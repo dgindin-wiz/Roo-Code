@@ -230,6 +230,7 @@
 		"searchMaxResultsDescription": "Maximum number of search results to return when querying the codebase index. Higher values provide more context but may include less relevant results.",
 		"resetToDefault": "Reset to default",
 		"startIndexingButton": "Start Indexing",
+		"reindexButton": "Re-index",
 		"clearIndexDataButton": "Clear Index Data",
 		"unsavedSettingsMessage": "Please save your settings before starting the indexing process.",
 		"clearDataDialog": {
@@ -251,8 +252,13 @@
 			"standby": "Standby",
 			"indexing": "Indexing",
 			"indexed": "Indexed",
+			"stopping": "Stopping",
 			"error": "Error"
 		},
+		"phaseScanning": "Scanning files… {{processed}}/{{total}}",
+		"phaseEmbedding": "Embedding blocks… {{embedded}}/{{total}}",
+		"indexedFilesCount": "{{count}} files",
+		"indexedBlocksCount": "{{count}} blocks",
 		"close": "Close",
 		"validation": {
 			"qdrantUrlRequired": "Qdrant URL is required",
