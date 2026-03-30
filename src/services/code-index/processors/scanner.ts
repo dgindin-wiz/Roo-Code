@@ -7,11 +7,18 @@ import { generateNormalizedAbsolutePath, generateRelativeFilePath } from "../sha
 import { getWorkspacePathForContext } from "../../../utils/path"
 import { scannerExtensions } from "../shared/supported-extensions"
 import * as vscode from "vscode"
-import { CodeBlock, ICodeParser, IEmbedder, IVectorStore, IDirectoryScanner } from "../interfaces"
+import {
+	CodeBlock,
+	ICodeParser,
+	IEmbedder,
+	IVectorStore,
+	IDirectoryScanner,
+	ScanProgress,
+	ScanResult,
+} from "../interfaces"
 import { createHash } from "crypto"
 import { v5 as uuidv5 } from "uuid"
 import pLimit from "p-limit"
-import { Mutex } from "async-mutex"
 import { CacheManager } from "../cache-manager"
 import { t } from "../../../i18n"
 import {
@@ -23,16 +30,49 @@ import {
 	INITIAL_RETRY_DELAY_MS,
 	PARSING_CONCURRENCY,
 	BATCH_PROCESSING_CONCURRENCY,
-	MAX_PENDING_BATCHES,
+	MAX_EMBED_QUEUE_FILES,
+	MAX_CONSECUTIVE_BATCH_FAILURES,
+	BATCH_PROCESSING_TIMEOUT_MS,
 } from "../constants"
 import { isPathInIgnoredDirectory } from "../../glob/ignore-utils"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 import { sanitizeErrorMessage } from "../shared/validation-helpers"
 import { Package } from "../../../shared/package"
+import { BoundedChannel } from "./bounded-channel"
+import { IndexDebugLogger } from "../debug-logger"
+
+// ─── Internal Types ──────────────────────────────────────────────────────────
+
+/** A file that passed stat but needs mtime/hash/parse checking. */
+interface StatEntry {
+	filePath: string
+	normalizedPath: string
+	size: number
+	mtimeMs: number
+}
+
+/** A parsed file's blocks ready for embedding. */
+interface EmbedWork {
+	blocks: CodeBlock[]
+	filePath: string
+	fileHash: string
+	mtimeMs: number
+	isNew: boolean
+}
+
+// ─── Scanner ─────────────────────────────────────────────────────────────────
 
 export class DirectoryScanner implements IDirectoryScanner {
 	private readonly batchSegmentThreshold: number
+	private readonly maxFilesLimit: number
+
+	// Event emitters for progress and errors
+	private readonly _progressEmitter = new vscode.EventEmitter<ScanProgress>()
+	private readonly _errorEmitter = new vscode.EventEmitter<Error>()
+
+	public readonly onProgress = this._progressEmitter.event
+	public readonly onError = this._errorEmitter.event
 
 	constructor(
 		private readonly embedder: IEmbedder,
@@ -42,8 +82,6 @@ export class DirectoryScanner implements IDirectoryScanner {
 		private readonly ignoreInstance: Ignore,
 		batchSegmentThreshold?: number,
 	) {
-		// Get the configurable batch size from VSCode settings, fallback to default
-		// If not provided in constructor, try to get from VSCode settings
 		if (batchSegmentThreshold !== undefined) {
 			this.batchSegmentThreshold = batchSegmentThreshold
 		} else {
@@ -52,347 +90,571 @@ export class DirectoryScanner implements IDirectoryScanner {
 					.getConfiguration(Package.name)
 					.get<number>("codeIndex.embeddingBatchSize", BATCH_SEGMENT_THRESHOLD)
 			} catch {
-				// In test environment, vscode.workspace might not be available
 				this.batchSegmentThreshold = BATCH_SEGMENT_THRESHOLD
 			}
 		}
+
+		try {
+			this.maxFilesLimit = vscode.workspace
+				.getConfiguration(Package.name)
+				.get<number>("codeIndex.maxFiles", MAX_LIST_FILES_LIMIT_CODE_INDEX)
+		} catch {
+			this.maxFilesLimit = MAX_LIST_FILES_LIMIT_CODE_INDEX
+		}
 	}
 
+	// ═══════════════════════════════════════════════════════════════════════
+	// Public API
+	// ═══════════════════════════════════════════════════════════════════════
+
 	/**
-	 * Recursively scans a directory for code blocks in supported files.
-	 * @param directoryPath The directory to scan
-	 * @param rooIgnoreController Optional RooIgnoreController instance for filtering
-	 * @param context VS Code ExtensionContext for cache storage
-	 * @param onError Optional error handler callback
-	 * @returns Promise<{codeBlocks: CodeBlock[], stats: {processed: number, skipped: number}}> Array of parsed code blocks and processing stats
+	 * Three-phase indexing pipeline:
+	 *   Phase 1 — Discover: list, filter, stat, classify (unchanged vs candidate)
+	 *   Phase 2 — Parse:    read, hash, parse candidates (parseLimiter, no embed wait)
+	 *   Phase 3 — Embed:    batch, embed, upsert (concurrent with Phase 2 via BoundedChannel)
 	 */
-	public async scanDirectory(
-		directory: string,
-		onError?: (error: Error) => void,
-		onBlocksIndexed?: (indexedCount: number) => void,
-		onFileParsed?: (fileBlockCount: number) => void,
-		signal?: AbortSignal,
-	): Promise<{ stats: { processed: number; skipped: number }; totalBlockCount: number }> {
-		const directoryPath = directory
-		// Capture workspace context at scan start
-		const scanWorkspace = getWorkspacePathForContext(directoryPath)
+	public async scanDirectory(directory: string, signal: AbortSignal): Promise<ScanResult> {
+		const scanWorkspace = getWorkspacePathForContext(directory)
+		const errors: Error[] = []
 
-		// Get all files recursively (handles .gitignore automatically)
-		const [allPaths, _] = await listFiles(directoryPath, true, MAX_LIST_FILES_LIMIT_CODE_INDEX)
+		// ── Phase 1: Discover ──────────────────────────────────────────────
+		const discovery = await this._discover(directory, scanWorkspace, signal)
+		if (signal.aborted) {
+			return this._abortedResult(discovery)
+		}
 
-		// Filter out directories (marked with trailing '/')
-		const filePaths = allPaths.filter((p) => !p.endsWith("/"))
-
-		// Initialize RooIgnoreController if not provided
-		const ignoreController = new RooIgnoreController(directoryPath)
-
-		await ignoreController.initialize()
-
-		// Filter paths using .rooignore
-		const allowedPaths = ignoreController.filterPaths(filePaths)
-
-		// Filter by supported extensions, ignore patterns, and excluded directories
-		const supportedPaths = allowedPaths.filter((filePath) => {
-			const ext = path.extname(filePath).toLowerCase()
-			const relativeFilePath = generateRelativeFilePath(filePath, scanWorkspace)
-
-			// Check if file is in an ignored directory using the shared helper
-			// Use relative path to avoid matching parent directories outside the workspace
-			if (isPathInIgnoredDirectory(relativeFilePath)) {
-				return false
-			}
-
-			return scannerExtensions.includes(ext) && !this.ignoreInstance.ignores(relativeFilePath)
+		IndexDebugLogger.log("Scanner", "discovery-complete", {
+			totalFiles: discovery.totalFiles,
+			unchangedCount: discovery.unchangedCount,
+			candidateCount: discovery.candidates.length,
+			totalBytes: discovery.totalBytes,
 		})
 
-		// Initialize tracking variables
-		const processedFiles = new Set<string>()
-		let processedCount = 0
-		let skippedCount = 0
+		// If no candidates, skip Phase 2 & 3 entirely
+		if (discovery.candidates.length === 0) {
+			// Still need to handle deleted files
+			await this._handleDeletedFiles(discovery.processedPaths, scanWorkspace, signal, errors)
 
-		// Initialize parallel processing tools
-		const parseLimiter = pLimit(PARSING_CONCURRENCY) // Concurrency for file parsing
-		const batchLimiter = pLimit(BATCH_PROCESSING_CONCURRENCY) // Concurrency for batch processing
-		const mutex = new Mutex()
+			this._emitProgress({
+				phase: "complete",
+				filesChecked: discovery.totalFiles,
+				totalFiles: discovery.totalFiles,
+				blocksEmbedded: 0,
+				totalBlocksEstimate: 0,
+				isEstimatedTotal: false,
+			})
 
-		// Shared batch accumulators (protected by mutex)
-		let currentBatchBlocks: CodeBlock[] = []
-		let currentBatchTexts: string[] = []
-		let currentBatchFileInfos: { filePath: string; fileHash: string; isNew: boolean }[] = []
-		const activeBatchPromises = new Set<Promise<void>>()
-		let pendingBatchCount = 0
-
-		// Initialize block counter
-		let totalBlockCount = 0
-
-		// Process all files in parallel with concurrency control
-		const parsePromises = supportedPaths.map((filePath) =>
-			parseLimiter(async () => {
-				// Check abort signal before processing each file
-				if (signal?.aborted) return
-
-				try {
-					// Check file size
-					const stats = await stat(filePath)
-					if (stats.size > MAX_FILE_SIZE_BYTES) {
-						skippedCount++ // Skip large files
-						return
-					}
-
-					// Read file content
-					const content = await vscode.workspace.fs
-						.readFile(vscode.Uri.file(filePath))
-						.then((buffer) => Buffer.from(buffer).toString("utf-8"))
-
-					// Calculate current hash
-					const currentFileHash = createHash("sha256").update(content).digest("hex")
-					processedFiles.add(filePath)
-
-					// Check against cache
-					const cachedFileHash = this.cacheManager.getHash(filePath)
-					const isNewFile = !cachedFileHash
-					if (cachedFileHash === currentFileHash) {
-						// File is unchanged
-						skippedCount++
-						return
-					}
-
-					// File is new or changed - parse it using the injected parser function
-					const blocks = await this.codeParser.parseFile(filePath, { content, fileHash: currentFileHash })
-					const fileBlockCount = blocks.length
-					onFileParsed?.(fileBlockCount)
-					processedCount++
-
-					// Process embeddings if configured
-					if (this.embedder && this.qdrantClient && blocks.length > 0) {
-						// Add to batch accumulators
-						let addedBlocksFromFile = false
-						for (const block of blocks) {
-							const trimmedContent = block.content.trim()
-							if (trimmedContent) {
-								const release = await mutex.acquire()
-								try {
-									currentBatchBlocks.push(block)
-									currentBatchTexts.push(trimmedContent)
-									addedBlocksFromFile = true
-
-									// Check if batch threshold is met
-									// Check abort signal before dispatching batch
-									if (signal?.aborted) {
-										throw new DOMException("Indexing aborted", "AbortError")
-									}
-
-									if (currentBatchBlocks.length >= this.batchSegmentThreshold) {
-										// Wait if we've reached the maximum pending batches
-										while (pendingBatchCount >= MAX_PENDING_BATCHES) {
-											if (signal?.aborted) {
-												throw new DOMException("Indexing aborted", "AbortError")
-											}
-											await Promise.race(activeBatchPromises)
-										}
-
-										// Copy current batch data and clear accumulators
-										const batchBlocks = [...currentBatchBlocks]
-										const batchTexts = [...currentBatchTexts]
-										const batchFileInfos = [...currentBatchFileInfos]
-										currentBatchBlocks = []
-										currentBatchTexts = []
-										currentBatchFileInfos = []
-
-										// Increment pending batch count
-										pendingBatchCount++
-
-										// Queue batch processing
-										const batchPromise = batchLimiter(() =>
-											this.processBatch(
-												batchBlocks,
-												batchTexts,
-												batchFileInfos,
-												scanWorkspace,
-												onError,
-												onBlocksIndexed,
-											),
-										)
-										activeBatchPromises.add(batchPromise)
-
-										// Clean up completed promises to prevent memory accumulation
-										batchPromise.finally(() => {
-											activeBatchPromises.delete(batchPromise)
-											pendingBatchCount--
-										})
-									}
-								} finally {
-									release()
-								}
-							}
-						}
-
-						// Add file info once per file (outside the block loop)
-						if (addedBlocksFromFile) {
-							const release = await mutex.acquire()
-							try {
-								totalBlockCount += fileBlockCount
-								currentBatchFileInfos.push({
-									filePath,
-									fileHash: currentFileHash,
-									isNew: isNewFile,
-								})
-							} finally {
-								release()
-							}
-						}
-					} else {
-						// Only update hash if not being processed in a batch
-						await this.cacheManager.updateHash(filePath, currentFileHash)
-					}
-				} catch (error) {
-					// Re-throw AbortError — it's not a file processing error, just a user-initiated stop
-					if (error instanceof DOMException && error.name === "AbortError") {
-						throw error
-					}
-					console.error(`Error processing file ${filePath} in workspace ${scanWorkspace}:`, error)
-					TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
-						error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
-						stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
-						location: "scanDirectory:processFile",
-					})
-					if (onError) {
-						onError(
-							error instanceof Error
-								? new Error(`${error.message} (Workspace: ${scanWorkspace}, File: ${filePath})`)
-								: new Error(
-										t("embeddings:scanner.unknownErrorProcessingFile", { filePath }) +
-											` (Workspace: ${scanWorkspace})`,
-									),
-						)
-					}
-				}
-			}),
-		)
-
-		// Wait for all parsing to complete
-		await Promise.all(parsePromises)
-
-		// Check abort signal before processing remaining batch
-		if (signal?.aborted) {
 			return {
-				stats: {
-					processed: processedCount,
-					skipped: skippedCount,
-				},
-				totalBlockCount,
+				totalFiles: discovery.totalFiles,
+				processedFiles: 0,
+				skippedFiles: discovery.unchangedCount,
+				totalBlocks: 0,
+				blocksEmbedded: 0,
+				errors,
 			}
 		}
 
-		// Process any remaining items in batch
-		if (currentBatchBlocks.length > 0) {
-			const release = await mutex.acquire()
-			try {
-				// Copy current batch data and clear accumulators
-				const batchBlocks = [...currentBatchBlocks]
-				const batchTexts = [...currentBatchTexts]
-				const batchFileInfos = [...currentBatchFileInfos]
-				currentBatchBlocks = []
-				currentBatchTexts = []
-				currentBatchFileInfos = []
+		// ── Phase 2 + 3: Parse and Embed (concurrent) ─────────────────────
+		const channel = new BoundedChannel<EmbedWork>(MAX_EMBED_QUEUE_FILES)
 
-				// Increment pending batch count for final batch
-				pendingBatchCount++
+		// Block count for unchanged files (mtime-matched during discovery).
+		// Candidates (no mtime match) are a DISJOINT set — their blocks come
+		// via blocksFound during parse. Total = unchangedBlockCount + blocksFound.
+		const unchangedBlockCount = discovery.unchangedBlockCount
 
-				// Queue final batch processing
-				const batchPromise = batchLimiter(() =>
-					this.processBatch(batchBlocks, batchTexts, batchFileInfos, scanWorkspace, onError, onBlocksIndexed),
-				)
-				activeBatchPromises.add(batchPromise)
+		// Mutable progress counters — Phase 2 updates filesChecked/blocksFound,
+		// Phase 3 updates blocksEmbedded. Both fire progress events independently.
+		let filesChecked = discovery.unchangedCount
+		let blocksFound = 0
+		let blocksEmbedded = 0
+		let processedCount = 0
+		let isEstimated = true
+		let embedPhaseStarted = false
 
-				// Clean up completed promises to prevent memory accumulation
-				batchPromise.finally(() => {
-					activeBatchPromises.delete(batchPromise)
-					pendingBatchCount--
+		// Total estimate = unchanged (mtime-matched) + found (candidates parsed so far).
+		// These are strictly disjoint: unchanged = mtime match, candidates = no mtime match.
+		const getTotalEstimate = () => unchangedBlockCount + blocksFound
+
+		const reportProgress = () => {
+			this._emitProgress({
+				phase: embedPhaseStarted ? "embedding" : "parsing",
+				filesChecked,
+				totalFiles: discovery.totalFiles,
+				blocksEmbedded,
+				totalBlocksEstimate: getTotalEstimate(),
+				isEstimatedTotal: isEstimated,
+			})
+		}
+
+		// Start Phase 3: Embed consumer (runs concurrently with Phase 2)
+		const embedPromise = this._runEmbedPhase(
+			channel,
+			scanWorkspace,
+			signal,
+			(count: number) => {
+				blocksEmbedded += count
+				IndexDebugLogger.log("Scanner", "blocks-embedded", {
+					batchSize: count,
+					blocksEmbedded,
+					totalBlockEstimate: getTotalEstimate(),
+					filesChecked,
+					totalFiles: discovery.totalFiles,
 				})
-			} finally {
-				release()
+				reportProgress()
+			},
+			errors,
+		)
+
+		// Run Phase 2: Parse producer
+		const parseResult = await this._runParsePhase(
+			discovery.candidates,
+			discovery.processedPaths,
+			scanWorkspace,
+			signal,
+			channel,
+			(fileBlockCount: number) => {
+				filesChecked++
+				blocksFound += fileBlockCount
+
+				if (!embedPhaseStarted && getTotalEstimate() > 0) {
+					embedPhaseStarted = true
+				}
+
+				if (fileBlockCount > 0) processedCount++
+				reportProgress()
+			},
+			errors,
+		)
+
+		// Close channel — tells embed consumer no more items coming
+		channel.close()
+
+		// Wait for all embedding to finish
+		await embedPromise
+
+		if (signal.aborted) {
+			return {
+				totalFiles: discovery.totalFiles,
+				processedFiles: processedCount,
+				skippedFiles: discovery.unchangedCount + parseResult.hashSkipped,
+				totalBlocks: blocksFound,
+				blocksEmbedded,
+				errors,
 			}
+		}
+
+		// Now that all files are parsed, total is exact
+		isEstimated = false
+		reportProgress()
+
+		// Handle deleted files
+		await this._handleDeletedFiles(discovery.processedPaths, scanWorkspace, signal, errors)
+
+		this._emitProgress({
+			phase: "complete",
+			filesChecked: discovery.totalFiles,
+			totalFiles: discovery.totalFiles,
+			blocksEmbedded,
+			totalBlocksEstimate: getTotalEstimate(),
+			isEstimatedTotal: false,
+		})
+
+		return {
+			totalFiles: discovery.totalFiles,
+			processedFiles: processedCount,
+			skippedFiles: discovery.unchangedCount + parseResult.hashSkipped,
+			totalBlocks: blocksFound,
+			blocksEmbedded,
+			errors,
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 1: Discover
+	// ═══════════════════════════════════════════════════════════════════════
+
+	/**
+	 * Lists files, filters by extension/ignore, stats all, classifies by mtime.
+	 * Returns immediately with the classification — no I/O-heavy work.
+	 *
+	 * Unchanged files are counted instantly (90%+ of 65K files in a typical
+	 * incremental scan), so file progress jumps to ~90% within 3 seconds.
+	 */
+	private async _discover(
+		directory: string,
+		scanWorkspace: string,
+		signal: AbortSignal,
+	): Promise<{
+		totalFiles: number
+		totalBytes: number
+		unchangedCount: number
+		unchangedBlockCount: number
+		candidates: StatEntry[]
+		processedPaths: Set<string>
+	}> {
+		// List all files
+		const [allPaths] = await listFiles(directory, true, 500_000)
+		const filePaths = allPaths.filter((p) => !p.endsWith("/"))
+
+		// Initialize RooIgnoreController
+		const ignoreController = new RooIgnoreController(directory)
+		await ignoreController.initialize()
+		const allowedPaths = ignoreController.filterPaths(filePaths)
+
+		// Filter by supported extensions and ignore patterns
+		let supportedPaths = allowedPaths.filter((filePath) => {
+			const ext = path.extname(filePath).toLowerCase()
+			const relativeFilePath = generateRelativeFilePath(filePath, scanWorkspace)
+			if (isPathInIgnoredDirectory(relativeFilePath)) return false
+			return scannerExtensions.includes(ext) && !this.ignoreInstance.ignores(relativeFilePath)
+		})
+
+		// Apply file count cap
+		if (supportedPaths.length > this.maxFilesLimit) {
+			console.warn(`[DirectoryScanner] Capping files from ${supportedPaths.length} to ${this.maxFilesLimit}`)
+			supportedPaths = supportedPaths.slice(0, this.maxFilesLimit)
+		}
+
+		// Stat all files (fast: ~2 seconds for 65K files)
+		const statLimiter = pLimit(50)
+		const statEntries: StatEntry[] = []
+		let totalBytes = 0
+		const processedPaths = new Set<string>()
+
+		await Promise.all(
+			supportedPaths.map((filePath) =>
+				statLimiter(async () => {
+					if (signal.aborted) return
+					try {
+						const s = await stat(filePath)
+						const normalizedPath = path.normalize(filePath)
+						processedPaths.add(normalizedPath)
+						if (s.size <= MAX_FILE_SIZE_BYTES) {
+							totalBytes += s.size
+						}
+						statEntries.push({
+							filePath,
+							normalizedPath,
+							size: s.size,
+							mtimeMs: s.mtimeMs,
+						})
+					} catch {
+						// File vanished between list and stat — skip
+					}
+				}),
+			),
+		)
+
+		const totalFiles = statEntries.length
+
+		// Report scan start immediately
+		this._emitProgress({
+			phase: "discovering",
+			filesChecked: 0,
+			totalFiles,
+			blocksEmbedded: 0,
+			totalBlocksEstimate: 0,
+			isEstimatedTotal: true,
+		})
+
+		// Classify: mtime match → unchanged, otherwise → candidate
+		const candidates: StatEntry[] = []
+		let unchangedCount = 0
+
+		let unchangedBlockCount = 0
+
+		for (const entry of statEntries) {
+			if (signal.aborted) break
+
+			if (entry.size > MAX_FILE_SIZE_BYTES) {
+				unchangedCount++ // Skip large files, count as examined
+				continue
+			}
+
+			const cachedMtime = this.cacheManager.getMtime(entry.normalizedPath)
+			if (cachedMtime !== undefined && cachedMtime === entry.mtimeMs) {
+				unchangedCount++
+				// Sum cached block count for unchanged files only —
+				// candidates will be re-parsed and contribute via blocksFound
+				const bc = this.cacheManager.getBlockCount(entry.normalizedPath)
+				if (bc !== undefined) unchangedBlockCount += bc
+			} else {
+				candidates.push(entry)
+			}
+		}
+
+		// Report discovery results — file progress jumps to unchangedCount/totalFiles
+		this._emitProgress({
+			phase: "discovering",
+			filesChecked: unchangedCount,
+			totalFiles,
+			blocksEmbedded: 0,
+			totalBlocksEstimate: 0,
+			isEstimatedTotal: true,
+		})
+
+		return { totalFiles, totalBytes, unchangedCount, unchangedBlockCount, candidates, processedPaths }
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 2: Parse
+	// ═══════════════════════════════════════════════════════════════════════
+
+	/**
+	 * For each candidate file: read → hash → parse. Pushes changed files
+	 * to the BoundedChannel for embedding.
+	 *
+	 * parseLimiter slots release IMMEDIATELY after parse — they never wait
+	 * on the embed pipeline. Backpressure happens in channel.push(), which
+	 * blocks the awaiting promise in the per-file callback, NOT the
+	 * parseLimiter slot (because we use a separate outer promise).
+	 *
+	 * The onFileChecked callback fires for every candidate regardless of
+	 * whether it's hash-skipped or actually changed. This keeps filesChecked
+	 * advancing at full parsing speed.
+	 */
+	private async _runParsePhase(
+		candidates: StatEntry[],
+		processedPaths: Set<string>,
+		scanWorkspace: string,
+		signal: AbortSignal,
+		channel: BoundedChannel<EmbedWork>,
+		onFileChecked: (fileBlockCount: number) => void,
+		errors: Error[],
+	): Promise<{ hashSkipped: number }> {
+		const parseLimiter = pLimit(PARSING_CONCURRENCY)
+		let hashSkipped = 0
+
+		// We use a two-layer approach:
+		// 1. parseLimiter: reads file, hashes, parses, calls onFileChecked, then RELEASES slot
+		// 2. channel.push: happens AFTER parseLimiter releases, so backpressure
+		//    doesn't block other parseLimiter slots
+		//
+		// Implementation: parseLimiter returns the EmbedWork (or null), then
+		// the outer promise does channel.push if there's work.
+
+		const promises = candidates.map((entry) => {
+			// Create an outer promise that wraps parseLimiter + channel.push
+			return (async () => {
+				if (signal.aborted) return
+
+				// parseLimiter: read → hash → parse → release slot
+				const embedWork = await parseLimiter(async () => {
+					if (signal.aborted) return null
+
+					try {
+						const content = await vscode.workspace.fs
+							.readFile(vscode.Uri.file(entry.filePath))
+							.then((buffer) => Buffer.from(buffer).toString("utf-8"))
+
+						const currentFileHash = createHash("sha256").update(content).digest("hex")
+
+						const cachedFileHash = this.cacheManager.getHash(entry.normalizedPath)
+						const isNewFile = !cachedFileHash
+
+						if (cachedFileHash === currentFileHash) {
+							// Hash match — mtime changed but content didn't
+							this.cacheManager.updateHash(entry.normalizedPath, currentFileHash, entry.mtimeMs)
+							hashSkipped++
+							onFileChecked(0)
+							return null
+						}
+
+						// File is new or changed — parse it
+						const blocks = await this.codeParser.parseFile(entry.filePath, {
+							content,
+							fileHash: currentFileHash,
+						})
+						this.cacheManager.updateBlockCount(entry.normalizedPath, blocks.length)
+						onFileChecked(blocks.length)
+
+						if (blocks.length === 0) {
+							// File parsed but produced 0 blocks — just update cache
+							this.cacheManager.updateHash(entry.normalizedPath, currentFileHash, entry.mtimeMs)
+							return null
+						}
+
+						// Return work for the embed phase — parseLimiter slot releases NOW
+						return {
+							blocks,
+							filePath: entry.normalizedPath,
+							fileHash: currentFileHash,
+							mtimeMs: entry.mtimeMs,
+							isNew: isNewFile,
+						} as EmbedWork
+					} catch (error) {
+						if (error instanceof DOMException && error.name === "AbortError") {
+							throw error
+						}
+						const wrappedError =
+							error instanceof Error
+								? new Error(`${error.message} (Workspace: ${scanWorkspace}, File: ${entry.filePath})`)
+								: new Error(
+										t("embeddings:scanner.unknownErrorProcessingFile", {
+											filePath: entry.filePath,
+										}) + ` (Workspace: ${scanWorkspace})`,
+									)
+						errors.push(wrappedError)
+						this._errorEmitter.fire(wrappedError)
+						console.error(`Error processing file ${entry.filePath}:`, error)
+						TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
+							error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+							stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
+							location: "scanDirectory:processFile",
+						})
+						onFileChecked(0)
+						return null
+					}
+				})
+
+				// Push to channel OUTSIDE parseLimiter — backpressure blocks HERE,
+				// not in the parseLimiter slot. Other files keep parsing.
+				if (embedWork && !signal.aborted) {
+					await channel.push(embedWork, signal)
+				}
+			})()
+		})
+
+		await Promise.all(promises)
+		return { hashSkipped }
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Phase 3: Embed
+	// ═══════════════════════════════════════════════════════════════════════
+
+	/**
+	 * Consumes EmbedWork items from the channel, accumulates into batches,
+	 * embeds, and upserts to Qdrant.
+	 *
+	 * Runs concurrently with Phase 2. The channel provides backpressure:
+	 * when the buffer is full, Phase 2's channel.push() blocks (outside
+	 * parseLimiter), and when items are consumed here, pushers wake up.
+	 */
+	private async _runEmbedPhase(
+		channel: BoundedChannel<EmbedWork>,
+		scanWorkspace: string,
+		signal: AbortSignal,
+		onBatchComplete: (count: number) => void,
+		errors: Error[],
+	): Promise<void> {
+		if (!this.embedder || !this.qdrantClient) return
+
+		const batchLimiter = pLimit(BATCH_PROCESSING_CONCURRENCY)
+		let currentBatchBlocks: CodeBlock[] = []
+		let currentBatchTexts: string[] = []
+		let currentBatchFileInfos: { filePath: string; fileHash: string; mtimeMs: number; isNew: boolean }[] = []
+		const activeBatchPromises = new Set<Promise<void>>()
+		let pendingBatchCount = 0
+
+		// Fail-fast tracking
+		let consecutiveBatchFailures = 0
+		let systemicBatchError: Error | null = null
+
+		const submitBatch = async () => {
+			if (currentBatchBlocks.length === 0) return
+
+			// Snapshot and clear accumulators
+			const batchBlocks = [...currentBatchBlocks]
+			const batchTexts = [...currentBatchTexts]
+			const batchFileInfos = [...currentBatchFileInfos]
+			currentBatchBlocks = []
+			currentBatchTexts = []
+			currentBatchFileInfos = []
+			pendingBatchCount++
+
+			const batchPromise = batchLimiter(async () => {
+				const ok = await this._processBatch(
+					batchBlocks,
+					batchTexts,
+					batchFileInfos,
+					scanWorkspace,
+					onBatchComplete,
+					errors,
+				)
+				if (ok) {
+					consecutiveBatchFailures = 0
+				} else {
+					consecutiveBatchFailures++
+					if (consecutiveBatchFailures >= MAX_CONSECUTIVE_BATCH_FAILURES) {
+						systemicBatchError = new Error(
+							`Indexing aborted: ${consecutiveBatchFailures} consecutive batch failures — the vector store may be unavailable.`,
+						)
+					}
+				}
+			})
+			activeBatchPromises.add(batchPromise)
+			batchPromise.finally(() => {
+				activeBatchPromises.delete(batchPromise)
+				pendingBatchCount--
+			})
+		}
+
+		// Consume items from the channel
+		for await (const work of channel.drain(signal)) {
+			if (signal.aborted) break
+			if (systemicBatchError) break
+
+			// Track file info BEFORE processing blocks — submitBatch() snapshots
+			// currentBatchFileInfos, so the current file must already be present.
+			currentBatchFileInfos.push({
+				filePath: work.filePath,
+				fileHash: work.fileHash,
+				mtimeMs: work.mtimeMs,
+				isNew: work.isNew,
+			})
+
+			// Accumulate blocks from this file into current batch
+			for (const block of work.blocks) {
+				const trimmedContent = block.content.trim()
+				if (!trimmedContent) continue
+
+				currentBatchBlocks.push(block)
+				currentBatchTexts.push(trimmedContent)
+
+				if (currentBatchBlocks.length >= this.batchSegmentThreshold) {
+					// Wait for batch slot if too many pending
+					while (pendingBatchCount >= 20 /* MAX_PENDING_BATCHES */) {
+						if (signal.aborted || systemicBatchError) break
+						await Promise.race(activeBatchPromises)
+					}
+					if (signal.aborted || systemicBatchError) break
+					await submitBatch()
+				}
+			}
+		}
+
+		// Flush remaining partial batch
+		if (!signal.aborted && !systemicBatchError && currentBatchBlocks.length > 0) {
+			await submitBatch()
 		}
 
 		// Wait for all batch processing to complete
 		await Promise.all(activeBatchPromises)
 
-		// Check abort signal before handling deleted files
-		if (signal?.aborted) {
-			return {
-				stats: {
-					processed: processedCount,
-					skipped: skippedCount,
-				},
-				totalBlockCount,
-			}
-		}
-
-		// Handle deleted files
-		const oldHashes = this.cacheManager.getAllHashes()
-		for (const cachedFilePath of Object.keys(oldHashes)) {
-			if (!processedFiles.has(cachedFilePath)) {
-				// File was deleted or is no longer supported/indexed
-				if (this.qdrantClient) {
-					try {
-						await this.qdrantClient.deletePointsByFilePath(cachedFilePath)
-						await this.cacheManager.deleteHash(cachedFilePath)
-					} catch (error: any) {
-						const errorStatus = error?.status || error?.response?.status || error?.statusCode
-						const errorMessage = error instanceof Error ? error.message : String(error)
-
-						console.error(
-							`[DirectoryScanner] Failed to delete points for ${cachedFilePath} in workspace ${scanWorkspace}:`,
-							error,
-						)
-
-						TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
-							error: sanitizeErrorMessage(errorMessage),
-							stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
-							location: "scanDirectory:deleteRemovedFiles",
-							errorStatus: errorStatus,
-						})
-
-						if (onError) {
-							// Report error to error handler
-							onError(
-								error instanceof Error
-									? new Error(
-											`${error.message} (Workspace: ${scanWorkspace}, File: ${cachedFilePath})`,
-										)
-									: new Error(
-											t("embeddings:scanner.unknownErrorDeletingPoints", {
-												filePath: cachedFilePath,
-											}) + ` (Workspace: ${scanWorkspace})`,
-										),
-							)
-						}
-						// Log error and continue processing instead of re-throwing
-						console.error(`Failed to delete points for removed file: ${cachedFilePath}`, error)
-					}
-				}
-			}
-		}
-
-		return {
-			stats: {
-				processed: processedCount,
-				skipped: skippedCount,
-			},
-			totalBlockCount,
+		// Propagate systemic error
+		if (systemicBatchError) {
+			throw systemicBatchError
 		}
 	}
 
-	private async processBatch(
+	// ═══════════════════════════════════════════════════════════════════════
+	// Batch Processing
+	// ═══════════════════════════════════════════════════════════════════════
+
+	/**
+	 * Process a batch of code blocks: delete old points, embed, upsert.
+	 * Returns `true` on success, `false` on failure (after all retries exhausted).
+	 */
+	private async _processBatch(
 		batchBlocks: CodeBlock[],
 		batchTexts: string[],
-		batchFileInfos: { filePath: string; fileHash: string; isNew: boolean }[],
+		batchFileInfos: { filePath: string; fileHash: string; mtimeMs: number; isNew: boolean }[],
 		scanWorkspace: string,
-		onError?: (error: Error) => void,
-		onBlocksIndexed?: (indexedCount: number) => void,
-	): Promise<void> {
-		if (batchBlocks.length === 0) return
+		onBatchComplete: (count: number) => void,
+		errors: Error[],
+	): Promise<boolean> {
+		if (batchBlocks.length === 0) return true
 
 		let attempts = 0
 		let success = false
@@ -401,89 +663,87 @@ export class DirectoryScanner implements IDirectoryScanner {
 		while (attempts < MAX_BATCH_RETRIES && !success) {
 			attempts++
 			try {
-				// --- Deletion Step ---
-				const uniqueFilePaths = [
-					...new Set(
-						batchFileInfos
-							.filter((info) => !info.isNew) // Only modified files (not new)
-							.map((info) => info.filePath),
-					),
-				]
-				if (uniqueFilePaths.length > 0) {
-					try {
-						await this.qdrantClient.deletePointsByMultipleFilePaths(uniqueFilePaths)
-					} catch (deleteError: any) {
-						const errorStatus =
-							deleteError?.status || deleteError?.response?.status || deleteError?.statusCode
-						const errorMessage = deleteError instanceof Error ? deleteError.message : String(deleteError)
-
-						console.error(
-							`[DirectoryScanner] Failed to delete points for ${uniqueFilePaths.length} files before upsert in workspace ${scanWorkspace}:`,
-							deleteError,
-						)
-
-						TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
-							error: sanitizeErrorMessage(errorMessage),
-							stack:
-								deleteError instanceof Error
-									? sanitizeErrorMessage(deleteError.stack || "")
-									: undefined,
-							location: "processBatch:deletePointsByMultipleFilePaths",
-							fileCount: uniqueFilePaths.length,
-							errorStatus: errorStatus,
-						})
-
-						// Re-throw with workspace context
-						throw new Error(
-							`Failed to delete points for ${uniqueFilePaths.length} files. Workspace: ${scanWorkspace}. ${errorMessage}`,
-							{ cause: deleteError },
-						)
+				// Wrap the entire attempt in a timeout to prevent indefinite hangs
+				// from API/network issues that would otherwise deadlock the pipeline
+				await this._withBatchTimeout(async () => {
+					// Delete old points for modified files (not new files)
+					const uniqueFilePaths = [
+						...new Set(batchFileInfos.filter((info) => !info.isNew).map((info) => info.filePath)),
+					]
+					if (uniqueFilePaths.length > 0) {
+						try {
+							await this.qdrantClient.deletePointsByMultipleFilePaths(uniqueFilePaths)
+						} catch (deleteError: any) {
+							const errorMessage =
+								deleteError instanceof Error ? deleteError.message : String(deleteError)
+							console.error(
+								`[DirectoryScanner] Failed to delete points for ${uniqueFilePaths.length} files:`,
+								deleteError,
+							)
+							TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
+								error: sanitizeErrorMessage(errorMessage),
+								stack:
+									deleteError instanceof Error
+										? sanitizeErrorMessage(deleteError.stack || "")
+										: undefined,
+								location: "processBatch:deletePointsByMultipleFilePaths",
+								fileCount: uniqueFilePaths.length,
+							})
+							throw new Error(
+								`Failed to delete points for ${uniqueFilePaths.length} files. Workspace: ${scanWorkspace}. ${errorMessage}`,
+								{ cause: deleteError },
+							)
+						}
 					}
-				}
-				// --- End Deletion Step ---
 
-				// Create embeddings for batch
-				const { embeddings } = await this.embedder.createEmbeddings(batchTexts)
+					// Create embeddings
+					const { embeddings } = await this.embedder.createEmbeddings(batchTexts)
 
-				// Prepare points for Qdrant
-				const points = batchBlocks.map((block, index) => {
-					const normalizedAbsolutePath = generateNormalizedAbsolutePath(block.file_path, scanWorkspace)
+					// Prepare and upsert points
+					const points = batchBlocks.map((block, index) => {
+						const normalizedAbsolutePath = generateNormalizedAbsolutePath(block.file_path, scanWorkspace)
+						const pointId = uuidv5(block.segmentHash, QDRANT_CODE_BLOCK_NAMESPACE)
+						return {
+							id: pointId,
+							vector: embeddings[index],
+							payload: {
+								filePath: generateRelativeFilePath(normalizedAbsolutePath, scanWorkspace),
+								codeChunk: block.content,
+								startLine: block.start_line,
+								endLine: block.end_line,
+								segmentHash: block.segmentHash,
+							},
+						}
+					})
 
-					// Use segmentHash for unique ID generation to handle multiple segments from same line
-					const pointId = uuidv5(block.segmentHash, QDRANT_CODE_BLOCK_NAMESPACE)
-
-					return {
-						id: pointId,
-						vector: embeddings[index],
-						payload: {
-							filePath: generateRelativeFilePath(normalizedAbsolutePath, scanWorkspace),
-							codeChunk: block.content,
-							startLine: block.start_line,
-							endLine: block.end_line,
-							segmentHash: block.segmentHash,
-						},
-					}
+					await this.qdrantClient.upsertPoints(points)
 				})
 
-				// Upsert points to Qdrant
-				await this.qdrantClient.upsertPoints(points)
-				onBlocksIndexed?.(batchBlocks.length)
+				onBatchComplete(batchBlocks.length)
 
-				// Update hashes for successfully processed files in this batch
+				// Update cache for successfully processed files
 				for (const fileInfo of batchFileInfos) {
-					await this.cacheManager.updateHash(fileInfo.filePath, fileInfo.fileHash)
+					this.cacheManager.updateHash(fileInfo.filePath, fileInfo.fileHash, fileInfo.mtimeMs)
 				}
+				await this.cacheManager.flush()
 				success = true
 			} catch (error) {
 				lastError = error as Error
+				const isTimeout = lastError.message.includes("Batch processing timed out")
 				console.error(
-					`[DirectoryScanner] Error processing batch (attempt ${attempts}) in workspace ${scanWorkspace}:`,
+					`[DirectoryScanner] Error processing batch (attempt ${attempts}${isTimeout ? ", TIMEOUT" : ""}):`,
 					error,
 				)
+				IndexDebugLogger.log("Scanner", "batch-error", {
+					attempt: attempts,
+					batchSize: batchBlocks.length,
+					isTimeout,
+					error: lastError.message,
+				})
 				TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
 					error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
 					stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
-					location: "processBatch:retry",
+					location: isTimeout ? "processBatch:timeout" : "processBatch:retry",
 					attemptNumber: attempts,
 					batchSize: batchBlocks.length,
 				})
@@ -497,20 +757,108 @@ export class DirectoryScanner implements IDirectoryScanner {
 
 		if (!success && lastError) {
 			console.error(`[DirectoryScanner] Failed to process batch after ${MAX_BATCH_RETRIES} attempts`)
-			if (onError) {
-				// Preserve the original error message from embedders which now have detailed i18n messages
-				const errorMessage = lastError.message || "Unknown error"
+			const wrappedError = new Error(
+				t("embeddings:scanner.failedToProcessBatchWithError", {
+					maxRetries: MAX_BATCH_RETRIES,
+					errorMessage: lastError.message || "Unknown error",
+				}),
+			)
+			errors.push(wrappedError)
+			this._errorEmitter.fire(wrappedError)
+			return false
+		}
+		return true
+	}
 
-				// For other errors, provide context
-				onError(
-					new Error(
-						t("embeddings:scanner.failedToProcessBatchWithError", {
-							maxRetries: MAX_BATCH_RETRIES,
-							errorMessage,
-						}),
-					),
-				)
+	/**
+	 * Wraps a batch processing function with a timeout to prevent indefinite
+	 * hangs from API/network issues. If the timeout fires, the batch is
+	 * treated as a failure and retried (or counted as a consecutive failure).
+	 */
+	private async _withBatchTimeout<R>(fn: () => Promise<R>): Promise<R> {
+		return new Promise<R>((resolve, reject) => {
+			const timeoutId = setTimeout(() => {
+				reject(new Error(`Batch processing timed out after ${BATCH_PROCESSING_TIMEOUT_MS}ms`))
+			}, BATCH_PROCESSING_TIMEOUT_MS)
+
+			fn().then(
+				(result) => {
+					clearTimeout(timeoutId)
+					resolve(result)
+				},
+				(error) => {
+					clearTimeout(timeoutId)
+					reject(error)
+				},
+			)
+		})
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Deleted Files
+	// ═══════════════════════════════════════════════════════════════════════
+
+	/**
+	 * Removes Qdrant points for files that are in the cache but no longer
+	 * on disk (or no longer pass extension/ignore filters).
+	 */
+	private async _handleDeletedFiles(
+		processedPaths: Set<string>,
+		scanWorkspace: string,
+		signal: AbortSignal,
+		errors: Error[],
+	): Promise<void> {
+		if (signal.aborted) return
+
+		const oldHashes = this.cacheManager.getAllHashes()
+		for (const cachedFilePath of Object.keys(oldHashes)) {
+			if (signal.aborted) return
+			const normalizedCachedPath = path.normalize(cachedFilePath)
+			if (!processedPaths.has(normalizedCachedPath)) {
+				if (this.qdrantClient) {
+					try {
+						await this.qdrantClient.deletePointsByFilePath(cachedFilePath)
+						await this.cacheManager.deleteHash(cachedFilePath)
+					} catch (error: any) {
+						const errorMessage = error instanceof Error ? error.message : String(error)
+						console.error(`[DirectoryScanner] Failed to delete points for ${cachedFilePath}:`, error)
+						TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
+							error: sanitizeErrorMessage(errorMessage),
+							stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
+							location: "scanDirectory:deleteRemovedFiles",
+						})
+						const wrappedError =
+							error instanceof Error
+								? new Error(`${error.message} (Workspace: ${scanWorkspace}, File: ${cachedFilePath})`)
+								: new Error(
+										t("embeddings:scanner.unknownErrorDeletingPoints", {
+											filePath: cachedFilePath,
+										}) + ` (Workspace: ${scanWorkspace})`,
+									)
+						errors.push(wrappedError)
+						this._errorEmitter.fire(wrappedError)
+					}
+				}
 			}
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// Helpers
+	// ═══════════════════════════════════════════════════════════════════════
+
+	private _emitProgress(progress: ScanProgress): void {
+		this._progressEmitter.fire(progress)
+	}
+
+	private _abortedResult(discovery: { totalFiles: number; unchangedCount: number }): ScanResult {
+		return {
+			totalFiles: discovery.totalFiles,
+			processedFiles: 0,
+			skippedFiles: discovery.unchangedCount,
+			totalBlocks: 0,
+			blocksEmbedded: 0,
+			errors: [],
 		}
 	}
 }

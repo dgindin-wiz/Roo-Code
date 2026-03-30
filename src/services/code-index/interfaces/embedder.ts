@@ -7,9 +7,13 @@ export interface IEmbedder {
 	 * Creates embeddings for the given texts.
 	 * @param texts Array of text strings to create embeddings for
 	 * @param model Optional model ID to use for embeddings
+	 * @param options Optional embedding options
+	 * @param options.isQuery When true, applies query-specific prefixes for asymmetric models
+	 *   (e.g., nomic-embed-code requires "Represent this query for searching relevant code: " for queries
+	 *   but no prefix for documents). Defaults to false (document embedding).
 	 * @returns Promise resolving to an EmbeddingResponse
 	 */
-	createEmbeddings(texts: string[], model?: string): Promise<EmbeddingResponse>
+	createEmbeddings(texts: string[], model?: string, options?: { isQuery?: boolean }): Promise<EmbeddingResponse>
 
 	/**
 	 * Validates the embedder configuration by testing connectivity and credentials.

@@ -509,7 +509,7 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "")
 		})
 
-		it("should reset internal service instances", async () => {
+		it("should reset internal service instances but preserve configManager", async () => {
 			// Verify initial state
 			expect((manager as any)._configManager).toBeDefined()
 			expect((manager as any)._serviceFactory).toBeDefined()
@@ -519,8 +519,9 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			// Act
 			await manager.recoverFromError()
 
-			// Assert - all service instances should be undefined
-			expect((manager as any)._configManager).toBeUndefined()
+			// Assert - runtime service instances should be undefined
+			// but _configManager is intentionally preserved to avoid false restart detection
+			expect((manager as any)._configManager).toBeDefined()
 			expect((manager as any)._serviceFactory).toBeUndefined()
 			expect((manager as any)._orchestrator).toBeUndefined()
 			expect((manager as any)._searchService).toBeUndefined()
@@ -609,9 +610,10 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			// Act - call recoverFromError when not in error state
 			await expect(manager.recoverFromError()).resolves.not.toThrow()
 
-			// Assert - should still clear state and service instances
+			// Assert - should still clear state and runtime service instances
+			// _configManager is intentionally preserved to avoid false restart detection
 			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "")
-			expect((manager as any)._configManager).toBeUndefined()
+			expect((manager as any)._configManager).toBeDefined()
 			expect((manager as any)._serviceFactory).toBeUndefined()
 			expect((manager as any)._orchestrator).toBeUndefined()
 			expect((manager as any)._searchService).toBeUndefined()
@@ -641,8 +643,9 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 				expect.any(Error),
 			)
 
-			// Assert - service instances should still be cleared
-			expect((manager as any)._configManager).toBeUndefined()
+			// Assert - runtime service instances should still be cleared
+			// _configManager is intentionally preserved to avoid false restart detection
+			expect((manager as any)._configManager).toBeDefined()
 			expect((manager as any)._serviceFactory).toBeUndefined()
 			expect((manager as any)._orchestrator).toBeUndefined()
 			expect((manager as any)._searchService).toBeUndefined()

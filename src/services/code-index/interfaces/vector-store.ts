@@ -80,6 +80,12 @@ export interface IVectorStore {
 	 * Should be called at the start of indexing to indicate work in progress
 	 */
 	markIndexingIncomplete(): Promise<void>
+
+	/**
+	 * Returns the number of indexed points (blocks) in the collection.
+	 * Excludes the metadata marker point. Returns 0 if collection doesn't exist or on error.
+	 */
+	getPointCount(): Promise<number>
 }
 
 export interface VectorStoreSearchResult {

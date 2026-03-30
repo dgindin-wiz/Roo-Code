@@ -647,21 +647,20 @@ describe("QdrantVectorStore", () => {
 			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(6)
 			;(console.warn as any).mockRestore() // Restore console.warn
 		})
-		it("should log warning for non-404 errors but still create collection", async () => {
+		it("should throw QdrantTransientError for non-404 errors instead of creating collection", async () => {
 			const genericError = new Error("Generic Qdrant Error")
 			mockQdrantClientInstance.getCollection.mockRejectedValue(genericError)
 			vitest.spyOn(console, "warn").mockImplementation(() => {}) // Suppress console.warn
 
-			const result = await vectorStore.initialize()
+			// Non-404 errors now throw QdrantTransientError instead of falling through to collection creation
+			await expect(vectorStore.initialize()).rejects.toThrow("Transient error checking collection")
 
-			expect(result).toBe(true) // Collection was created
 			expect(mockQdrantClientInstance.getCollection).toHaveBeenCalledTimes(1)
-			expect(mockQdrantClientInstance.createCollection).toHaveBeenCalledTimes(1)
-			expect(mockQdrantClientInstance.deleteCollection).not.toHaveBeenCalled()
-			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(6)
+			// Should NOT have tried to create collection — the error was transient, not "not found"
+			expect(mockQdrantClientInstance.createCollection).not.toHaveBeenCalled()
 			expect(console.warn).toHaveBeenCalledWith(
-				expect.stringContaining(`Warning during getCollectionInfo for "${expectedCollectionName}"`),
-				genericError.message,
+				expect.stringContaining(`Transient error during getCollectionInfo for "${expectedCollectionName}"`),
+				expect.any(String),
 			)
 			;(console.warn as any).mockRestore()
 		})
@@ -1007,18 +1006,19 @@ describe("QdrantVectorStore", () => {
 		expect(mockQdrantClientInstance.getCollection).toHaveBeenCalledWith(expectedCollectionName)
 	})
 
-	it("should return false and log warning for non-404 errors", async () => {
+	it("should return false for non-404 errors (transient errors caught internally)", async () => {
 		const genericError = new Error("Network error")
 		mockQdrantClientInstance.getCollection.mockRejectedValue(genericError)
 		vitest.spyOn(console, "warn").mockImplementation(() => {})
 
+		// collectionExists() catches QdrantTransientError and returns false
 		const result = await vectorStore.collectionExists()
 
 		expect(result).toBe(false)
 		expect(mockQdrantClientInstance.getCollection).toHaveBeenCalledTimes(1)
 		expect(console.warn).toHaveBeenCalledWith(
-			expect.stringContaining(`Warning during getCollectionInfo for "${expectedCollectionName}"`),
-			genericError.message,
+			expect.stringContaining(`Transient error during getCollectionInfo for "${expectedCollectionName}"`),
+			expect.any(String),
 		)
 		;(console.warn as any).mockRestore()
 	})
@@ -1773,6 +1773,52 @@ describe("QdrantVectorStore", () => {
 					must_not: [{ key: "type", match: { value: "metadata" } }],
 				}) // Should still create filter for regular paths
 			})
+		})
+	})
+
+	describe("getPointCount", () => {
+		it("should return points_count minus 1 (for metadata marker)", async () => {
+			mockQdrantClientInstance.getCollection.mockResolvedValue({
+				points_count: 5001,
+				config: { params: { vectors: { size: mockVectorSize } } },
+			})
+
+			const count = await vectorStore.getPointCount()
+			expect(count).toBe(5000) // 5001 - 1 metadata point
+		})
+
+		it("should return 0 when collection has no points", async () => {
+			mockQdrantClientInstance.getCollection.mockResolvedValue({
+				points_count: 0,
+				config: { params: { vectors: { size: mockVectorSize } } },
+			})
+
+			const count = await vectorStore.getPointCount()
+			expect(count).toBe(0)
+		})
+
+		it("should return 0 when collection has only metadata point", async () => {
+			mockQdrantClientInstance.getCollection.mockResolvedValue({
+				points_count: 1,
+				config: { params: { vectors: { size: mockVectorSize } } },
+			})
+
+			const count = await vectorStore.getPointCount()
+			expect(count).toBe(0) // 1 - 1 = 0
+		})
+
+		it("should return 0 when collection does not exist", async () => {
+			mockQdrantClientInstance.getCollection.mockRejectedValue({ status: 404, message: "Not found" })
+
+			const count = await vectorStore.getPointCount()
+			expect(count).toBe(0)
+		})
+
+		it("should return 0 on transient error", async () => {
+			mockQdrantClientInstance.getCollection.mockRejectedValue(new Error("Connection refused"))
+
+			const count = await vectorStore.getPointCount()
+			expect(count).toBe(0)
 		})
 	})
 })

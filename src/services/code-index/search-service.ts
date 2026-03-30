@@ -41,8 +41,8 @@ export class CodeIndexSearchService {
 		}
 
 		try {
-			// Generate embedding for query
-			const embeddingResponse = await this.embedder.createEmbeddings([query])
+			// Generate embedding for query with isQuery flag for asymmetric prefix support
+			const embeddingResponse = await this.embedder.createEmbeddings([query], undefined, { isQuery: true })
 			const vector = embeddingResponse?.embeddings[0]
 			if (!vector) {
 				throw new Error("Failed to generate embedding for query.")

@@ -424,6 +424,16 @@ export async function activate(context: vscode.ExtensionContext) {
 export async function deactivate() {
 	outputChannel.appendLine(`${Package.name} extension deactivated`)
 
+	// Flush code index caches FIRST to prevent data loss on shutdown.
+	// This must run before the process exits to ensure partial indexing progress is saved.
+	try {
+		await CodeIndexManager.flushAllCaches()
+	} catch (error) {
+		outputChannel.appendLine(
+			`[CodeIndexManager] Failed to flush caches on deactivate: ${error instanceof Error ? error.message : String(error)}`,
+		)
+	}
+
 	if (cloudService && CloudService.hasInstance()) {
 		try {
 			if (authStateChangedHandler) {

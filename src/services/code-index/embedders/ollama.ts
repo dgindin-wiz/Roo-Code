@@ -35,12 +35,17 @@ export class CodeIndexOllamaEmbedder implements IEmbedder {
 	 * @param model - Optional model ID to override the default.
 	 * @returns A promise that resolves to an EmbeddingResponse containing the embeddings and usage data.
 	 */
-	async createEmbeddings(texts: string[], model?: string): Promise<EmbeddingResponse> {
+	async createEmbeddings(
+		texts: string[],
+		model?: string,
+		options?: { isQuery?: boolean },
+	): Promise<EmbeddingResponse> {
 		const modelToUse = model || this.defaultModelId
 		const url = `${this.baseUrl}/api/embed` // Endpoint as specified
 
-		// Apply model-specific query prefix if required
-		const queryPrefix = getModelQueryPrefix("ollama", modelToUse)
+		// Apply model-specific query prefix only for search queries (asymmetric embedding)
+		// Document embeddings during indexing should NOT get the query prefix
+		const queryPrefix = options?.isQuery ? getModelQueryPrefix("ollama", modelToUse) : undefined
 		const processedTexts = queryPrefix
 			? texts.map((text, index) => {
 					// Prevent double-prefixing

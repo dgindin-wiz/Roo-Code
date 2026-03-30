@@ -750,6 +750,14 @@ export interface IndexingStatus {
 	workspacePath?: string
 	workspaceEnabled?: boolean
 	autoEnableDefault?: boolean
+	// Two-phase progress fields
+	phase?: "scanning" | "embedding" | "complete"
+	totalFiles?: number
+	processedFiles?: number
+	totalBlocks?: number
+	blocksEmbedded?: number
+	estimatedTimeRemainingMs?: number | null
+	isEstimatedTotal?: boolean
 }
 
 export interface IndexingStatusUpdateMessage {

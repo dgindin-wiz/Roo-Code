@@ -1,6 +1,23 @@
 import * as vscode from "vscode"
+import { IndexDebugLogger } from "./debug-logger"
 
 export type IndexingState = "Standby" | "Indexing" | "Indexed" | "Error" | "Stopping"
+
+export type IndexingPhase = "scanning" | "embedding" | "complete"
+
+/**
+ * Formats milliseconds into a human-readable ETA string.
+ */
+export function formatEta(ms: number): string {
+	if (ms < 10_000) return "almost done"
+	if (ms < 60_000) return `~${Math.round(ms / 1000)} sec remaining`
+	const minutes = Math.round(ms / 60_000)
+	if (minutes < 60) return `~${minutes} min remaining`
+	const hours = Math.floor(minutes / 60)
+	const remainingMinutes = minutes % 60
+	if (remainingMinutes === 0) return `~${hours} hr remaining`
+	return `~${hours} hr ${remainingMinutes} min remaining`
+}
 
 export class CodeIndexStateManager {
 	private _systemStatus: IndexingState = "Standby"
@@ -9,6 +26,19 @@ export class CodeIndexStateManager {
 	private _totalItems: number = 0
 	private _currentItemUnit: string = "blocks"
 	private _progressEmitter = new vscode.EventEmitter<ReturnType<typeof this.getCurrentStatus>>()
+
+	// Two-phase progress fields
+	private _phase: IndexingPhase | undefined
+	private _totalFiles: number = 0
+	private _processedFiles: number = 0
+	private _filesParsed: number = 0 // files actually parsed (not skipped), for ETA during estimated totals
+	private _totalBlocks: number = 0
+	private _blocksEmbedded: number = 0
+	private _startingBlockCount: number = 0 // pre-existing blocks in Qdrant from a previous session
+	private _isEstimatedTotal: boolean = false
+	private _embedStartedAt: number = 0
+	private _estimatedTimeRemainingMs: number | null = null
+	private static readonly MIN_PROGRESS_FOR_ETA = 0.01 // 1% — show ETA early; block-level progress is stable
 
 	// --- Public API ---
 
@@ -19,12 +49,23 @@ export class CodeIndexStateManager {
 	}
 
 	public getCurrentStatus() {
+		// Effective counts include the pre-existing Qdrant blocks from a previous session.
+		// This makes the UI show the real index size, not just this session's work.
+		const effectiveBlocksEmbedded = this._startingBlockCount + this._blocksEmbedded
 		return {
 			systemStatus: this._systemStatus,
 			message: this._statusMessage,
 			processedItems: this._processedItems,
 			totalItems: this._totalItems,
 			currentItemUnit: this._currentItemUnit,
+			// Two-phase fields
+			phase: this._phase,
+			totalFiles: this._totalFiles,
+			processedFiles: this._processedFiles,
+			totalBlocks: this._totalBlocks,
+			blocksEmbedded: effectiveBlocksEmbedded,
+			estimatedTimeRemainingMs: this._estimatedTimeRemainingMs,
+			isEstimatedTotal: this._isEstimatedTotal,
 		}
 	}
 
@@ -49,13 +90,257 @@ export class CodeIndexStateManager {
 				if (newState === "Standby" && message === undefined) this._statusMessage = "Ready."
 				if (newState === "Indexed" && message === undefined) this._statusMessage = "Index up-to-date."
 				if (newState === "Error" && message === undefined) this._statusMessage = "An error occurred."
+				// Reset two-phase fields
+				if (newState !== "Stopping") {
+					this._phase = newState === "Indexed" ? "complete" : undefined
+					this._estimatedTimeRemainingMs = null
+				}
 			}
 
 			this._progressEmitter.fire(this.getCurrentStatus())
+			IndexDebugLogger.log("StateManager", "setSystemState", {
+				phaseTransition: true,
+				newState,
+				message: message?.substring(0, 80),
+			})
 		}
 	}
 
-	public reportBlockIndexingProgress(processedItems: number, totalItems: number): void {
+	// --- Two-Phase Progress ---
+
+	/**
+	 * Called when indexing begins to initialize timing.
+	 */
+	public startIndexingTimer(): void {
+		this._estimatedTimeRemainingMs = null
+	}
+
+	/**
+	 * Reports progress during the scan phase (checking files for changes).
+	 */
+	public reportScanProgress(scannedFiles: number, totalFiles: number): void {
+		if (this._systemStatus === "Stopping") return
+
+		this._phase = "scanning"
+		this._totalFiles = totalFiles
+		this._processedFiles = scannedFiles
+		this._processedItems = scannedFiles
+		this._totalItems = totalFiles
+		this._currentItemUnit = "files"
+		this._systemStatus = "Indexing"
+		this._statusMessage = `Checking ${totalFiles.toLocaleString()} files for changes...`
+
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "reportScanProgress", { scannedFiles, totalFiles })
+	}
+
+	/**
+	 * Sets the total block estimate and transitions to embedding phase.
+	 * @param totalBlocks Estimated total blocks across the entire workspace
+	 * @param isEstimate Whether the total is an estimate (true) or exact (false)
+	 * @param changedFiles Number of changed files to process
+	 * @param startingBlockCount Pre-existing blocks in Qdrant from a previous session (for resume display)
+	 */
+	public startEmbedPhase(
+		totalBlocks: number,
+		isEstimate: boolean,
+		changedFiles?: number,
+		startingBlockCount?: number,
+	): void {
+		if (this._systemStatus === "Stopping") return
+
+		this._phase = "embedding"
+		this._totalBlocks = totalBlocks
+		this._blocksEmbedded = 0
+		this._startingBlockCount = startingBlockCount ?? 0
+		this._isEstimatedTotal = isEstimate
+		this._embedStartedAt = Date.now()
+		this._estimatedTimeRemainingMs = null
+
+		// Also update legacy fields for backward compat
+		this._processedItems = this._startingBlockCount
+		this._totalItems = totalBlocks
+		this._currentItemUnit = "blocks"
+		this._systemStatus = "Indexing"
+
+		const prefix = isEstimate ? "~" : ""
+		const changedSuffix = changedFiles !== undefined ? ` from ${changedFiles.toLocaleString()} files` : ""
+		this._statusMessage = `${prefix}${totalBlocks.toLocaleString()} blocks to index${changedSuffix}`
+
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "startEmbedPhase", {
+			phaseTransition: true,
+			totalBlocks,
+			isEstimate,
+			changedFiles,
+			startingBlockCount,
+		})
+	}
+
+	/**
+	 * Reports progress during the embedding phase.
+	 * Progress bar and ETA both use block-based metrics (uniform embedding cost per block).
+	 * Message shows blocks progress + throughput + ETA.
+	 *
+	 * Display shows (startingBlockCount + blocksEmbedded) as the "Embedded X" count,
+	 * so on resume the user sees the real index size growing, not starting from 0.
+	 * ETA uses only blocksEmbedded (new work this session) for throughput calculation.
+	 *
+	 * @param isExact When true, clears the "~" prefix — parsing is complete and total is exact.
+	 */
+	public reportEmbedProgress(
+		blocksEmbedded: number,
+		revisedTotal?: number,
+		filesParsed?: number,
+		isExact?: boolean,
+	): void {
+		if (this._systemStatus === "Stopping") return
+
+		const blocksChanged = blocksEmbedded !== this._blocksEmbedded
+		const totalChanged = revisedTotal !== undefined && revisedTotal !== this._totalBlocks
+		const filesChanged = filesParsed !== undefined && filesParsed !== this._filesParsed
+		const changed = blocksChanged || totalChanged || filesChanged
+		if (!changed && this._systemStatus === "Indexing") {
+			IndexDebugLogger.logSuppressed("StateManager", "reportEmbedProgress", {
+				blocksEmbedded,
+				revisedTotal,
+				filesParsed,
+				storedBlocks: this._blocksEmbedded,
+				storedTotal: this._totalBlocks,
+				storedFiles: this._filesParsed,
+			})
+			return
+		}
+
+		this._blocksEmbedded = blocksEmbedded
+		if (revisedTotal !== undefined) {
+			this._totalBlocks = revisedTotal
+		}
+		if (isExact) {
+			this._isEstimatedTotal = false
+		}
+		if (filesParsed !== undefined) {
+			this._filesParsed = filesParsed
+		}
+
+		// Effective embedded = pre-existing + new this session
+		const effectiveEmbedded = this._startingBlockCount + this._blocksEmbedded
+
+		// Use block-level progress for bar + ETA (uniform cost per block)
+		this._processedItems = effectiveEmbedded
+		this._totalItems = this._totalBlocks
+		this._processedFiles = this._filesParsed
+		this._currentItemUnit = "blocks"
+		this._phase = "embedding"
+		this._systemStatus = "Indexing"
+
+		// Calculate ETA from block throughput (this session only)
+		this._updateEta()
+
+		// Calculate blocks/sec throughput for display (this session only)
+		const elapsedSec = (Date.now() - this._embedStartedAt) / 1000
+		const blocksPerSec = elapsedSec > 0 ? this._blocksEmbedded / elapsedSec : 0
+
+		// Build message with two lines:
+		// Line 1: "Embedded X of ~Y total blocks (N blocks/sec) — ~Z remaining"
+		//   X = startingBlockCount + blocksEmbedded (real index size)
+		//   Y = total blocks in workspace
+		// Line 2: "X of Y files checked"
+		// "total blocks" makes it clear Y is the full workspace total, not remaining.
+		const throughputPart =
+			blocksPerSec >= 1
+				? ` (${Math.round(blocksPerSec).toLocaleString()} blocks/sec)`
+				: blocksPerSec > 0
+					? " (<1 block/sec)"
+					: ""
+		const etaSuffix =
+			this._estimatedTimeRemainingMs !== null
+				? ` — ${formatEta(this._estimatedTimeRemainingMs)}`
+				: this._blocksEmbedded > 0
+					? " — estimating..."
+					: ""
+		const prefix = this._isEstimatedTotal ? "~" : ""
+		const blockLine = `Embedded ${effectiveEmbedded.toLocaleString()} of ${prefix}${this._totalBlocks.toLocaleString()} total blocks${throughputPart}${etaSuffix}`
+		const fileLine =
+			this._totalFiles > 0
+				? `\n${this._filesParsed.toLocaleString()} of ${this._totalFiles.toLocaleString()} files checked`
+				: ""
+		this._statusMessage = `${blockLine}${fileLine}`
+
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "reportEmbedProgress", {
+			blocksEmbedded,
+			revisedTotal,
+			filesParsed,
+			isExact,
+			startingBlockCount: this._startingBlockCount,
+			effectiveEmbedded,
+		})
+	}
+
+	/**
+	 * Reports completion with final stats.
+	 */
+	public reportComplete(totalBlocks: number, totalFiles: number): void {
+		this._phase = "complete"
+		this._totalBlocks = totalBlocks
+		this._blocksEmbedded = totalBlocks
+		this._startingBlockCount = 0 // Reset — total already includes everything
+		this._totalFiles = totalFiles
+		this._isEstimatedTotal = false
+		this._estimatedTimeRemainingMs = null
+		this._processedItems = totalBlocks
+		this._totalItems = totalBlocks
+		this._systemStatus = "Indexed"
+
+		if (totalBlocks > 0) {
+			this._statusMessage = `Index complete — ${totalBlocks.toLocaleString()} blocks across ${totalFiles.toLocaleString()} files`
+		} else {
+			// Block count unknown (old cache without blockCounts, or vector store unreachable)
+			this._statusMessage =
+				totalFiles > 0 ? `Index up-to-date — ${totalFiles.toLocaleString()} files` : "Index up-to-date"
+		}
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "reportComplete", { phaseTransition: true, totalBlocks, totalFiles })
+	}
+
+	/**
+	 * Calculates ETA using block-level throughput.
+	 *
+	 * On resume, _startingBlockCount represents pre-existing blocks from Qdrant.
+	 * ETA uses only _blocksEmbedded (new work this session) for throughput,
+	 * then estimates time for remaining = totalBlocks - startingBlockCount - blocksEmbedded.
+	 */
+	private _updateEta(): void {
+		const elapsed = Date.now() - this._embedStartedAt
+		if (elapsed <= 0 || this._totalBlocks <= 0 || this._blocksEmbedded <= 0) {
+			this._estimatedTimeRemainingMs = null
+			return
+		}
+
+		// Effective progress = (startingBlockCount + blocksEmbedded) / totalBlocks
+		const effectiveEmbedded = this._startingBlockCount + this._blocksEmbedded
+		const progress = effectiveEmbedded / this._totalBlocks
+
+		if (progress < CodeIndexStateManager.MIN_PROGRESS_FOR_ETA) {
+			this._estimatedTimeRemainingMs = null
+			return
+		}
+
+		// Throughput based on THIS session's work only (not pre-existing blocks)
+		const blocksPerMs = this._blocksEmbedded / elapsed
+		// Remaining blocks to embed this session
+		const remainingBlocks = Math.max(0, this._totalBlocks - effectiveEmbedded)
+		this._estimatedTimeRemainingMs = blocksPerMs > 0 ? Math.max(0, Math.round(remainingBlocks / blocksPerMs)) : null
+	}
+
+	// --- Legacy methods (used by file watcher) ---
+
+	public reportBlockIndexingProgress(
+		processedItems: number,
+		totalItems: number,
+		options?: { skippedFiles?: number; totalFiles?: number },
+	): void {
 		const progressChanged = processedItems !== this._processedItems || totalItems !== this._totalItems
 
 		// Don't override Stopping state with progress updates
@@ -66,7 +351,16 @@ export class CodeIndexStateManager {
 			this._totalItems = totalItems
 			this._currentItemUnit = "blocks"
 
-			const message = `Indexed ${this._processedItems} / ${this._totalItems} ${this._currentItemUnit} found`
+			// Build context suffix showing file-level info
+			const parts: string[] = []
+			if (options?.totalFiles && options.totalFiles > 0) {
+				parts.push(`${options.totalFiles.toLocaleString()} files`)
+			}
+			if (options?.skippedFiles && options.skippedFiles > 0) {
+				parts.push(`${options.skippedFiles.toLocaleString()} unchanged`)
+			}
+			const suffix = parts.length > 0 ? ` (${parts.join(", ")})` : ""
+			const message = `Indexed ${this._processedItems.toLocaleString()} / ${this._totalItems.toLocaleString()} blocks found${suffix}`
 			const oldStatus = this._systemStatus
 			const oldMessage = this._statusMessage
 
@@ -93,11 +387,11 @@ export class CodeIndexStateManager {
 
 			let message: string
 			if (totalFiles > 0 && processedFiles < totalFiles) {
-				message = `Processing ${processedFiles} / ${totalFiles} ${this._currentItemUnit}. Current: ${
-					currentFileBasename || "..."
+				message = `Updating index: ${processedFiles} / ${totalFiles} files${
+					currentFileBasename ? ` — ${currentFileBasename}` : ""
 				}`
 			} else if (totalFiles > 0 && processedFiles === totalFiles) {
-				message = `Finished processing ${totalFiles} ${this._currentItemUnit} from queue.`
+				message = `Finished processing ${totalFiles} files from queue.`
 			} else {
 				message = `File queue processed.`
 			}

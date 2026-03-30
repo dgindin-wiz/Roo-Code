@@ -16,6 +16,21 @@ interface IndexingStatusBadgeProps {
 	className?: string
 }
 
+/**
+ * Formats milliseconds into a human-readable ETA string for display.
+ * Mirrors the server-side formatEta() in state-manager.ts.
+ */
+function formatEtaForDisplay(ms: number): string {
+	if (ms < 10_000) return "almost done"
+	if (ms < 60_000) return `~${Math.round(ms / 1000)}s remaining`
+	const minutes = Math.round(ms / 60_000)
+	if (minutes < 60) return `~${minutes}m remaining`
+	const hours = Math.floor(minutes / 60)
+	const remainingMinutes = minutes % 60
+	if (remainingMinutes === 0) return `~${hours}h remaining`
+	return `~${hours}h ${remainingMinutes}m remaining`
+}
+
 export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ className }) => {
 	const { t } = useAppTranslation()
 	const { cwd } = useExtensionState()
@@ -48,20 +63,34 @@ export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ classN
 		}
 	}, [cwd])
 
-	const progressPercentage = useMemo(
-		() =>
-			indexingStatus.totalItems > 0
-				? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
-				: 0,
-		[indexingStatus.processedItems, indexingStatus.totalItems],
-	)
+	const progressPercentage = useMemo(() => {
+		// Use block-level progress during embedding (uniform cost per block → accurate ETA)
+		if (indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0) {
+			return Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100)
+		}
+		// Fall back to legacy fields
+		return indexingStatus.totalItems > 0
+			? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
+			: 0
+	}, [
+		indexingStatus.phase,
+		indexingStatus.blocksEmbedded,
+		indexingStatus.totalBlocks,
+		indexingStatus.processedItems,
+		indexingStatus.totalItems,
+	])
 
 	const tooltipText = useMemo(() => {
 		switch (indexingStatus.systemStatus) {
 			case "Standby":
 				return t("chat:indexingStatus.ready")
-			case "Indexing":
-				return t("chat:indexingStatus.indexing", { percentage: progressPercentage })
+			case "Indexing": {
+				const etaText =
+					indexingStatus.estimatedTimeRemainingMs != null
+						? ` — ${formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}`
+						: ""
+				return `${t("chat:indexingStatus.indexing", { percentage: progressPercentage })}${etaText}`
+			}
 			case "Indexed":
 				return t("chat:indexingStatus.indexed")
 			case "Stopping":
@@ -71,7 +100,7 @@ export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ classN
 			default:
 				return t("chat:indexingStatus.status")
 		}
-	}, [indexingStatus.systemStatus, progressPercentage, t])
+	}, [indexingStatus.systemStatus, indexingStatus.estimatedTimeRemainingMs, progressPercentage, t])
 
 	const statusColorClass = useMemo(() => {
 		const statusColors = {

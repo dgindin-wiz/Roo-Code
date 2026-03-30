@@ -2734,18 +2734,15 @@ export const webviewMessageHandler = async (
 				await manager.setWorkspaceEnabled(true)
 
 				if (manager.isFeatureEnabled && manager.isFeatureConfigured) {
+					// initialize() handles service creation and will call startIndexing()
+					// internally when shouldStartOrRestartIndexing is true.
+					// We only need a single initialize() call, then check if we need
+					// an explicit startIndexing() for cases where initialize() didn't trigger it.
 					await manager.initialize(provider.contextProxy)
 
 					const currentState = manager.state
 					if (currentState === "Standby" || currentState === "Error") {
 						manager.startIndexing()
-
-						if (!manager.isInitialized) {
-							await manager.initialize(provider.contextProxy)
-							if (manager.state === "Standby" || manager.state === "Error") {
-								manager.startIndexing()
-							}
-						}
 					}
 				}
 			} catch (error) {
