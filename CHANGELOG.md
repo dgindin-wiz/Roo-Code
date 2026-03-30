@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### Codebase Indexing: UI Responsive Improvements & New Controls (2026-03-30 08:47)
+
+#### Fixed
+
+- **Missing Stopping status color in popover**: Status dot had no color mapping for the "Stopping" state, rendering an invisible dot. Added `bg-amber-500 animate-pulse` matching IndexingStatusBadge behavior.
+- **Inline style violation**: Replaced `style={{ display: "inline" }}` with Tailwind class `className="inline"` in the Learn More link.
+- **Inconsistent checkboxes**: Auto-enable default and workspace toggle used raw `<input type="checkbox">` instead of `VSCodeCheckbox`, causing visual inconsistency with the global enable toggle.
+
+#### Changed
+
+- **Sticky action footer**: Moved Save/Start/Stop/Clear buttons from the scrollable body into a fixed footer with `border-t` separator. Popover body now scrolls independently via `flex-col` + `overflow-y-auto` + `min-h-0`.
+- **Flex-wrap on button row**: Action buttons now use `flex-wrap` to stack gracefully at narrow panel widths instead of colliding.
+- **Slider minimum width**: Added `min-w-[80px]` to both Search Score and Max Results sliders to prevent them from being squeezed to unusable sizes.
+- **Progress bar minimum width**: Added `min-w-[80px]` to the indexing progress bar for consistent sizing.
+
+#### Added
+
+- **ETA display below progress bar**: Shows estimated time remaining during embedding phase using `estimatedTimeRemainingMs` from IndexingStatus (e.g., "~3m remaining").
+- **Phase label during indexing**: Displays current phase — "Scanning files… 120/500" or "Embedding blocks… 340/1200" — using the two-phase progress data from IndexingStatus.
+- **Index stats when Indexed**: Shows summary (e.g., "500 files · 1,200 blocks") in the status section when indexing is complete.
+- **Re-index button**: New button in the Indexed state that triggers re-indexing without requiring Clear → Start. Sends the existing `startIndexing` message.
+- **"stopping" translation key**: Added missing `"stopping": "Stopping"` to `indexingStatuses` in en/settings.json.
+
+#### Tested
+
+- 26 new tests covering: formatEtaForDisplay helper, status dot color mapping for all 5 states, phase label rendering logic, index stats rendering, re-index button visibility/disabled conditions, and ETA display conditions.
+- All 43 CodeIndex-related webview tests passing.
+
 ### Codebase Indexing: Embed Pipeline Robustness & Stuck Prevention (2026-03-28 00:29)
 
 #### Fixed

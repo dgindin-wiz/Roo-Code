@@ -51,6 +51,21 @@ import {
 const DEFAULT_QDRANT_URL = "http://localhost:6333"
 const DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
+/**
+ * Formats milliseconds into a human-readable ETA string for display.
+ * Mirrors the server-side formatEta() in state-manager.ts.
+ */
+function formatEtaForDisplay(ms: number): string {
+	if (ms < 10_000) return "almost done"
+	if (ms < 60_000) return `~${Math.round(ms / 1000)}s remaining`
+	const minutes = Math.round(ms / 60_000)
+	if (minutes < 60) return `~${minutes}m remaining`
+	const hours = Math.floor(minutes / 60)
+	const remainingMinutes = minutes % 60
+	if (remainingMinutes === 0) return `~${hours}h remaining`
+	return `~${hours}h ${remainingMinutes}m remaining`
+}
+
 interface CodeIndexPopoverProps {
 	children: React.ReactNode
 	indexingStatus: IndexingStatus
@@ -619,7 +634,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 				}}>
 				{children}
 				<PopoverContent
-					className="w-[calc(100vw-32px)] max-w-[450px] max-h-[80vh] overflow-y-auto p-0"
+					className="w-[calc(100vw-32px)] max-w-[450px] max-h-[80vh] flex flex-col p-0"
 					align="end"
 					alignOffset={0}
 					side="bottom"
@@ -627,7 +642,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 					collisionPadding={16}
 					avoidCollisions={true}
 					container={portalContainer}>
-					<div className="p-3 border-b border-vscode-dropdown-border cursor-default">
+					<div className="p-3 border-b border-vscode-dropdown-border cursor-default flex-shrink-0">
 						<div className="flex flex-row items-center gap-1 p-0 mt-0 mb-1 w-full">
 							<h4 className="m-0 pb-2 flex-1">{t("settings:codeIndex.title")}</h4>
 						</div>
@@ -635,13 +650,13 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 							<Trans i18nKey="settings:codeIndex.description">
 								<VSCodeLink
 									href={buildDocLink("features/experimental/codebase-indexing", "settings")}
-									style={{ display: "inline" }}
+									className="inline"
 								/>
 							</Trans>
 						</p>
 					</div>
 
-					<div className="p-4">
+					<div className="p-4 overflow-y-auto flex-1 min-h-0">
 						{/* Enable/Disable Toggle */}
 						<div className="mb-4">
 							<div className="flex items-center gap-2">
@@ -665,6 +680,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 										"bg-gray-400": indexingStatus.systemStatus === "Standby",
 										"bg-yellow-500 animate-pulse": indexingStatus.systemStatus === "Indexing",
 										"bg-green-500": indexingStatus.systemStatus === "Indexed",
+										"bg-amber-500 animate-pulse": indexingStatus.systemStatus === "Stopping",
 										"bg-red-500": indexingStatus.systemStatus === "Error",
 									})}
 								/>
@@ -672,11 +688,44 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 								{indexingStatus.message ? ` - ${indexingStatus.message}` : ""}
 							</div>
 
+							{/* Index stats when indexed */}
+							{indexingStatus.systemStatus === "Indexed" &&
+								(indexingStatus.totalFiles || indexingStatus.totalBlocks) && (
+									<div className="text-xs text-vscode-descriptionForeground">
+										{indexingStatus.totalFiles != null &&
+											t("settings:codeIndex.indexedFilesCount", {
+												count: indexingStatus.totalFiles,
+											})}
+										{indexingStatus.totalFiles != null &&
+											indexingStatus.totalBlocks != null &&
+											" · "}
+										{indexingStatus.totalBlocks != null &&
+											t("settings:codeIndex.indexedBlocksCount", {
+												count: indexingStatus.totalBlocks,
+											})}
+									</div>
+								)}
+
 							{indexingStatus.systemStatus === "Indexing" && (
-								<div className="mt-2">
+								<div className="mt-2 space-y-1">
+									{/* Phase label */}
+									{indexingStatus.phase && (
+										<div className="text-xs text-vscode-descriptionForeground">
+											{indexingStatus.phase === "scanning" &&
+												t("settings:codeIndex.phaseScanning", {
+													processed: indexingStatus.processedFiles ?? 0,
+													total: indexingStatus.totalFiles ?? "?",
+												})}
+											{indexingStatus.phase === "embedding" &&
+												t("settings:codeIndex.phaseEmbedding", {
+													embedded: indexingStatus.blocksEmbedded ?? 0,
+													total: indexingStatus.totalBlocks ?? "?",
+												})}
+										</div>
+									)}
 									<div className="flex items-center gap-2">
 										<ProgressPrimitive.Root
-											className="relative h-2 w-full overflow-hidden rounded-full bg-secondary"
+											className="relative h-2 w-full overflow-hidden rounded-full bg-secondary min-w-[80px]"
 											value={progressPercentage}>
 											<ProgressPrimitive.Indicator
 												className="h-full w-full flex-1 bg-primary transition-transform duration-300 ease-in-out"
@@ -689,6 +738,12 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 											{progressPercentage}%
 										</span>
 									</div>
+									{/* ETA display */}
+									{indexingStatus.estimatedTimeRemainingMs != null && (
+										<div className="text-xs text-vscode-descriptionForeground">
+											{formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}
+										</div>
+									)}
 								</div>
 							)}
 						</div>
@@ -1534,7 +1589,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 												onValueChange={(values) =>
 													updateSetting("codebaseIndexSearchMinScore", values[0])
 												}
-												className="flex-1"
+												className="flex-1 min-w-[80px]"
 												data-testid="search-min-score-slider"
 											/>
 											<span className="w-12 text-center">
@@ -1580,7 +1635,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 												onValueChange={(values) =>
 													updateSetting("codebaseIndexSearchMaxResults", values[0])
 												}
-												className="flex-1"
+												className="flex-1 min-w-[80px]"
 												data-testid="search-max-results-slider"
 											/>
 											<span className="w-12 text-center">
@@ -1607,46 +1662,32 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 						{/* Auto-enable default */}
 						{currentSettings.codebaseIndexEnabled && (
 							<div className="flex items-center gap-2 pt-4 pb-1">
-								<input
-									type="checkbox"
-									id="auto-enable-default-toggle"
+								<VSCodeCheckbox
 									checked={indexingStatus.autoEnableDefault ?? true}
-									onChange={(e) =>
+									onChange={(e: any) =>
 										vscode.postMessage({
 											type: "setAutoEnableDefault",
 											bool: e.target.checked,
 										})
-									}
-									className="accent-vscode-focusBorder"
-								/>
-								<label
-									htmlFor="auto-enable-default-toggle"
-									className="text-xs text-vscode-foreground cursor-pointer">
-									{t("settings:codeIndex.autoEnableDefaultLabel")}
-								</label>
+									}>
+									<span className="text-xs">{t("settings:codeIndex.autoEnableDefaultLabel")}</span>
+								</VSCodeCheckbox>
 							</div>
 						)}
 
 						{/* Workspace Toggle */}
 						{currentSettings.codebaseIndexEnabled && (
 							<div className="flex items-center gap-2 pt-1 pb-2">
-								<input
-									type="checkbox"
-									id="workspace-indexing-toggle"
+								<VSCodeCheckbox
 									checked={indexingStatus.workspaceEnabled ?? false}
-									onChange={(e) =>
+									onChange={(e: any) =>
 										vscode.postMessage({
 											type: "toggleWorkspaceIndexing",
 											bool: e.target.checked,
 										})
-									}
-									className="accent-vscode-focusBorder"
-								/>
-								<label
-									htmlFor="workspace-indexing-toggle"
-									className="text-xs text-vscode-foreground cursor-pointer">
-									{t("settings:codeIndex.workspaceToggleLabel")}
-								</label>
+									}>
+									<span className="text-xs">{t("settings:codeIndex.workspaceToggleLabel")}</span>
+								</VSCodeCheckbox>
 							</div>
 						)}
 
@@ -1655,10 +1696,12 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 								{t("settings:codeIndex.workspaceDisabledMessage")}
 							</p>
 						)}
+					</div>
 
-						{/* Action Buttons */}
-						<div className="flex items-center justify-between gap-2 pt-6">
-							<div className="flex gap-2">
+					{/* Sticky Action Footer */}
+					<div className="p-4 border-t border-vscode-dropdown-border flex-shrink-0">
+						<div className="flex flex-wrap items-center justify-between gap-2">
+							<div className="flex flex-wrap gap-2">
 								{currentSettings.codebaseIndexEnabled &&
 									(indexingStatus.systemStatus === "Error" ||
 										indexingStatus.systemStatus === "Standby") && (
@@ -1668,6 +1711,14 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 											{t("settings:codeIndex.startIndexingButton")}
 										</Button>
 									)}
+
+								{currentSettings.codebaseIndexEnabled && indexingStatus.systemStatus === "Indexed" && (
+									<Button
+										onClick={() => vscode.postMessage({ type: "startIndexing" })}
+										disabled={saveStatus === "saving" || hasUnsavedChanges}>
+										{t("settings:codeIndex.reindexButton")}
+									</Button>
+								)}
 
 								{currentSettings.codebaseIndexEnabled && indexingStatus.systemStatus === "Indexing" && (
 									<Button
