@@ -23,28 +23,47 @@ export interface ICodeParser {
 }
 
 /**
+ * Progress reported by the scanner during indexing.
+ */
+export interface ScanProgress {
+	phase: "discovering" | "parsing" | "embedding" | "complete"
+	filesChecked: number
+	totalFiles: number
+	blocksEmbedded: number
+	totalBlocksEstimate: number
+	isEstimatedTotal: boolean
+}
+
+/**
+ * Result returned when a scan completes.
+ */
+export interface ScanResult {
+	totalFiles: number
+	processedFiles: number
+	skippedFiles: number
+	totalBlocks: number
+	blocksEmbedded: number
+	errors: Error[]
+}
+
+/**
  * Interface for directory scanner
  */
 export interface IDirectoryScanner {
 	/**
-	 * Scans a directory for code blocks
-	 * @param directoryPath Path to the directory to scan
-	 * @param options Optional scanning options
+	 * Scans a directory for code files, parses them, and embeds/upserts to the vector store.
+	 * Emits progress events via `onProgress` and errors via `onError`.
+	 * @param directory Path to the directory to scan
+	 * @param signal AbortSignal for cancellation
 	 * @returns Promise resolving to scan results
 	 */
-	scanDirectory(
-		directory: string,
-		onError?: (error: Error) => void,
-		onBlocksIndexed?: (indexedCount: number) => void,
-		onFileParsed?: (fileBlockCount: number) => void,
-		signal?: AbortSignal,
-	): Promise<{
-		stats: {
-			processed: number
-			skipped: number
-		}
-		totalBlockCount: number
-	}>
+	scanDirectory(directory: string, signal: AbortSignal): Promise<ScanResult>
+
+	/** Fired whenever scan progress changes. */
+	readonly onProgress: vscode.Event<ScanProgress>
+
+	/** Fired for non-fatal errors during scanning. */
+	readonly onError: vscode.Event<Error>
 }
 
 /**

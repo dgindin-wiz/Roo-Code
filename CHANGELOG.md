@@ -1,5 +1,132 @@
 # Roo Code Changelog
 
+## [Unreleased]
+
+### Codebase Indexing: Embed Pipeline Robustness & Stuck Prevention (2026-03-28 00:29)
+
+#### Fixed
+
+- **File info tracking bug in embed phase**: `currentBatchFileInfos.push()` was placed AFTER the block accumulation loop, but `submitBatch()` was called INSIDE it. Batches were snapshotted with missing file info for the current file, causing cache updates to be skipped and files re-processed on resume. Fix: moved file info tracking BEFORE the block loop.
+- **No batch timeout causing pipeline deadlocks**: `_processBatch()` called `embedder.createEmbeddings()` and `qdrantClient.upsertPoints()` with no timeout. If the API or Qdrant hung, all `batchLimiter` slots filled, `Promise.race(activeBatchPromises)` never resolved, the BoundedChannel filled (200 capacity), and all `channel.push()` calls from the parse phase blocked — total deadlock. Fix: added `_withBatchTimeout()` wrapper (2-minute timeout per batch attempt) so hung batches fail fast and count toward `consecutiveBatchFailures`.
+- **Missing `isFeatureEnabled` guard in orchestrator**: `startIndexing()` checked `isFeatureConfigured` but NOT `isFeatureEnabled`. If the "Enable Codebase Indexing" checkbox was unchecked, the scan could still start via the orchestrator. Fix: added `isFeatureEnabled` check as defense-in-depth.
+
+#### Added
+
+- `BATCH_PROCESSING_TIMEOUT_MS` constant (120s) — per-batch timeout to prevent indefinite hangs from API/network issues
+- Debug logging for batch errors with timeout detection (`batch-error` events in debug log)
+
+#### Tests
+
+- Updated all orchestrator test mocks to include `isFeatureEnabled: true`
+
+### Codebase Indexing: Fix Block Count Inflation on Resume (2026-03-28 23:48)
+
+#### Fixed
+
+- **Scanner totalBlockEstimate was non-additive**: `totalBlockEstimate` used `max(cachedBlockEstimate, blocksFound)` but cached files (unchanged, mtime-matched) and candidates (new/changed) are **disjoint** sets. Once candidates' `blocksFound` exceeded the cached count, the cached value was lost. Total should be `cachedBlockEstimate + blocksFound`. Fix: replaced mutable `totalBlockEstimate` with `getTotalEstimate()` function that always returns `cachedBlockEstimate + blocksFound`. This was the dominant cause of inflated block counts on resume (e.g., 239K cached + 200K candidates showing as 440K instead of 440K — both numbers happened to be close in this case, but would diverge badly in other scenarios).
+- **Orphaned cache entries inflating getTotalCachedBlockCount()**: When quitting VS Code mid-index, `updateBlockCount()` is called during parse but `updateHash()` only happens after successful embedding. `flush()` from any completed batch writes ALL in-memory blockCounts to disk. On resume, `getTotalCachedBlockCount()` summed ALL blockCount entries including orphans (no hash). Fix: only count files that also have a hash entry.
+- **Orchestrator double-counting startingBlockCount**: Orchestrator was adding `startingBlockCount` (pre-existing Qdrant points) to `totalBlocksEstimate` (already represents ALL workspace blocks). Fix: pass `totalBlocksEstimate` directly — `startingBlockCount` is only a display offset.
+
+#### Tests
+
+- Updated `getTotalCachedBlockCount` test to require hash entries alongside blockCounts
+- Added test: "should exclude orphaned blockCounts (no hash) from total"
+- Added test: "should return 0 when all blockCounts are orphaned (no hashes)"
+- Added test: "should NOT add startingBlockCount to totalBlocksEstimate on resume (no double-counting)" in orchestrator tests
+
+### Codebase Indexing: Scanner Pipeline Re-Architecture (2026-03-28 01:18)
+
+Complete re-architecture of the scanner pipeline from a monolithic single-method design to a clean three-phase pipeline (Discover → Parse → Embed) with bounded backpressure and event-based progress reporting.
+
+#### Added
+
+- **`BoundedChannel<T>` utility** (`processors/bounded-channel.ts`): async producer-consumer queue with `push()`, `drain()` (AsyncGenerator), `close()`, and AbortSignal support for clean backpressure between parse and embed phases
+- **Event-based scanner progress**: `IDirectoryScanner` now uses `onProgress: Event<ScanProgress>` and `onError: Event<Error>` instead of 6+ callback parameters
+- **`ScanProgress` and `ScanResult` interfaces** for clean typed data flow between scanner and orchestrator
+- **15 new BoundedChannel tests** covering push/drain, backpressure, abort signal, and close behavior
+
+#### Changed
+
+- **Scanner rewritten with three-phase pipeline**:
+    - Phase 1 (Discover): list → filter → stat → classify by mtime. Unchanged files counted instantly (~90% of files in incremental scan), so file progress jumps to ~90% within 3 seconds
+    - Phase 2 (Parse): `parseLimiter` reads/hashes/parses candidates. Slots release IMMEDIATELY after parse — never wait on embedding
+    - Phase 3 (Embed): consumes from BoundedChannel, batches, embeds, upserts with fail-fast. Runs concurrently with Phase 2
+- **Backpressure moved outside `parseLimiter`**: `channel.push()` blocks the per-file outer promise, NOT the parseLimiter slot. Other files keep parsing while backpressure is applied
+- **Orchestrator simplified**: single `_runScan()` method replaces duplicate `_runIncrementalScan`/`_runFullScan`. Subscribes to scanner progress events and forwards to state manager
+- **Scanner API simplified**: `scanDirectory(directory, signal)` returns `ScanResult` — no more 6-parameter callback signature
+
+#### Fixed
+
+- **File/block progress out of sync**: Root cause was backpressure wait inside `parseLimiter` — when 10 changed files all block on embed backpressure, all 10 parseLimiter slots are occupied and remaining ~60K unchanged files can't even be counted. Fixed by moving backpressure to BoundedChannel outside parseLimiter
+- **parseLimiter starvation**: parseLimiter slots could be held indefinitely while waiting for embed queue depth to decrease. Now parseLimiter always releases after parse, and backpressure is in the BoundedChannel push
+
+#### Tests
+
+- Scanner tests updated for new `scanDirectory(dir, signal)` API and event-based progress
+- Orchestrator tests updated with `createMockScanner()` helper supporting `onProgress`/`onError` events
+- 15 new BoundedChannel tests (constructor validation, push/drain, backpressure, abort signal, close behavior)
+- All 574 code-index tests passing
+
+### Codebase Indexing: Reliability, Performance, and Progress Accuracy Overhaul
+
+Major improvements to the codebase indexing feature making it production-ready for large workspaces (65K+ files, 2M+ code blocks). Addresses indexing stability on VS Code restart, accurate progress display, and resilience to transient errors.
+
+#### Added
+
+- **Two-phase indexing progress with ETA**: scanning → embedding phases with accurate block-level throughput, percentage, and estimated time remaining in the UI
+    - `StateManager` rewritten with phase-aware progress: `startIndexingTimer()`, `reportScanProgress()`, `startEmbedPhase()`, `reportEmbedProgress()`, `reportComplete()`
+    - `formatEta()` utility for human-readable time remaining display
+    - `~` (tilde) prefix on block counts when total is estimated (self-corrects as parsing proceeds)
+    - Two-line status: "Embedded X of ~Y total blocks (N blocks/sec) — ~Z remaining" + "X of Y files checked"
+    - `CacheManager` extended with per-file `blockCounts` for progress estimation on future scans
+    - `IndexingStatus` type extended with `phase`, `totalBlocks`, `blocksEmbedded`, `estimatedTimeRemainingMs`, `isEstimatedTotal`
+    - WebView components (`CodeIndexPopover` + `IndexingStatusBadge`) updated with progress bar, percentage label, and ETA
+- **Configurable file cap**: `roo-cline.codeIndex.maxFiles` VS Code setting (default 100K, min 1K, max 500K). Applied after extension filtering so non-code files don't consume the budget.
+- **Auto-retry with exponential backoff** (5s, 15s, 30s) on transient Qdrant errors instead of requiring manual restart
+
+#### Changed
+
+- **Orchestrator refactored** into `_runFullScan()`, `_runIncrementalScan()`, `_validateScanResults()`, `_handleIndexingError()` — extracted from monolithic `startIndexing()`
+- **~100x faster incremental scans**: two-tier mtime+hash check — `stat()` mtime comparison first (microseconds), only reads+hashes file if mtime changed
+- **File-size-weighted block estimation** for accurate first-index progress — scanner pre-stats all files before parsing; orchestrator computes `(blocksFound / bytesParsed) × totalBytes` so progress converges to true total as files are parsed
+- **Cache format upgraded** to `{hashes, mtimes, blockCounts}` with full backward compatibility for old formats
+- **Serialized cache flush** via `_flushPromise` coalescing pattern — prevents concurrent `safeWriteJson()` calls from lock contention
+- `deactivate()` now awaits cache flush before process exit — previously fire-and-forget async that lost data
+- Structured `[REINDEX-DECISION]` logging at all decision points for debugging reindex behavior
+
+#### Fixed
+
+- **Indexing lockup when Qdrant collection deleted mid-indexing**: Scanner would futilely retry 13K+ batches × 3 retries × 3.5s each with no status change. Added fail-fast mechanism: `MAX_CONSECUTIVE_BATCH_FAILURES=5` — after 5 consecutive batch failures, `systemicBatchError` is set, all blocked parsers and embed workers are woken, and the error propagates to the orchestrator's `_handleIndexingError()` which shows "Error" status in the UI. (2026-03-27 17:49)
+- **File parsing stall at ~23K files**: Unbounded embed queue accumulated 380K+ blocks in closures (~380MB) causing GC thrashing and event loop stalls. Added `MAX_EMBED_QUEUE_FILES=200` backpressure — parsing pauses when embed queue exceeds depth limit, then resumes as queue drains. (2026-03-27 17:25)
+- **Growing total estimate on incremental scans**: `startingBlockCount + cumulativeBlocksFound` kept climbing (432K→839K) as more files were parsed. Now uses cache-based frozen estimate (like full scans) — total stays stable unless actual exceeds it. (2026-03-27 17:25)
+- **JSON block explosion (25x)**: JSON files parsed via tree-sitter JavaScript query captured every `object`, `pair`, and `array` node, creating ~19,811 blocks from a 790KB file. Moved `.json` to fallback line-based chunking which produces ~790 blocks instead — a 25x reduction. Affects total index size significantly for workspaces with large JSON fixtures. (2026-03-27 16:50)
+- **File progress stuck on resume**: "X of Y files checked" counter no longer freezes during resumed indexing — `reportEmbedProgress()` change detection now includes `filesParsed`, so skipped (unchanged) files still update the UI (2026-03-27 15:19)
+- **Resume progress accuracy**: on resume after interrupted indexing, progress bar, block counts, totals, and ETA are now correct
+    - Block count includes pre-existing Qdrant points (`startingBlockCount`) so display shows real index size, not just this session's work
+    - Total block estimate extrapolated from partial cache when it covers <90% of files (e.g., 10K of 65K files → proportional scale-up)
+    - ETA uses session-only throughput so it reflects actual embedding speed, not inflated by pre-existing blocks
+- **Cache persistence**: fixed bug where only ~16% of file entries persisted across VS Code restarts (concurrent batch flushes caused lock contention; replaced with single orchestrator-level flush)
+- **Unnecessary full re-indexes** eliminated on transient Qdrant/embedder errors, VS Code restarts, and macOS sleep/wake cycles:
+    - Distinguish HTTP 404 from transient network errors in Qdrant client
+    - Preserve collection data on embedder-only failures
+    - Retry logic and optimistic fallback in `hasIndexedData()` to prevent full re-index on transient connectivity issues
+    - Treat partially-indexed collections as having data (incremental scan, not full re-index)
+    - Guard against stale macOS keychain secrets causing spurious config change detection
+    - Deduplicate redundant `initialize()` + `startIndexing()` calls in webview handler
+- **Embedding prefix bug**: `queryPrefix` was applied to both documents and queries, degrading search quality for models like `nomic-embed-code` — now only applied to queries via `{ isQuery: true }`
+- **Edge case**: externally clearing Qdrant collection points (without deleting the collection) now correctly detected and triggers cache clear instead of silently skipping all files
+- **Stale cache pruning** on startup removes entries for files that no longer exist on disk
+- **File watcher** now distinguishes transient Qdrant errors from permanent failures — transient errors skip cache updates so files are retried on next change
+- Parse `Retry-After` header from 429 rate-limit responses for more precise backoff in OpenAI-compatible embedder
+
+#### Tests
+
+- 60 new tests across the indexing subsystem (553 total passing):
+    - StateManager: two-phase progress, ETA calculation, `formatEta()`, resume with `startingBlockCount`, "files checked" wording, `reportComplete` reset
+    - Orchestrator: edge case empty collection cache clear, normal resume preserves cache, transient error handling, auto-retry backoff
+    - QdrantVectorStore: `getPointCount()` metadata subtraction, empty/missing/transient error cases
+    - Scanner: `onFileParsed(0)` for skipped files (oversized, mtime-cached, hash-matched), fail-fast after consecutive batch failures, below-threshold batch failures don't abort
+
 ## 3.51.1
 
 ### Patch Changes

@@ -48,9 +48,48 @@ export function sanitizeErrorMessage(errorMessage: string): string {
  */
 export interface HttpError extends Error {
 	status?: number
+	headers?: Record<string, string>
 	response?: {
 		status?: number
+		headers?: Record<string, string> | Headers
 	}
+}
+
+/**
+ * Parses the Retry-After header value from an HTTP error.
+ * Supports both seconds (numeric) and HTTP-date formats.
+ * @returns Delay in milliseconds, or undefined if not present/parseable
+ */
+export function parseRetryAfterMs(error: HttpError): number | undefined {
+	// Try to get Retry-After from various error shapes
+	const retryAfter =
+		error.headers?.["retry-after"] ??
+		error.headers?.["Retry-After"] ??
+		(error.response?.headers instanceof Headers
+			? error.response.headers.get("retry-after")
+			: (error.response?.headers as Record<string, string> | undefined)?.["retry-after"]) ??
+		(error.response?.headers instanceof Headers
+			? error.response.headers.get("Retry-After")
+			: (error.response?.headers as Record<string, string> | undefined)?.["Retry-After"])
+
+	if (!retryAfter) {
+		return undefined
+	}
+
+	// Try parsing as seconds (numeric)
+	const seconds = Number(retryAfter)
+	if (!isNaN(seconds) && seconds > 0) {
+		return seconds * 1000
+	}
+
+	// Try parsing as HTTP-date
+	const dateMs = Date.parse(retryAfter)
+	if (!isNaN(dateMs)) {
+		const delayMs = dateMs - Date.now()
+		return delayMs > 0 ? delayMs : undefined
+	}
+
+	return undefined
 }
 
 /**

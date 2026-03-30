@@ -8,6 +8,21 @@ import { DEFAULT_MAX_SEARCH_RESULTS, DEFAULT_SEARCH_MIN_SCORE, QDRANT_CODE_BLOCK
 import { t } from "../../../i18n"
 
 /**
+ * Custom error class for transient Qdrant connectivity issues.
+ * Thrown when the error is likely temporary (network hiccup, server restart)
+ * and the caller should NOT assume the collection is missing.
+ */
+export class QdrantTransientError extends Error {
+	constructor(
+		message: string,
+		public override readonly cause?: unknown,
+	) {
+		super(message)
+		this.name = "QdrantTransientError"
+	}
+}
+
+/**
  * Qdrant implementation of the vector store interface
  */
 export class QdrantVectorStore implements IVectorStore {
@@ -127,24 +142,74 @@ export class QdrantVectorStore implements IVectorStore {
 		}
 	}
 
+	/**
+	 * Checks if an error indicates the collection was not found (HTTP 404 or equivalent).
+	 * Returns true only for definitive "not found" responses; returns false for
+	 * transient errors like network failures, timeouts, or server errors.
+	 */
+	private _isCollectionNotFoundError(error: unknown): boolean {
+		if (error && typeof error === "object") {
+			const err = error as Record<string, unknown>
+			// Check HTTP status codes that definitively mean "not found"
+			const status = err.status ?? (err.response as Record<string, unknown>)?.status ?? err.statusCode
+			if (status === 404) {
+				return true
+			}
+			// Check error message patterns from Qdrant client
+			const message = (err.message as string) ?? ""
+			const lowerMessage = message.toLowerCase()
+			if (
+				lowerMessage.includes("not found") ||
+				lowerMessage.includes("doesn't exist") ||
+				lowerMessage.includes("does not exist")
+			) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/**
+	 * Retrieves collection info from Qdrant.
+	 * Returns the collection info if it exists, null if the collection does not exist,
+	 * or throws QdrantTransientError for transient connectivity issues.
+	 *
+	 * @throws {QdrantTransientError} When the error is transient (network, timeout, server error)
+	 */
 	private async getCollectionInfo(): Promise<Schemas["CollectionInfo"] | null> {
 		try {
 			const collectionInfo = await this.client.getCollection(this.collectionName)
 			return collectionInfo
 		} catch (error: unknown) {
-			if (error instanceof Error) {
-				console.warn(
-					`[QdrantVectorStore] Warning during getCollectionInfo for "${this.collectionName}". Collection may not exist or another error occurred:`,
-					error.message,
-				)
+			// Distinguish "collection not found" from transient errors
+			if (this._isCollectionNotFoundError(error)) {
+				console.log(`[QdrantVectorStore] Collection "${this.collectionName}" does not exist (not found).`)
+				return null
 			}
-			return null
+
+			// Transient error - throw so callers can handle appropriately
+			// instead of assuming collection doesn't exist
+			const message = error instanceof Error ? error.message : String(error)
+			console.warn(
+				`[QdrantVectorStore] Transient error during getCollectionInfo for "${this.collectionName}":`,
+				message,
+			)
+			throw new QdrantTransientError(
+				`Transient error checking collection "${this.collectionName}": ${message}`,
+				error,
+			)
 		}
 	}
 
 	/**
-	 * Initializes the vector store
-	 * @returns Promise resolving to boolean indicating if a new collection was created
+	 * Initializes the vector store.
+	 *
+	 * Returns true if a new collection was created (caller should do full scan),
+	 * false if collection already existed with correct dimensions (caller should check hasIndexedData).
+	 *
+	 * @throws {QdrantTransientError} When Qdrant is temporarily unreachable.
+	 *   The caller should NOT treat this as "collection missing" — it should retry or set error state
+	 *   without clearing the cache or collection.
 	 */
 	async initialize(): Promise<boolean> {
 		let created = false
@@ -152,7 +217,10 @@ export class QdrantVectorStore implements IVectorStore {
 			const collectionInfo = await this.getCollectionInfo()
 
 			if (collectionInfo === null) {
-				// Collection info not retrieved (assume not found or inaccessible), create it
+				// Collection definitively does not exist — create it
+				console.log(
+					`[QdrantVectorStore] Collection "${this.collectionName}" not found. Creating new collection.`,
+				)
 				await this.client.createCollection(this.collectionName, {
 					vectors: {
 						size: this.vectorSize,
@@ -196,6 +264,11 @@ export class QdrantVectorStore implements IVectorStore {
 			await this._createPayloadIndexes()
 			return created
 		} catch (error: any) {
+			// Re-throw transient errors as-is so callers can distinguish them
+			if (error instanceof QdrantTransientError) {
+				throw error
+			}
+
 			const errorMessage = error?.message || error
 			console.error(
 				`[QdrantVectorStore] Failed to initialize Qdrant collection "${this.collectionName}":`,
@@ -572,52 +645,102 @@ export class QdrantVectorStore implements IVectorStore {
 	}
 
 	/**
-	 * Checks if the collection exists
-	 * @returns Promise resolving to boolean indicating if the collection exists
+	 * Checks if the collection exists.
+	 * Returns false for both "not found" and transient errors (safe for non-critical checks).
 	 */
 	async collectionExists(): Promise<boolean> {
-		const collectionInfo = await this.getCollectionInfo()
-		return collectionInfo !== null
+		try {
+			const collectionInfo = await this.getCollectionInfo()
+			return collectionInfo !== null
+		} catch (error) {
+			// Transient error — can't confirm existence, return false
+			return false
+		}
 	}
 
 	/**
-	 * Checks if the collection exists and has indexed points
-	 * @returns Promise resolving to boolean indicating if the collection exists and has points
+	 * Checks if the collection exists and has indexed points.
+	 *
+	 * IMPORTANT: This method is resilient to transient errors. If Qdrant is temporarily
+	 * unreachable, it returns true (optimistic) to prevent unnecessary full re-indexes.
+	 * The rationale is: if we previously had data and can't reach Qdrant now, we should
+	 * assume data is still there and attempt an incremental scan rather than a destructive full scan.
+	 *
+	 * Returns false only when we can definitively confirm the collection is empty or doesn't exist.
 	 */
 	async hasIndexedData(): Promise<boolean> {
-		try {
-			const collectionInfo = await this.getCollectionInfo()
-			if (!collectionInfo) {
+		const MAX_RETRIES = 2
+		const RETRY_DELAY_MS = 1000
+
+		for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+			try {
+				const collectionInfo = await this.getCollectionInfo()
+				if (!collectionInfo) {
+					// Collection definitively does not exist
+					return false
+				}
+				// Check if the collection has any points indexed
+				const pointsCount = collectionInfo.points_count ?? 0
+				if (pointsCount === 0) {
+					return false
+				}
+
+				// Check if the indexing completion marker exists
+				// Use a deterministic UUID generated from a constant string
+				const metadataId = uuidv5("__indexing_metadata__", QDRANT_CODE_BLOCK_NAMESPACE)
+				const metadataPoints = await this.client.retrieve(this.collectionName, {
+					ids: [metadataId],
+				})
+
+				// If marker exists, use it to determine completion status
+				if (metadataPoints.length > 0) {
+					const isComplete = metadataPoints[0].payload?.indexing_complete === true
+					if (!isComplete) {
+						// Index was marked incomplete (e.g., previous scan failed partway through).
+						// If we have a significant number of points, treat as having data
+						// so we do an incremental scan instead of full re-index.
+						console.log(
+							`[QdrantVectorStore] Index marked incomplete but has ${pointsCount} points. ` +
+								`Treating as having data to allow incremental scan.`,
+						)
+						return pointsCount > 1 // >1 because the metadata point itself counts
+					}
+					return true
+				}
+
+				// Backward compatibility: No marker exists (old index or pre-marker version)
+				// Fall back to old logic - assume complete if collection has points
+				console.log(
+					"[QdrantVectorStore] No indexing metadata marker found. Using backward compatibility mode (checking points_count > 0).",
+				)
+				return pointsCount > 0
+			} catch (error) {
+				if (error instanceof QdrantTransientError) {
+					if (attempt < MAX_RETRIES) {
+						console.warn(
+							`[QdrantVectorStore] Transient error in hasIndexedData (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying in ${RETRY_DELAY_MS}ms...`,
+						)
+						await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS))
+						continue
+					}
+					// All retries exhausted — return true (optimistic) to prevent unnecessary full re-index.
+					// The incremental scan will fail quickly if Qdrant is truly down, and
+					// the error handler will set an appropriate error state without destroying data.
+					console.warn(
+						`[QdrantVectorStore] Transient error in hasIndexedData after ${MAX_RETRIES + 1} attempts. ` +
+							`Returning true (optimistic) to prevent unnecessary full re-index.`,
+					)
+					return true
+				}
+
+				// Non-transient error — log and return false as before
+				console.warn("[QdrantVectorStore] Failed to check if collection has data:", error)
 				return false
 			}
-			// Check if the collection has any points indexed
-			const pointsCount = collectionInfo.points_count ?? 0
-			if (pointsCount === 0) {
-				return false
-			}
-
-			// Check if the indexing completion marker exists
-			// Use a deterministic UUID generated from a constant string
-			const metadataId = uuidv5("__indexing_metadata__", QDRANT_CODE_BLOCK_NAMESPACE)
-			const metadataPoints = await this.client.retrieve(this.collectionName, {
-				ids: [metadataId],
-			})
-
-			// If marker exists, use it to determine completion status
-			if (metadataPoints.length > 0) {
-				return metadataPoints[0].payload?.indexing_complete === true
-			}
-
-			// Backward compatibility: No marker exists (old index or pre-marker version)
-			// Fall back to old logic - assume complete if collection has points
-			console.log(
-				"[QdrantVectorStore] No indexing metadata marker found. Using backward compatibility mode (checking points_count > 0).",
-			)
-			return pointsCount > 0
-		} catch (error) {
-			console.warn("[QdrantVectorStore] Failed to check if collection has data:", error)
-			return false
 		}
+
+		// Should not reach here, but return true to be safe
+		return true
 	}
 
 	/**
@@ -679,6 +802,26 @@ export class QdrantVectorStore implements IVectorStore {
 		} catch (error) {
 			console.error("[QdrantVectorStore] Failed to mark indexing as incomplete:", error)
 			throw error
+		}
+	}
+
+	/**
+	 * Returns the number of indexed points (blocks) in the collection,
+	 * excluding the metadata marker point.
+	 * Returns 0 if the collection doesn't exist or on any error.
+	 */
+	async getPointCount(): Promise<number> {
+		try {
+			const collectionInfo = await this.getCollectionInfo()
+			if (!collectionInfo) {
+				return 0
+			}
+			const rawCount = collectionInfo.points_count ?? 0
+			// Subtract 1 for the metadata marker point (if it exists)
+			return Math.max(0, rawCount > 0 ? rawCount - 1 : 0)
+		} catch (error) {
+			console.warn("[QdrantVectorStore] Failed to get point count:", error)
+			return 0
 		}
 	}
 }

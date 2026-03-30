@@ -1928,4 +1928,49 @@ describe("CodeIndexConfigManager", () => {
 			})
 		})
 	})
+
+	describe("stale secret detection", () => {
+		it("should NOT require restart when API key goes from non-empty to empty (stale cache)", async () => {
+			// Simulates macOS keychain unavailable after sleep/wake
+			const configManager = new CodeIndexConfigManager(mockContextProxy)
+
+			// Set up initial config with a real API key
+			mockContextProxy.getGlobalState.mockReturnValue({
+				codebaseIndexEnabled: true,
+				codebaseIndexEmbedderProvider: "openai",
+				codebaseIndexQdrantUrl: "http://localhost:6333",
+			})
+			mockContextProxy.getSecret.mockReturnValue("sk-real-api-key")
+			await configManager.loadConfiguration()
+
+			// Now simulate secret becoming empty (stale keychain)
+			mockContextProxy.getSecret.mockReturnValue("")
+			mockContextProxy.refreshSecrets.mockResolvedValue(undefined)
+
+			const result = await configManager.loadConfiguration()
+			// Should NOT restart — empty key is treated as stale, not as a config change
+			expect(result.requiresRestart).toBe(false)
+		})
+
+		it("should require restart when API key genuinely changes to different value", async () => {
+			const configManager = new CodeIndexConfigManager(mockContextProxy)
+
+			// Set up initial config
+			mockContextProxy.getGlobalState.mockReturnValue({
+				codebaseIndexEnabled: true,
+				codebaseIndexEmbedderProvider: "openai",
+				codebaseIndexQdrantUrl: "http://localhost:6333",
+			})
+			mockContextProxy.getSecret.mockReturnValue("sk-old-key")
+			await configManager.loadConfiguration()
+
+			// Change to a different non-empty key
+			mockContextProxy.getSecret.mockReturnValue("sk-new-key")
+			mockContextProxy.refreshSecrets.mockResolvedValue(undefined)
+
+			const result = await configManager.loadConfiguration()
+			// Should restart — this is a genuine config change
+			expect(result.requiresRestart).toBe(true)
+		})
+	})
 })

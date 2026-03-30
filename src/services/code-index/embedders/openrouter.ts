@@ -95,11 +95,16 @@ export class OpenRouterEmbedder implements IEmbedder {
 	 * @param model Optional model identifier
 	 * @returns Promise resolving to embedding response
 	 */
-	async createEmbeddings(texts: string[], model?: string): Promise<EmbeddingResponse> {
+	async createEmbeddings(
+		texts: string[],
+		model?: string,
+		options?: { isQuery?: boolean },
+	): Promise<EmbeddingResponse> {
 		const modelToUse = model || this.defaultModelId
 
-		// Apply model-specific query prefix if required
-		const queryPrefix = getModelQueryPrefix("openrouter", modelToUse)
+		// Apply model-specific query prefix only for search queries (asymmetric embedding)
+		// Document embeddings during indexing should NOT get the query prefix
+		const queryPrefix = options?.isQuery ? getModelQueryPrefix("openrouter", modelToUse) : undefined
 		const processedTexts = queryPrefix
 			? texts.map((text, index) => {
 					// Prevent double-prefixing

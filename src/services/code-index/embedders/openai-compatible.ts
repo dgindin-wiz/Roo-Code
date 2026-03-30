@@ -8,7 +8,12 @@ import {
 } from "../constants"
 import { getDefaultModelId, getModelQueryPrefix } from "../../../shared/embeddingModels"
 import { t } from "../../../i18n"
-import { withValidationErrorHandling, HttpError, formatEmbeddingError } from "../shared/validation-helpers"
+import {
+	withValidationErrorHandling,
+	HttpError,
+	formatEmbeddingError,
+	parseRetryAfterMs,
+} from "../shared/validation-helpers"
 import { TelemetryEventName } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 import { Mutex } from "async-mutex"
@@ -91,11 +96,16 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 	 * @param model Optional model identifier
 	 * @returns Promise resolving to embedding response
 	 */
-	async createEmbeddings(texts: string[], model?: string): Promise<EmbeddingResponse> {
+	async createEmbeddings(
+		texts: string[],
+		model?: string,
+		options?: { isQuery?: boolean },
+	): Promise<EmbeddingResponse> {
 		const modelToUse = model || this.defaultModelId
 
-		// Apply model-specific query prefix if required
-		const queryPrefix = getModelQueryPrefix("openai-compatible", modelToUse)
+		// Apply model-specific query prefix only for search queries (asymmetric embedding)
+		// Document embeddings during indexing should NOT get the query prefix
+		const queryPrefix = options?.isQuery ? getModelQueryPrefix("openai-compatible", modelToUse) : undefined
 		const processedTexts = queryPrefix
 			? texts.map((text, index) => {
 					// Prevent double-prefixing
@@ -235,6 +245,13 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 			}
 			const error = new Error(`HTTP ${status}: ${errorText}`) as HttpError
 			error.status = status || response?.status || 0
+			// Capture response headers for Retry-After parsing
+			if (response?.headers) {
+				error.response = {
+					status: response.status,
+					headers: response.headers,
+				}
+			}
 			throw error
 		}
 
@@ -328,10 +345,11 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 					await this.updateGlobalRateLimitState(httpError)
 
 					if (hasMoreAttempts) {
-						// Calculate delay based on global rate limit state
+						// Calculate delay: prefer server's Retry-After header, fall back to exponential backoff
+						const retryAfterDelay = parseRetryAfterMs(httpError)
 						const baseDelay = INITIAL_DELAY_MS * Math.pow(2, attempts)
 						const globalDelay = await this.getGlobalRateLimitDelay()
-						const delayMs = Math.max(baseDelay, globalDelay)
+						const delayMs = retryAfterDelay ?? Math.max(baseDelay, globalDelay)
 
 						console.warn(
 							t("embeddings:rateLimitRetry", {

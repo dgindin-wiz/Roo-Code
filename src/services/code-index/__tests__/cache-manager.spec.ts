@@ -146,7 +146,7 @@ describe("CacheManager", () => {
 
 			// Verify the saved data
 			const savedData = (safeWriteJson as Mock).mock.calls[0][1]
-			expect(savedData).toEqual({ [filePath]: hash })
+			expect(savedData).toEqual({ hashes: { [filePath]: hash }, mtimes: {}, blockCounts: {} })
 		})
 
 		it("should handle save errors gracefully", async () => {
@@ -174,7 +174,11 @@ describe("CacheManager", () => {
 
 			await cacheManager.clearCacheFile()
 
-			expect(safeWriteJson).toHaveBeenCalledWith(mockCachePath.fsPath, {})
+			expect(safeWriteJson).toHaveBeenCalledWith(mockCachePath.fsPath, {
+				hashes: {},
+				mtimes: {},
+				blockCounts: {},
+			})
 			expect(cacheManager.getAllHashes()).toEqual({})
 		})
 
@@ -191,6 +195,119 @@ describe("CacheManager", () => {
 			)
 
 			consoleErrorSpy.mockRestore()
+		})
+	})
+
+	describe("mtime support", () => {
+		it("should store and retrieve mtime alongside hash", () => {
+			cacheManager.updateHash("file.ts", "hash1", 1234567890)
+			expect(cacheManager.getHash("file.ts")).toBe("hash1")
+			expect(cacheManager.getMtime("file.ts")).toBe(1234567890)
+		})
+
+		it("should return undefined for mtime when not set", () => {
+			cacheManager.updateHash("file.ts", "hash1")
+			expect(cacheManager.getMtime("file.ts")).toBeUndefined()
+		})
+
+		it("should delete mtime when deleting hash", () => {
+			cacheManager.updateHash("file.ts", "hash1", 1234567890)
+			cacheManager.deleteHash("file.ts")
+			expect(cacheManager.getHash("file.ts")).toBeUndefined()
+			expect(cacheManager.getMtime("file.ts")).toBeUndefined()
+		})
+
+		it("should clear mtimes when clearing cache file", async () => {
+			// Reset safeWriteJson mock to succeed (it may be mocked to throw from prior tests)
+			;(safeWriteJson as Mock).mockResolvedValue(undefined)
+			cacheManager.updateHash("file.ts", "hash1", 1234567890)
+			await cacheManager.clearCacheFile()
+			expect(cacheManager.getMtime("file.ts")).toBeUndefined()
+			expect(cacheManager.getAllHashes()).toEqual({})
+		})
+	})
+
+	describe("block count support", () => {
+		it("should store and retrieve block count", () => {
+			cacheManager.updateBlockCount("file.ts", 15)
+			expect(cacheManager.getBlockCount("file.ts")).toBe(15)
+		})
+
+		it("should return undefined for block count when not set", () => {
+			expect(cacheManager.getBlockCount("nonexistent.ts")).toBeUndefined()
+		})
+
+		it("should delete block count when deleting hash", () => {
+			cacheManager.updateHash("file.ts", "hash1")
+			cacheManager.updateBlockCount("file.ts", 10)
+			cacheManager.deleteHash("file.ts")
+			expect(cacheManager.getBlockCount("file.ts")).toBeUndefined()
+		})
+
+		it("should clear block counts when clearing cache file", async () => {
+			;(safeWriteJson as Mock).mockResolvedValue(undefined)
+			cacheManager.updateBlockCount("file.ts", 20)
+			await cacheManager.clearCacheFile()
+			expect(cacheManager.getBlockCount("file.ts")).toBeUndefined()
+		})
+
+		it("should return all block counts", () => {
+			cacheManager.updateBlockCount("a.ts", 5)
+			cacheManager.updateBlockCount("b.ts", 10)
+			const counts = cacheManager.getAllBlockCounts()
+			expect(counts).toEqual({ "a.ts": 5, "b.ts": 10 })
+			// Should be a copy, not the same reference
+			counts["a.ts"] = 999
+			expect(cacheManager.getBlockCount("a.ts")).toBe(5)
+		})
+
+		it("should compute total cached block count only for files with a hash", () => {
+			// Files with both hash and blockCount (fully processed)
+			cacheManager.updateHash("a.ts", "hashA")
+			cacheManager.updateBlockCount("a.ts", 5)
+			cacheManager.updateHash("b.ts", "hashB")
+			cacheManager.updateBlockCount("b.ts", 10)
+			cacheManager.updateHash("c.ts", "hashC")
+			cacheManager.updateBlockCount("c.ts", 3)
+			expect(cacheManager.getTotalCachedBlockCount()).toBe(18)
+		})
+
+		it("should exclude orphaned blockCounts (no hash) from total", () => {
+			// Fully processed file — has hash + blockCount
+			cacheManager.updateHash("done.ts", "hashDone")
+			cacheManager.updateBlockCount("done.ts", 10)
+
+			// Orphaned entries — blockCount written during parse, but hash never written
+			// (simulates interrupted quit before embedding completed)
+			cacheManager.updateBlockCount("orphan1.ts", 20)
+			cacheManager.updateBlockCount("orphan2.ts", 30)
+
+			// Only done.ts should be counted
+			expect(cacheManager.getTotalCachedBlockCount()).toBe(10)
+		})
+
+		it("should return 0 for total cached block count when empty", () => {
+			expect(cacheManager.getTotalCachedBlockCount()).toBe(0)
+		})
+
+		it("should return 0 when all blockCounts are orphaned (no hashes)", () => {
+			cacheManager.updateBlockCount("orphan1.ts", 5)
+			cacheManager.updateBlockCount("orphan2.ts", 10)
+			expect(cacheManager.getTotalCachedBlockCount()).toBe(0)
+		})
+
+		it("should persist block counts alongside hashes and mtimes", async () => {
+			;(safeWriteJson as Mock).mockClear()
+			;(safeWriteJson as Mock).mockResolvedValue(undefined)
+			cacheManager.updateHash("file.ts", "hash1", 1000)
+			cacheManager.updateBlockCount("file.ts", 12)
+			// Trigger save by updating hash again (debounced save)
+			cacheManager.updateHash("file2.ts", "hash2")
+
+			const savedData = (safeWriteJson as Mock).mock.calls[0][1]
+			expect(savedData.blockCounts).toEqual({ "file.ts": 12 })
+			expect(savedData.hashes).toHaveProperty("file.ts", "hash1")
+			expect(savedData.mtimes).toHaveProperty("file.ts", 1000)
 		})
 	})
 })

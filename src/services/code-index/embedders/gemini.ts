@@ -68,7 +68,11 @@ export class GeminiEmbedder implements IEmbedder {
 	 * @param model Optional model identifier (uses constructor model if not provided)
 	 * @returns Promise resolving to embedding response
 	 */
-	async createEmbeddings(texts: string[], model?: string): Promise<EmbeddingResponse> {
+	async createEmbeddings(
+		texts: string[],
+		model?: string,
+		options?: { isQuery?: boolean },
+	): Promise<EmbeddingResponse> {
 		try {
 			// Use the provided model or fall back to the instance's model
 			const modelToUse = model || this.modelId

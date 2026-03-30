@@ -80,6 +80,26 @@ export class CodeIndexManager {
 		CodeIndexManager.instances.clear()
 	}
 
+	/**
+	 * Flushes all pending cache writes across all manager instances.
+	 * Called from deactivate() to ensure partial indexing progress is saved
+	 * before the extension process exits. Unlike dispose(), this is fully
+	 * async and awaited, guaranteeing the writes complete.
+	 */
+	public static async flushAllCaches(): Promise<void> {
+		const promises: Promise<void>[] = []
+		for (const instance of CodeIndexManager.instances.values()) {
+			if (instance._cacheManager && typeof instance._cacheManager.flush === "function") {
+				promises.push(
+					instance._cacheManager.flush().catch((error: unknown) => {
+						console.error(`[CodeIndexManager] Failed to flush cache for ${instance.workspacePath}:`, error)
+					}),
+				)
+			}
+		}
+		await Promise.all(promises)
+	}
+
 	private readonly workspacePath: string
 	private readonly _folderUri: vscode.Uri
 	private readonly context: vscode.ExtensionContext
@@ -193,12 +213,18 @@ export class CodeIndexManager {
 		if (!this._cacheManager) {
 			this._cacheManager = new CacheManager(this.context, this.workspacePath)
 			await this._cacheManager.initialize()
+			// Prune stale cache entries from files that no longer exist on disk.
+			// This runs once per workspace on first initialization to keep cache size bounded.
+			await this._cacheManager.pruneStaleEntries()
 		}
 
 		// 6. Determine if Core Services Need Recreation
 		const needsServiceRecreation = !this._serviceFactory || requiresRestart
 
 		if (needsServiceRecreation) {
+			console.log(
+				`[CodeIndexManager] [REINDEX-DECISION] Recreating services: requiresRestart=${requiresRestart}, hadFactory=${!!this._serviceFactory}`,
+			)
 			await this._recreateServices()
 		}
 
@@ -206,6 +232,12 @@ export class CodeIndexManager {
 		const shouldStartOrRestartIndexing =
 			requiresRestart ||
 			(needsServiceRecreation && (!this._orchestrator || this._orchestrator.state !== "Indexing"))
+
+		console.log(
+			`[CodeIndexManager] [REINDEX-DECISION] shouldStartOrRestartIndexing=${shouldStartOrRestartIndexing}, ` +
+				`requiresRestart=${requiresRestart}, needsServiceRecreation=${needsServiceRecreation}, ` +
+				`orchestratorState=${this._orchestrator?.state ?? "none"}`,
+		)
 
 		if (shouldStartOrRestartIndexing) {
 			this._orchestrator?.startIndexing()
@@ -265,15 +297,18 @@ export class CodeIndexManager {
 	 * Recovers from error state by clearing the error and resetting internal state.
 	 * This allows the manager to be re-initialized after a recoverable error.
 	 *
-	 * This method clears all service instances (configManager, serviceFactory, orchestrator, searchService)
-	 * to force a complete re-initialization on the next operation. This ensures a clean slate
-	 * after recovering from errors such as network failures or configuration issues.
+	 * This method clears runtime service instances (serviceFactory, orchestrator, searchService)
+	 * to force service re-creation on the next operation. The configManager is intentionally
+	 * PRESERVED to maintain accurate previous-config snapshots — clearing it would cause
+	 * the next loadConfiguration() to see a false "unconfigured → configured" transition
+	 * and trigger an unnecessary full re-index.
 	 *
 	 * @remarks
 	 * - Safe to call even when not in error state (idempotent)
 	 * - Does not restart indexing automatically - call initialize() after recovery
 	 * - Service instances will be recreated on next initialize() call
 	 * - Prevents race conditions from multiple concurrent recovery attempts
+	 * - ConfigManager is preserved to avoid false restart detection (RC-4)
 	 */
 	public async recoverFromError(): Promise<void> {
 		// Prevent race conditions from multiple rapid recovery attempts
@@ -289,9 +324,11 @@ export class CodeIndexManager {
 			// Log error but continue with recovery - clearing service instances is more important
 			console.error("Failed to clear error state during recovery:", error)
 		} finally {
-			// Force re-initialization by clearing service instances
-			// This ensures a clean slate even if state update failed
-			this._configManager = undefined
+			// Force re-initialization of runtime services by clearing them.
+			// IMPORTANT: _configManager is intentionally NOT cleared here.
+			// Clearing it would create a fresh instance with empty defaults on next initialize(),
+			// causing doesConfigChangeRequireRestart() to see a false transition from
+			// "unconfigured" to "configured" and unnecessarily trigger a full re-index.
 			this._serviceFactory = undefined
 			this._orchestrator = undefined
 			this._searchService = undefined
@@ -303,9 +340,17 @@ export class CodeIndexManager {
 
 	/**
 	 * Cleans up the manager instance.
+	 * Flushes any pending cache writes to prevent data loss on extension deactivation.
 	 */
 	public dispose(): void {
 		this.stopIndexing()
+		// Flush pending debounced cache writes so they aren't lost on exit.
+		// Fire-and-forget since dispose() is synchronous but flush() is async.
+		if (this._cacheManager && typeof this._cacheManager.flush === "function") {
+			this._cacheManager.flush().catch((error: unknown) => {
+				console.error("[CodeIndexManager] Failed to flush cache on dispose:", error)
+			})
+		}
 		this._stateManager.dispose()
 	}
 

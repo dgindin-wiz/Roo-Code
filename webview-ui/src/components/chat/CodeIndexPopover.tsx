@@ -563,13 +563,22 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		})
 	}
 
-	const progressPercentage = useMemo(
-		() =>
-			indexingStatus.totalItems > 0
-				? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
-				: 0,
-		[indexingStatus.processedItems, indexingStatus.totalItems],
-	)
+	const progressPercentage = useMemo(() => {
+		// Use block-level progress during embedding (uniform cost per block → accurate ETA)
+		if (indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0) {
+			return Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100)
+		}
+		// Fall back to legacy fields
+		return indexingStatus.totalItems > 0
+			? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
+			: 0
+	}, [
+		indexingStatus.phase,
+		indexingStatus.blocksEmbedded,
+		indexingStatus.totalBlocks,
+		indexingStatus.processedItems,
+		indexingStatus.totalItems,
+	])
 
 	const transformStyleString = `translateX(-${100 - progressPercentage}%)`
 
@@ -650,7 +659,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 						{/* Status Section */}
 						<div className="space-y-2">
 							<h4 className="text-sm font-medium">{t("settings:codeIndex.statusTitle")}</h4>
-							<div className="text-sm text-vscode-descriptionForeground">
+							<div className="text-sm text-vscode-descriptionForeground whitespace-pre-line">
 								<span
 									className={cn("inline-block w-3 h-3 rounded-full mr-2", {
 										"bg-gray-400": indexingStatus.systemStatus === "Standby",
@@ -665,16 +674,21 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 
 							{indexingStatus.systemStatus === "Indexing" && (
 								<div className="mt-2">
-									<ProgressPrimitive.Root
-										className="relative h-2 w-full overflow-hidden rounded-full bg-secondary"
-										value={progressPercentage}>
-										<ProgressPrimitive.Indicator
-											className="h-full w-full flex-1 bg-primary transition-transform duration-300 ease-in-out"
-											style={{
-												transform: transformStyleString,
-											}}
-										/>
-									</ProgressPrimitive.Root>
+									<div className="flex items-center gap-2">
+										<ProgressPrimitive.Root
+											className="relative h-2 w-full overflow-hidden rounded-full bg-secondary"
+											value={progressPercentage}>
+											<ProgressPrimitive.Indicator
+												className="h-full w-full flex-1 bg-primary transition-transform duration-300 ease-in-out"
+												style={{
+													transform: transformStyleString,
+												}}
+											/>
+										</ProgressPrimitive.Root>
+										<span className="text-xs text-vscode-descriptionForeground whitespace-nowrap min-w-[2.5rem] text-right">
+											{progressPercentage}%
+										</span>
+									</div>
 								</div>
 							)}
 						</div>

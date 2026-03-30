@@ -204,6 +204,18 @@ export class CodeIndexConfigManager {
 
 		const requiresRestart = this.doesConfigChangeRequireRestart(previousConfigSnapshot)
 
+		if (requiresRestart) {
+			console.log(
+				`[CodeIndexConfigManager] [REINDEX-DECISION] Config change requires restart. ` +
+					`provider: ${previousConfigSnapshot.embedderProvider} → ${this.embedderProvider}, ` +
+					`enabled: ${previousConfigSnapshot.enabled} → ${this.codebaseIndexEnabled}, ` +
+					`configured: ${previousConfigSnapshot.configured} → ${this.isConfigured()}, ` +
+					`modelDimension: ${previousConfigSnapshot.modelDimension} → ${this.modelDimension}`,
+			)
+		} else {
+			console.log(`[CodeIndexConfigManager] [REINDEX-DECISION] No restart required.`)
+		}
+
 		return {
 			configSnapshot: previousConfigSnapshot,
 			currentConfig: {
@@ -291,6 +303,12 @@ export class CodeIndexConfigManager {
 	 * - Search minimum score adjustments
 	 * - UI-only settings
 	 * - Non-functional configuration tweaks
+	 *
+	 * TIMING PROTECTION:
+	 * - If a secret was previously set (non-empty) and is now empty after refresh,
+	 *   this is treated as a stale cache issue (e.g., macOS keychain unavailable
+	 *   after sleep/wake) rather than a genuine config change. This prevents
+	 *   unnecessary full re-indexes from transient secret access failures.
 	 */
 	doesConfigChangeRequireRestart(prev: PreviousConfigSnapshot): boolean {
 		const nowConfigured = this.isConfigured()
@@ -356,7 +374,16 @@ export class CodeIndexConfigManager {
 		const currentQdrantUrl = this.qdrantUrl ?? ""
 		const currentQdrantApiKey = this.qdrantApiKey ?? ""
 
-		if (prevOpenAiKey !== currentOpenAiKey) {
+		// Helper: detect if a secret "disappeared" (was set, now empty).
+		// This pattern indicates a stale secret cache (e.g., macOS keychain
+		// unavailable after sleep/wake) rather than a genuine config change.
+		// We only treat it as a real change if the secret changed to a DIFFERENT
+		// non-empty value, or if it went from empty to non-empty.
+		const isSecretStale = (prev: string, current: string): boolean => {
+			return prev !== "" && current === ""
+		}
+
+		if (prevOpenAiKey !== currentOpenAiKey && !isSecretStale(prevOpenAiKey, currentOpenAiKey)) {
 			return true
 		}
 
@@ -365,21 +392,25 @@ export class CodeIndexConfigManager {
 		}
 
 		if (
-			prevOpenAiCompatibleBaseUrl !== currentOpenAiCompatibleBaseUrl ||
-			prevOpenAiCompatibleApiKey !== currentOpenAiCompatibleApiKey
+			(prevOpenAiCompatibleBaseUrl !== currentOpenAiCompatibleBaseUrl ||
+				prevOpenAiCompatibleApiKey !== currentOpenAiCompatibleApiKey) &&
+			!isSecretStale(prevOpenAiCompatibleApiKey, currentOpenAiCompatibleApiKey)
 		) {
 			return true
 		}
 
-		if (prevGeminiApiKey !== currentGeminiApiKey) {
+		if (prevGeminiApiKey !== currentGeminiApiKey && !isSecretStale(prevGeminiApiKey, currentGeminiApiKey)) {
 			return true
 		}
 
-		if (prevMistralApiKey !== currentMistralApiKey) {
+		if (prevMistralApiKey !== currentMistralApiKey && !isSecretStale(prevMistralApiKey, currentMistralApiKey)) {
 			return true
 		}
 
-		if (prevVercelAiGatewayApiKey !== currentVercelAiGatewayApiKey) {
+		if (
+			prevVercelAiGatewayApiKey !== currentVercelAiGatewayApiKey &&
+			!isSecretStale(prevVercelAiGatewayApiKey, currentVercelAiGatewayApiKey)
+		) {
 			return true
 		}
 
@@ -387,7 +418,10 @@ export class CodeIndexConfigManager {
 			return true
 		}
 
-		if (prevOpenRouterApiKey !== currentOpenRouterApiKey) {
+		if (
+			prevOpenRouterApiKey !== currentOpenRouterApiKey &&
+			!isSecretStale(prevOpenRouterApiKey, currentOpenRouterApiKey)
+		) {
 			return true
 		}
 
@@ -401,7 +435,11 @@ export class CodeIndexConfigManager {
 			return true
 		}
 
-		if (prevQdrantUrl !== currentQdrantUrl || prevQdrantApiKey !== currentQdrantApiKey) {
+		if (prevQdrantUrl !== currentQdrantUrl) {
+			return true
+		}
+
+		if (prevQdrantApiKey !== currentQdrantApiKey && !isSecretStale(prevQdrantApiKey, currentQdrantApiKey)) {
 			return true
 		}
 

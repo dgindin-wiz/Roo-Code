@@ -1,4 +1,5 @@
 import * as vscode from "vscode"
+import { QdrantTransientError } from "../vector-store/qdrant-client"
 import {
 	QDRANT_CODE_BLOCK_NAMESPACE,
 	MAX_FILE_SIZE_BYTES,
@@ -222,27 +223,37 @@ export class FileWatcher implements IFileWatcher {
 					})
 				}
 			} catch (error: any) {
+				const isTransient = error instanceof QdrantTransientError
 				const errorStatus = error?.status || error?.response?.status || error?.statusCode
 				const errorMessage = error instanceof Error ? error.message : String(error)
 
-				// Log telemetry for deletion error
+				// Log telemetry for deletion error with transient flag
 				TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
 					error: sanitizeErrorMessage(errorMessage),
 					location: "deletePointsByMultipleFilePaths",
-					errorType: "deletion_error",
+					errorType: isTransient ? "transient_deletion_error" : "deletion_error",
 					errorStatus: errorStatus,
 				})
 
-				// Mark all paths as error
-				overallBatchError = error as Error
-				for (const path of pathsToExplicitlyDelete) {
-					batchResults.push({ path, status: "error", error: error as Error })
-					processedCountInBatch++
-					this._onBatchProgressUpdate.fire({
-						processedInBatch: processedCountInBatch,
-						totalInBatch: totalFilesInBatch,
-						currentFile: path,
-					})
+				if (isTransient) {
+					// Transient Qdrant error — don't mark files as failed,
+					// they'll be retried on next file change event
+					console.warn(
+						`[FileWatcher] Transient Qdrant error during batch deletion. ` +
+							`${pathsToExplicitlyDelete.length} file deletions will be retried on next change.`,
+					)
+				} else {
+					// Permanent error — mark all paths as error
+					overallBatchError = error as Error
+					for (const path of pathsToExplicitlyDelete) {
+						batchResults.push({ path, status: "error", error: error as Error })
+						processedCountInBatch++
+						this._onBatchProgressUpdate.fire({
+							processedInBatch: processedCountInBatch,
+							totalInBatch: totalFilesInBatch,
+							currentFile: path,
+						})
+					}
 				}
 			}
 		}
@@ -397,16 +408,30 @@ export class FileWatcher implements IFileWatcher {
 				}
 			} catch (error) {
 				const err = error as Error
-				overallBatchError = overallBatchError || err
-				// Log telemetry for batch upsert error
+				const isTransient = err instanceof QdrantTransientError || err.cause instanceof QdrantTransientError
+
+				// Log telemetry for batch upsert error with transient flag
 				TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
 					error: sanitizeErrorMessage(err.message),
 					location: "executeBatchUpsertOperations",
-					errorType: "batch_upsert_error",
+					errorType: isTransient ? "transient_upsert_error" : "batch_upsert_error",
 					affectedFiles: successfullyProcessedForUpsert.length,
 				})
-				for (const { path } of successfullyProcessedForUpsert) {
-					batchResults.push({ path, status: "error", error: err })
+
+				if (isTransient) {
+					// Transient Qdrant error — don't update cache hashes so files
+					// will be re-processed on the next change event
+					console.warn(
+						`[FileWatcher] Transient Qdrant error during batch upsert. ` +
+							`${successfullyProcessedForUpsert.length} files will be retried on next change.`,
+					)
+					// Don't set overallBatchError for transient errors —
+					// the batch itself wasn't a permanent failure
+				} else {
+					overallBatchError = overallBatchError || err
+					for (const { path } of successfullyProcessedForUpsert) {
+						batchResults.push({ path, status: "error", error: err })
+					}
 				}
 			}
 		} else if (overallBatchError && pointsForBatchUpsert.length > 0) {

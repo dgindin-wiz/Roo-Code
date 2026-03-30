@@ -55,7 +55,11 @@ export class BedrockEmbedder implements IEmbedder {
 	 * @param model Optional model identifier
 	 * @returns Promise resolving to embedding response
 	 */
-	async createEmbeddings(texts: string[], model?: string): Promise<EmbeddingResponse> {
+	async createEmbeddings(
+		texts: string[],
+		model?: string,
+		options?: { isQuery?: boolean },
+	): Promise<EmbeddingResponse> {
 		const modelToUse = model || this.defaultModelId
 
 		const allEmbeddings: number[][] = []
