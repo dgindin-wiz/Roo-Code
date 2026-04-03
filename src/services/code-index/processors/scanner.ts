@@ -29,10 +29,14 @@ import {
 	MAX_BATCH_RETRIES,
 	INITIAL_RETRY_DELAY_MS,
 	PARSING_CONCURRENCY,
+	PARSE_CHUNK_SIZE,
+	PROGRESS_THROTTLE_MS,
 	BATCH_PROCESSING_CONCURRENCY,
+	MAX_PENDING_BATCHES,
 	MAX_EMBED_QUEUE_FILES,
 	MAX_CONSECUTIVE_BATCH_FAILURES,
 	BATCH_PROCESSING_TIMEOUT_MS,
+	CLIENT_RECYCLE_INTERVAL,
 } from "../constants"
 import { isPathInIgnoredDirectory } from "../../glob/ignore-utils"
 import { TelemetryService } from "@roo-code/telemetry"
@@ -41,6 +45,7 @@ import { sanitizeErrorMessage } from "../shared/validation-helpers"
 import { Package } from "../../../shared/package"
 import { BoundedChannel } from "./bounded-channel"
 import { IndexDebugLogger } from "../debug-logger"
+import { getIsolatedFetchStats } from "../utils/isolated-fetch"
 
 // ─── Internal Types ──────────────────────────────────────────────────────────
 
@@ -66,6 +71,7 @@ interface EmbedWork {
 export class DirectoryScanner implements IDirectoryScanner {
 	private readonly batchSegmentThreshold: number
 	private readonly maxFilesLimit: number
+	private _batchCount = 0
 
 	// Event emitters for progress and errors
 	private readonly _progressEmitter = new vscode.EventEmitter<ScanProgress>()
@@ -175,9 +181,25 @@ export class DirectoryScanner implements IDirectoryScanner {
 		// These are strictly disjoint: unchanged = mtime match, candidates = no mtime match.
 		const getTotalEstimate = () => unchangedBlockCount + blocksFound
 
-		const reportProgress = () => {
+		// Fix 2: Throttle progress events to prevent event storm (4/sec max).
+		// Phase transitions ("embedding" start) and completion always fire immediately.
+		let lastProgressTime = 0
+		let lastProgressPhase = ""
+
+		const reportProgress = (forceEmit = false) => {
+			const now = Date.now()
+			const currentPhase = embedPhaseStarted ? "embedding" : "parsing"
+			const isPhaseTransition = currentPhase !== lastProgressPhase
+
+			if (!forceEmit && !isPhaseTransition && now - lastProgressTime < PROGRESS_THROTTLE_MS) {
+				return // Throttled — skip this event
+			}
+
+			lastProgressTime = now
+			lastProgressPhase = currentPhase
+
 			this._emitProgress({
-				phase: embedPhaseStarted ? "embedding" : "parsing",
+				phase: currentPhase,
 				filesChecked,
 				totalFiles: discovery.totalFiles,
 				blocksEmbedded,
@@ -245,7 +267,7 @@ export class DirectoryScanner implements IDirectoryScanner {
 
 		// Now that all files are parsed, total is exact
 		isEstimated = false
-		reportProgress()
+		reportProgress(true) // Force emit — final count
 
 		// Handle deleted files
 		await this._handleDeletedFiles(discovery.processedPaths, scanWorkspace, signal, errors)
@@ -363,6 +385,12 @@ export class DirectoryScanner implements IDirectoryScanner {
 
 		let unchangedBlockCount = 0
 
+		// Candidate reason counters for diagnostics
+		let noCacheEntry = 0
+		let mtimeMismatch = 0
+		// Sample up to 20 candidate paths for the debug log (path, reason, cached mtime, current mtime)
+		const candidateSamples: Array<{ path: string; reason: string; cachedMtime?: number; fileMtime: number }> = []
+
 		for (const entry of statEntries) {
 			if (signal.aborted) break
 
@@ -380,8 +408,45 @@ export class DirectoryScanner implements IDirectoryScanner {
 				if (bc !== undefined) unchangedBlockCount += bc
 			} else {
 				candidates.push(entry)
+				if (cachedMtime === undefined) {
+					noCacheEntry++
+					if (candidateSamples.length < 20) {
+						candidateSamples.push({
+							path: entry.normalizedPath,
+							reason: "noCache",
+							fileMtime: entry.mtimeMs,
+						})
+					}
+				} else {
+					mtimeMismatch++
+					if (candidateSamples.length < 20) {
+						candidateSamples.push({
+							path: entry.normalizedPath,
+							reason: "mtimeMismatch",
+							cachedMtime,
+							fileMtime: entry.mtimeMs,
+						})
+					}
+				}
 			}
 		}
+
+		IndexDebugLogger.log("Scanner", "discovery-classify", {
+			totalFiles,
+			unchangedCount,
+			candidateCount: candidates.length,
+			noCacheEntry,
+			mtimeMismatch,
+			cacheHashCount: this.cacheManager.hashCount,
+			sampleCandidates: candidateSamples
+				.map((s) =>
+					s.reason === "noCache"
+						? `noCache:${s.path.split("/").slice(-2).join("/")}`
+						: `mtimeMismatch:${s.path.split("/").slice(-2).join("/")}(cached=${s.cachedMtime},file=${s.fileMtime})`,
+				)
+				.join(" | "),
+			phaseTransition: true,
+		})
 
 		// Report discovery results — file progress jumps to unchangedCount/totalFiles
 		this._emitProgress({
@@ -430,92 +495,108 @@ export class DirectoryScanner implements IDirectoryScanner {
 		// 2. channel.push: happens AFTER parseLimiter releases, so backpressure
 		//    doesn't block other parseLimiter slots
 		//
-		// Implementation: parseLimiter returns the EmbedWork (or null), then
-		// the outer promise does channel.push if there's work.
+		// Fix 1: Process candidates in chunks of PARSE_CHUNK_SIZE instead of
+		// creating all promises at once. This prevents the 65K Promise explosion
+		// that blocks the event loop and exhausts memory on large workspaces.
 
-		const promises = candidates.map((entry) => {
-			// Create an outer promise that wraps parseLimiter + channel.push
-			return (async () => {
-				if (signal.aborted) return
+		for (let chunkStart = 0; chunkStart < candidates.length; chunkStart += PARSE_CHUNK_SIZE) {
+			if (signal.aborted) break
 
-				// parseLimiter: read → hash → parse → release slot
-				const embedWork = await parseLimiter(async () => {
-					if (signal.aborted) return null
+			const chunkEnd = Math.min(chunkStart + PARSE_CHUNK_SIZE, candidates.length)
+			const chunk = candidates.slice(chunkStart, chunkEnd)
 
-					try {
-						const content = await vscode.workspace.fs
-							.readFile(vscode.Uri.file(entry.filePath))
-							.then((buffer) => Buffer.from(buffer).toString("utf-8"))
+			const chunkPromises = chunk.map((entry) => {
+				// Create an outer promise that wraps parseLimiter + channel.push
+				return (async () => {
+					if (signal.aborted) return
 
-						const currentFileHash = createHash("sha256").update(content).digest("hex")
+					// parseLimiter: read → hash → parse → release slot
+					const embedWork = await parseLimiter(async () => {
+						if (signal.aborted) return null
 
-						const cachedFileHash = this.cacheManager.getHash(entry.normalizedPath)
-						const isNewFile = !cachedFileHash
+						try {
+							const content = await vscode.workspace.fs
+								.readFile(vscode.Uri.file(entry.filePath))
+								.then((buffer) => Buffer.from(buffer).toString("utf-8"))
 
-						if (cachedFileHash === currentFileHash) {
-							// Hash match — mtime changed but content didn't
-							this.cacheManager.updateHash(entry.normalizedPath, currentFileHash, entry.mtimeMs)
-							hashSkipped++
+							const currentFileHash = createHash("sha256").update(content).digest("hex")
+
+							const cachedFileHash = this.cacheManager.getHash(entry.normalizedPath)
+							const isNewFile = !cachedFileHash
+
+							if (cachedFileHash === currentFileHash) {
+								// Hash match — mtime changed but content didn't
+								this.cacheManager.updateHash(entry.normalizedPath, currentFileHash, entry.mtimeMs)
+								hashSkipped++
+								onFileChecked(0)
+								return null
+							}
+
+							// File is new or changed — parse it
+							const blocks = await this.codeParser.parseFile(entry.filePath, {
+								content,
+								fileHash: currentFileHash,
+							})
+							this.cacheManager.updateBlockCount(entry.normalizedPath, blocks.length)
+							onFileChecked(blocks.length)
+
+							if (blocks.length === 0) {
+								// File parsed but produced 0 blocks — just update cache
+								this.cacheManager.updateHash(entry.normalizedPath, currentFileHash, entry.mtimeMs)
+								return null
+							}
+
+							// Return work for the embed phase — parseLimiter slot releases NOW
+							return {
+								blocks,
+								filePath: entry.normalizedPath,
+								fileHash: currentFileHash,
+								mtimeMs: entry.mtimeMs,
+								isNew: isNewFile,
+							} as EmbedWork
+						} catch (error) {
+							if (error instanceof DOMException && error.name === "AbortError") {
+								throw error
+							}
+							const wrappedError =
+								error instanceof Error
+									? new Error(
+											`${error.message} (Workspace: ${scanWorkspace}, File: ${entry.filePath})`,
+										)
+									: new Error(
+											t("embeddings:scanner.unknownErrorProcessingFile", {
+												filePath: entry.filePath,
+											}) + ` (Workspace: ${scanWorkspace})`,
+										)
+							errors.push(wrappedError)
+							this._errorEmitter.fire(wrappedError)
+							console.error(`Error processing file ${entry.filePath}:`, error)
+							TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
+								error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+								stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
+								location: "scanDirectory:processFile",
+							})
 							onFileChecked(0)
 							return null
 						}
+					})
 
-						// File is new or changed — parse it
-						const blocks = await this.codeParser.parseFile(entry.filePath, {
-							content,
-							fileHash: currentFileHash,
-						})
-						this.cacheManager.updateBlockCount(entry.normalizedPath, blocks.length)
-						onFileChecked(blocks.length)
-
-						if (blocks.length === 0) {
-							// File parsed but produced 0 blocks — just update cache
-							this.cacheManager.updateHash(entry.normalizedPath, currentFileHash, entry.mtimeMs)
-							return null
-						}
-
-						// Return work for the embed phase — parseLimiter slot releases NOW
-						return {
-							blocks,
-							filePath: entry.normalizedPath,
-							fileHash: currentFileHash,
-							mtimeMs: entry.mtimeMs,
-							isNew: isNewFile,
-						} as EmbedWork
-					} catch (error) {
-						if (error instanceof DOMException && error.name === "AbortError") {
-							throw error
-						}
-						const wrappedError =
-							error instanceof Error
-								? new Error(`${error.message} (Workspace: ${scanWorkspace}, File: ${entry.filePath})`)
-								: new Error(
-										t("embeddings:scanner.unknownErrorProcessingFile", {
-											filePath: entry.filePath,
-										}) + ` (Workspace: ${scanWorkspace})`,
-									)
-						errors.push(wrappedError)
-						this._errorEmitter.fire(wrappedError)
-						console.error(`Error processing file ${entry.filePath}:`, error)
-						TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
-							error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
-							stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
-							location: "scanDirectory:processFile",
-						})
-						onFileChecked(0)
-						return null
+					// Push to channel OUTSIDE parseLimiter — backpressure blocks HERE,
+					// not in the parseLimiter slot. Other files keep parsing.
+					if (embedWork && !signal.aborted) {
+						await channel.push(embedWork, signal)
 					}
-				})
+				})()
+			})
 
-				// Push to channel OUTSIDE parseLimiter — backpressure blocks HERE,
-				// not in the parseLimiter slot. Other files keep parsing.
-				if (embedWork && !signal.aborted) {
-					await channel.push(embedWork, signal)
-				}
-			})()
-		})
+			await Promise.all(chunkPromises)
 
-		await Promise.all(promises)
+			// Yield to event loop between chunks — keeps UI responsive on large workspaces
+			if (chunkEnd < candidates.length && !signal.aborted) {
+				await new Promise((resolve) => setTimeout(resolve, 0))
+			}
+		}
+
 		return { hashSkipped }
 	}
 
@@ -614,15 +695,88 @@ export class DirectoryScanner implements IDirectoryScanner {
 
 				if (currentBatchBlocks.length >= this.batchSegmentThreshold) {
 					// Wait for batch slot if too many pending
-					while (pendingBatchCount >= 20 /* MAX_PENDING_BATCHES */) {
+					// Fix 3: Yield to event loop between waits to prevent UI freeze
+					if (pendingBatchCount >= MAX_PENDING_BATCHES) {
+						IndexDebugLogger.log("Scanner", "backpressure-wait", {
+							pendingBatches: pendingBatchCount,
+							activeBatches: activeBatchPromises.size,
+							consecutiveFailures: consecutiveBatchFailures,
+						})
+					}
+					while (pendingBatchCount >= MAX_PENDING_BATCHES) {
 						if (signal.aborted || systemicBatchError) break
-						await Promise.race(activeBatchPromises)
+						// Guard: Promise.race([]) returns a forever-pending promise per JS spec.
+						// If activeBatchPromises is unexpectedly empty, break to avoid deadlock.
+						if (activeBatchPromises.size === 0) break
+						await Promise.race([...activeBatchPromises])
+						// Yield to event loop — prevents Extension Host freeze under backpressure
+						await new Promise((resolve) => setTimeout(resolve, 0))
 					}
 					if (signal.aborted || systemicBatchError) break
 					await submitBatch()
+
+					// Drain-then-recycle: at recycle boundary, wait for ALL in-flight
+					// batches to finish (zero requests on old agents), then destroy
+					// and recreate clients. This is the only safe way to call destroy()
+					// on undici Agents without killing concurrent requests.
+					if (this._batchCount > 0 && this._batchCount % CLIENT_RECYCLE_INTERVAL === 0) {
+						await Promise.all([...activeBatchPromises])
+
+						// ── Diagnostic: per-source memory attribution ──
+						// Snapshot memory BEFORE recycle, BETWEEN the two recycles
+						// (embedder vs qdrant), and AFTER both. This isolates which
+						// source accounts for the external memory delta.
+						const memBefore = process.memoryUsage()
+						const isoStatsBefore = getIsolatedFetchStats()
+						const qdrantAgentsBefore = (this.qdrantClient as any).getDispatcherCount?.() ?? -1
+
+						// Phase 1: Recycle embedder (isolated-fetch agents)
+						// AWAIT is critical — socket close events must be processed
+						// before measuring memory, or V8 external counter won't update.
+						await this.embedder.recycleClient?.()
+						const memMid = process.memoryUsage()
+						const isoStatsMid = getIsolatedFetchStats()
+
+						// Phase 2: Recycle Qdrant (patch agents)
+						await this.qdrantClient.recycleClient?.()
+						const memAfter = process.memoryUsage()
+						const qdrantAgentsAfter = (this.qdrantClient as any).getDispatcherCount?.() ?? -1
+
+						const toMB = (bytes: number) => Math.round(bytes / 1024 / 1024)
+
+						IndexDebugLogger.log("Scanner", "client-recycled", {
+							batchNum: this._batchCount,
+							// Overall delta
+							externalBeforeMB: toMB(memBefore.external),
+							externalAfterMB: toMB(memAfter.external),
+							externalDeltaMB: toMB(memAfter.external - memBefore.external),
+							rssBeforeMB: toMB(memBefore.rss),
+							rssAfterMB: toMB(memAfter.rss),
+							// Per-source attribution
+							embedderExternalDeltaMB: toMB(memMid.external - memBefore.external),
+							qdrantExternalDeltaMB: toMB(memAfter.external - memMid.external),
+							// Agent lifecycle counters
+							isoFetchAlive: isoStatsBefore.alive,
+							isoFetchAliveAfter: isoStatsMid.alive,
+							isoFetchTotalCreated: isoStatsMid.created,
+							isoFetchTotalDestroyed: isoStatsMid.destroyed,
+							qdrantAgentsBefore,
+							qdrantAgentsAfter,
+							phaseTransition: true,
+						})
+					}
 				}
 			}
 		}
+
+		// Log embed loop exit reason — critical for diagnosing silent hangs
+		IndexDebugLogger.log("Scanner", "embed-loop-exit", {
+			reason: signal.aborted ? "aborted" : systemicBatchError ? "systemic-error" : "channel-drained",
+			pendingBatches: pendingBatchCount,
+			activeBatches: activeBatchPromises.size,
+			consecutiveFailures: consecutiveBatchFailures,
+			remainingBlocks: currentBatchBlocks.length,
+		})
 
 		// Flush remaining partial batch
 		if (!signal.aborted && !systemicBatchError && currentBatchBlocks.length > 0) {
@@ -630,7 +784,14 @@ export class DirectoryScanner implements IDirectoryScanner {
 		}
 
 		// Wait for all batch processing to complete
+		IndexDebugLogger.log("Scanner", "embed-drain-start", {
+			activeBatches: activeBatchPromises.size,
+		})
 		await Promise.all(activeBatchPromises)
+		IndexDebugLogger.log("Scanner", "embed-drain-done", {
+			consecutiveFailures: consecutiveBatchFailures,
+			errorCount: errors.length,
+		})
 
 		// Propagate systemic error
 		if (systemicBatchError) {
@@ -655,6 +816,9 @@ export class DirectoryScanner implements IDirectoryScanner {
 		errors: Error[],
 	): Promise<boolean> {
 		if (batchBlocks.length === 0) return true
+
+		this._batchCount++
+		const batchNum = this._batchCount
 
 		let attempts = 0
 		let success = false
@@ -727,6 +891,21 @@ export class DirectoryScanner implements IDirectoryScanner {
 				}
 				await this.cacheManager.flush()
 				success = true
+
+				// Periodic memory snapshot — every 10 batches (and batch 1).
+				// Logs externalMB alongside heap so memory trends are visible in debug log.
+				if (batchNum === 1 || batchNum % 10 === 0) {
+					const mem = process.memoryUsage()
+					IndexDebugLogger.log("Scanner", "memory-breakdown", {
+						batchNum,
+						rssMB: Math.round(mem.rss / 1024 / 1024),
+						heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+						heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+						externalMB: Math.round(mem.external / 1024 / 1024),
+						arrayBuffersMB: Math.round(mem.arrayBuffers / 1024 / 1024),
+						phaseTransition: true,
+					})
+				}
 			} catch (error) {
 				lastError = error as Error
 				const isTimeout = lastError.message.includes("Batch processing timed out")
@@ -810,8 +989,7 @@ export class DirectoryScanner implements IDirectoryScanner {
 	): Promise<void> {
 		if (signal.aborted) return
 
-		const oldHashes = this.cacheManager.getAllHashes()
-		for (const cachedFilePath of Object.keys(oldHashes)) {
+		for (const cachedFilePath of this.cacheManager.cachedFilePaths()) {
 			if (signal.aborted) return
 			const normalizedCachedPath = path.normalize(cachedFilePath)
 			if (!processedPaths.has(normalizedCachedPath)) {

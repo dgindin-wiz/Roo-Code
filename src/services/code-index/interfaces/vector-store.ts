@@ -86,6 +86,15 @@ export interface IVectorStore {
 	 * Excludes the metadata marker point. Returns 0 if collection doesn't exist or on error.
 	 */
 	getPointCount(): Promise<number>
+
+	/**
+	 * Recycles the underlying HTTP client to release accumulated native memory.
+	 * Called periodically by the scanner during long indexing runs.
+	 * Optional — implementations that don't hold persistent connections can skip this.
+	 * Returns a Promise so the caller can await socket teardown (critical for
+	 * freeing V8 external memory — unawaited destroys never process close events).
+	 */
+	recycleClient?(): Promise<void>
 }
 
 export interface VectorStoreSearchResult {

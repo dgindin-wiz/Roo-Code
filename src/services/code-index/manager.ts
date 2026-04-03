@@ -1,5 +1,6 @@
 import * as vscode from "vscode"
 import { ContextProxy } from "../../core/config/ContextProxy"
+import { IndexDebugLogger } from "./debug-logger"
 import { VectorStoreSearchResult } from "./interfaces"
 import { IndexingState } from "./interfaces/manager"
 import { CodeIndexConfigManager } from "./config-manager"
@@ -90,10 +91,34 @@ export class CodeIndexManager {
 		const promises: Promise<void>[] = []
 		for (const instance of CodeIndexManager.instances.values()) {
 			if (instance._cacheManager && typeof instance._cacheManager.flush === "function") {
+				const cacheCountBeforeFlush = instance._cacheManager.hashCount
+				IndexDebugLogger.log("Manager", "flushAllCaches-start", {
+					workspacePath: instance.workspacePath,
+					cacheHashCount: cacheCountBeforeFlush,
+					phaseTransition: true,
+				})
 				promises.push(
-					instance._cacheManager.flush().catch((error: unknown) => {
-						console.error(`[CodeIndexManager] Failed to flush cache for ${instance.workspacePath}:`, error)
-					}),
+					instance._cacheManager
+						.flush()
+						.then(() => {
+							IndexDebugLogger.log("Manager", "flushAllCaches-done", {
+								workspacePath: instance.workspacePath,
+								cacheHashCount: instance._cacheManager!.hashCount,
+								phaseTransition: true,
+							})
+						})
+						.catch((error: unknown) => {
+							const msg = error instanceof Error ? error.message : String(error)
+							console.error(
+								`[CodeIndexManager] Failed to flush cache for ${instance.workspacePath}:`,
+								error,
+							)
+							IndexDebugLogger.log("Manager", "flushAllCaches-error", {
+								workspacePath: instance.workspacePath,
+								error: msg,
+								phaseTransition: true,
+							})
+						}),
 				)
 			}
 		}
@@ -103,6 +128,7 @@ export class CodeIndexManager {
 	private readonly workspacePath: string
 	private readonly _folderUri: vscode.Uri
 	private readonly context: vscode.ExtensionContext
+	private _contextProxy: ContextProxy | undefined
 
 	// Private constructor for singleton pattern
 	private constructor(workspacePath: string, folderUri: vscode.Uri, context: vscode.ExtensionContext) {
@@ -181,6 +207,9 @@ export class CodeIndexManager {
 	 * @returns Object indicating if a restart is needed
 	 */
 	public async initialize(contextProxy: ContextProxy): Promise<{ requiresRestart: boolean }> {
+		// Store contextProxy for later re-initialization (e.g. recovery from Error state)
+		this._contextProxy = contextProxy
+
 		// 1. ConfigManager Initialization and Configuration Loading
 		if (!this._configManager) {
 			this._configManager = new CodeIndexConfigManager(contextProxy)
@@ -213,9 +242,13 @@ export class CodeIndexManager {
 		if (!this._cacheManager) {
 			this._cacheManager = new CacheManager(this.context, this.workspacePath)
 			await this._cacheManager.initialize()
-			// Prune stale cache entries from files that no longer exist on disk.
-			// This runs once per workspace on first initialization to keep cache size bounded.
-			await this._cacheManager.pruneStaleEntries()
+			// NOTE: pruneStaleEntries() was previously called here on every startup.
+			// This was removed because it does fs.access() on every cached file path,
+			// and for large workspaces (65K+ files), files can be briefly inaccessible
+			// during VS Code startup — causing valid cache entries to be permanently
+			// deleted. This forced full re-indexing on every restart.
+			// Stale entries are harmless (tiny memory/disk overhead) and deleted files
+			// are handled lazily by the scanner and file watcher.
 		}
 
 		// 6. Determine if Core Services Need Recreation
@@ -263,9 +296,11 @@ export class CodeIndexManager {
 		if (currentStatus.systemStatus === "Error") {
 			await this.recoverFromError()
 
-			// After recovery, we need to reinitialize since recoverFromError clears all services
-			// This will be handled by the caller (webviewMessageHandler) checking isInitialized
-			return
+			// After recovery, services are cleared. Re-initialize so we can
+			// actually start indexing instead of silently returning.
+			if (this._contextProxy) {
+				await this.initialize(this._contextProxy)
+			}
 		}
 
 		this.assertInitialized()
@@ -363,6 +398,9 @@ export class CodeIndexManager {
 			return
 		}
 		this.assertInitialized()
+		// Stop any in-progress scan before clearing data to prevent
+		// the running scan from writing to the collection while we delete it.
+		this.stopIndexing()
 		await this._orchestrator!.clearIndexData()
 		await this._cacheManager!.clearCacheFile()
 	}

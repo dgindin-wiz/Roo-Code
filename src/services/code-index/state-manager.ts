@@ -38,7 +38,9 @@ export class CodeIndexStateManager {
 	private _isEstimatedTotal: boolean = false
 	private _embedStartedAt: number = 0
 	private _estimatedTimeRemainingMs: number | null = null
+	private _lastFilesParsedChangeTime: number = 0 // when _filesParsed last changed (for backpressure detection)
 	private static readonly MIN_PROGRESS_FOR_ETA = 0.01 // 1% — show ETA early; block-level progress is stable
+	private static readonly BACKPRESSURE_DISPLAY_THRESHOLD_MS = 2_000 // show "waiting" hint after 2s of no file progress
 
 	// --- Public API ---
 
@@ -62,7 +64,7 @@ export class CodeIndexStateManager {
 			phase: this._phase,
 			totalFiles: this._totalFiles,
 			processedFiles: this._processedFiles,
-			totalBlocks: this._totalBlocks,
+			totalBlocks: this._getExtrapolatedTotal(),
 			blocksEmbedded: effectiveBlocksEmbedded,
 			estimatedTimeRemainingMs: this._estimatedTimeRemainingMs,
 			isEstimatedTotal: this._isEstimatedTotal,
@@ -156,6 +158,7 @@ export class CodeIndexStateManager {
 		this._isEstimatedTotal = isEstimate
 		this._embedStartedAt = Date.now()
 		this._estimatedTimeRemainingMs = null
+		this._lastFilesParsedChangeTime = Date.now()
 
 		// Also update legacy fields for backward compat
 		this._processedItems = this._startingBlockCount
@@ -220,15 +223,35 @@ export class CodeIndexStateManager {
 			this._isEstimatedTotal = false
 		}
 		if (filesParsed !== undefined) {
+			if (filesParsed !== this._filesParsed) {
+				this._lastFilesParsedChangeTime = Date.now()
+			}
 			this._filesParsed = filesParsed
 		}
 
 		// Effective embedded = pre-existing + new this session
 		const effectiveEmbedded = this._startingBlockCount + this._blocksEmbedded
 
+		// Auto-revise total upward if embedded count exceeds the estimate.
+		// This happens when the cache-based block estimate lags behind actual
+		// embedding output (e.g. stale cache entries, concurrent parse/embed).
+		if (effectiveEmbedded > this._totalBlocks) {
+			IndexDebugLogger.log("StateManager", "auto-revise-total", {
+				reason: "effectiveEmbedded > totalBlocks",
+				oldTotal: this._totalBlocks,
+				newTotal: effectiveEmbedded,
+				effectiveEmbedded,
+			})
+			this._totalBlocks = effectiveEmbedded
+		}
+
+		// Use extrapolated total for progress bar + ETA when parsing is incomplete.
+		// This prevents the progress bar from showing 98% when only 1% of files are parsed.
+		const displayTotal = this._getExtrapolatedTotal()
+
 		// Use block-level progress for bar + ETA (uniform cost per block)
 		this._processedItems = effectiveEmbedded
-		this._totalItems = this._totalBlocks
+		this._totalItems = displayTotal
 		this._processedFiles = this._filesParsed
 		this._currentItemUnit = "blocks"
 		this._phase = "embedding"
@@ -244,7 +267,7 @@ export class CodeIndexStateManager {
 		// Build message with two lines:
 		// Line 1: "Embedded X of ~Y total blocks (N blocks/sec) — ~Z remaining"
 		//   X = startingBlockCount + blocksEmbedded (real index size)
-		//   Y = total blocks in workspace
+		//   Y = extrapolated total (projected from blocks/file ratio when parsing incomplete)
 		// Line 2: "X of Y files checked"
 		// "total blocks" makes it clear Y is the full workspace total, not remaining.
 		const throughputPart =
@@ -260,10 +283,17 @@ export class CodeIndexStateManager {
 					? " — estimating..."
 					: ""
 		const prefix = this._isEstimatedTotal ? "~" : ""
-		const blockLine = `Embedded ${effectiveEmbedded.toLocaleString()} of ${prefix}${this._totalBlocks.toLocaleString()} total blocks${throughputPart}${etaSuffix}`
+		const blockLine = `Embedded ${effectiveEmbedded.toLocaleString()} of ${prefix}${displayTotal.toLocaleString()} total blocks${throughputPart}${etaSuffix}`
+		// Detect backpressure: file parsing hasn't advanced for a while but embedding is active.
+		// This indicates the parse phase is blocked waiting for embed queue capacity.
+		const parseStalled =
+			this._filesParsed < this._totalFiles &&
+			this._filesParsed > 0 &&
+			Date.now() - this._lastFilesParsedChangeTime >= CodeIndexStateManager.BACKPRESSURE_DISPLAY_THRESHOLD_MS
+		const backpressureHint = parseStalled ? " (waiting for embeddings)" : ""
 		const fileLine =
 			this._totalFiles > 0
-				? `\n${this._filesParsed.toLocaleString()} of ${this._totalFiles.toLocaleString()} files checked`
+				? `\n${this._filesParsed.toLocaleString()} of ${this._totalFiles.toLocaleString()} files checked${backpressureHint}`
 				: ""
 		this._statusMessage = `${blockLine}${fileLine}`
 
@@ -275,6 +305,8 @@ export class CodeIndexStateManager {
 			isExact,
 			startingBlockCount: this._startingBlockCount,
 			effectiveEmbedded,
+			rawTotal: this._totalBlocks,
+			extrapolatedTotal: displayTotal,
 		})
 	}
 
@@ -305,11 +337,40 @@ export class CodeIndexStateManager {
 	}
 
 	/**
+	 * Returns an extrapolated total block count when parsing is incomplete.
+	 *
+	 * During a from-scratch index, _totalBlocks only counts blocks from files
+	 * parsed so far. On a 65K-file workspace with 1% parsed, the raw total
+	 * vastly underestimates actual work — causing the ETA to say "almost done"
+	 * when the scan is barely started.
+	 *
+	 * When parsing is incomplete (_isEstimatedTotal && _filesParsed < _totalFiles),
+	 * we extrapolate: (blocks / files_parsed) * total_files.
+	 * On resume scans, filesParsed includes unchanged files, so the ratio
+	 * stays stable and extrapolation barely changes the total.
+	 */
+	private _getExtrapolatedTotal(): number {
+		if (
+			this._isEstimatedTotal &&
+			this._filesParsed > 0 &&
+			this._totalFiles > 0 &&
+			this._filesParsed < this._totalFiles
+		) {
+			const blocksPerFile = this._totalBlocks / this._filesParsed
+			return Math.round(blocksPerFile * this._totalFiles)
+		}
+		return this._totalBlocks
+	}
+
+	/**
 	 * Calculates ETA using block-level throughput.
 	 *
 	 * On resume, _startingBlockCount represents pre-existing blocks from Qdrant.
 	 * ETA uses only _blocksEmbedded (new work this session) for throughput,
-	 * then estimates time for remaining = totalBlocks - startingBlockCount - blocksEmbedded.
+	 * then estimates time for remaining = extrapolatedTotal - startingBlockCount - blocksEmbedded.
+	 *
+	 * Uses _getExtrapolatedTotal() to project the true workspace total when
+	 * parsing is incomplete, preventing grossly optimistic ETAs.
 	 */
 	private _updateEta(): void {
 		const elapsed = Date.now() - this._embedStartedAt
@@ -318,9 +379,9 @@ export class CodeIndexStateManager {
 			return
 		}
 
-		// Effective progress = (startingBlockCount + blocksEmbedded) / totalBlocks
+		const extrapolatedTotal = this._getExtrapolatedTotal()
 		const effectiveEmbedded = this._startingBlockCount + this._blocksEmbedded
-		const progress = effectiveEmbedded / this._totalBlocks
+		const progress = effectiveEmbedded / extrapolatedTotal
 
 		if (progress < CodeIndexStateManager.MIN_PROGRESS_FOR_ETA) {
 			this._estimatedTimeRemainingMs = null
@@ -329,8 +390,8 @@ export class CodeIndexStateManager {
 
 		// Throughput based on THIS session's work only (not pre-existing blocks)
 		const blocksPerMs = this._blocksEmbedded / elapsed
-		// Remaining blocks to embed this session
-		const remainingBlocks = Math.max(0, this._totalBlocks - effectiveEmbedded)
+		// Remaining blocks to embed this session (using extrapolated total)
+		const remainingBlocks = Math.max(0, extrapolatedTotal - effectiveEmbedded)
 		this._estimatedTimeRemainingMs = blocksPerMs > 0 ? Math.max(0, Math.round(remainingBlocks / blocksPerMs)) : null
 	}
 

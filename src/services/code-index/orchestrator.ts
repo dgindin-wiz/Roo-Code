@@ -74,7 +74,28 @@ export class CodeIndexOrchestrator {
 				}),
 				this.fileWatcher.onDidFinishBatchProcessing((summary: BatchProcessingSummary) => {
 					if (summary.batchError) {
+						const isTransient =
+							summary.batchError instanceof QdrantTransientError ||
+							summary.batchError.cause instanceof QdrantTransientError
+
 						console.error(`[CodeIndexOrchestrator] Batch processing failed:`, summary.batchError)
+
+						TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
+							error: summary.batchError.message,
+							location: "onDidFinishBatchProcessing",
+							errorType: isTransient ? "transient_batch_error" : "permanent_batch_error",
+						})
+
+						if (!isTransient) {
+							// Fix 4: Permanent batch error — transition to Error state and stop
+							// the watcher. Without this, the UI stays on "Indexed" while every
+							// batch silently fails.
+							this.stateManager.setSystemState(
+								"Error",
+								`File watcher batch failed: ${summary.batchError.message}`,
+							)
+							this.stopWatcher()
+						}
 					}
 				}),
 			]
@@ -132,11 +153,48 @@ export class CodeIndexOrchestrator {
 		let indexingStarted = false
 
 		try {
+			// Set session context for the debug logger — populates workspace name,
+			// provider, elapsed timer, and writes a rich session header.
+			IndexDebugLogger.setContext({
+				workspacePath: this.workspacePath,
+				embedderProvider: this.configManager.currentEmbedderProvider,
+				modelId: this.configManager.currentModelId,
+				qdrantUrl: this.configManager.qdrantConfig?.url,
+			})
+
+			const cacheCountBeforeInit = this.cacheManager.hashCount
+			IndexDebugLogger.log("Orchestrator", "pre-initialize", {
+				cacheFileCount: cacheCountBeforeInit,
+				workspacePath: this.workspacePath,
+				phaseTransition: true,
+			})
+
 			const collectionCreated = await this.vectorStore.initialize()
 			indexingStarted = true
 
+			IndexDebugLogger.log("Orchestrator", "post-initialize", {
+				collectionCreated,
+				cacheFileCount: cacheCountBeforeInit,
+				phaseTransition: true,
+			})
+
+			// Guard: if user clicked Stop during initialize(), bail out before
+			// making any cache-clearing decisions. This prevents losing all cache
+			// entries when the user quickly starts and stops indexing.
+			if (signal.aborted) {
+				await this.cacheManager.flush()
+				this.stopWatcher()
+				this.stateManager.setSystemState("Standby", t("embeddings:orchestrator.indexingStopped"))
+				return
+			}
+
 			if (collectionCreated) {
 				console.log(`[CodeIndexOrchestrator] New collection created → clearing cache and starting full scan.`)
+				IndexDebugLogger.log("Orchestrator", "clearCacheFile-collectionCreated", {
+					reason: "collectionCreated=true",
+					cacheEntriesBeingCleared: cacheCountBeforeInit,
+					phaseTransition: true,
+				})
 				await this.cacheManager.clearCacheFile()
 			}
 
@@ -145,10 +203,22 @@ export class CodeIndexOrchestrator {
 			// Edge case: Collection exists but is empty — data was wiped externally
 			if (!collectionCreated && !hasExistingData) {
 				console.log(`[CodeIndexOrchestrator] Collection exists but empty → clearing stale cache.`)
+				IndexDebugLogger.log("Orchestrator", "clearCacheFile-emptyCollection", {
+					reason: "collection exists but empty",
+					cacheEntriesBeingCleared: this.cacheManager.hashCount,
+					phaseTransition: true,
+				})
 				await this.cacheManager.clearCacheFile()
 			}
 
 			const isIncremental = hasExistingData && !collectionCreated
+			IndexDebugLogger.log("Orchestrator", "scan-decision", {
+				scanType: isIncremental ? "INCREMENTAL" : "FULL",
+				collectionCreated,
+				hasExistingData,
+				cacheFileCountAfterDecisions: this.cacheManager.hashCount,
+				phaseTransition: true,
+			})
 			console.log(
 				`[CodeIndexOrchestrator] ${isIncremental ? "INCREMENTAL" : "FULL"} scan starting` +
 					` (collectionCreated=${collectionCreated}, hasExistingData=${hasExistingData})`,
@@ -188,7 +258,7 @@ export class CodeIndexOrchestrator {
 	 * internally using the cache manager (mtime/hash checks).
 	 */
 	private async _runScan(signal: AbortSignal, isIncremental: boolean): Promise<void> {
-		const cachedFileCount = Object.keys(this.cacheManager.getAllHashes()).length
+		const cachedFileCount = this.cacheManager.hashCount
 
 		if (isIncremental) {
 			this.stateManager.setSystemState(
@@ -293,16 +363,23 @@ export class CodeIndexOrchestrator {
 
 		// Log results
 		if (result.totalBlocks > 0) {
-			console.log(
-				`[CodeIndexOrchestrator] Scan completed: ${result.blocksEmbedded} blocks indexed, ` +
-					`${result.skippedFiles} files skipped, ${result.processedFiles} files changed`,
-			)
+			const summary =
+				`Scan completed: ${result.blocksEmbedded} blocks indexed, ` +
+				`${result.skippedFiles} files skipped, ${result.processedFiles} files changed`
+			console.log(`[CodeIndexOrchestrator] ${summary}`)
+			IndexDebugLogger.logToChannel(summary)
 		} else {
-			console.log(`[CodeIndexOrchestrator] No new or changed files found (${result.skippedFiles} files skipped)`)
+			const summary = `No new or changed files found (${result.skippedFiles} files skipped)`
+			console.log(`[CodeIndexOrchestrator] ${summary}`)
+			IndexDebugLogger.logToChannel(summary)
 		}
 
 		await this._startWatcher()
 		await this.cacheManager.flush()
+		IndexDebugLogger.log("Orchestrator", "post-scan-flush", {
+			cacheFileCountAfterFlush: this.cacheManager.hashCount,
+			phaseTransition: true,
+		})
 		await this.vectorStore.markIndexingComplete()
 
 		// Reset retry counter on success
@@ -386,11 +463,12 @@ export class CodeIndexOrchestrator {
 				.catch((e) => console.error("[CodeIndexOrchestrator] Failed to flush cache after error:", e))
 		}
 
+		const errorMessage = error.message || t("embeddings:orchestrator.unknownError")
+		IndexDebugLogger.logToChannel(`ERROR: ${errorMessage}`)
+
 		this.stateManager.setSystemState(
 			"Error",
-			t("embeddings:orchestrator.failedDuringInitialScan", {
-				errorMessage: error.message || t("embeddings:orchestrator.unknownError"),
-			}),
+			t("embeddings:orchestrator.failedDuringInitialScan", { errorMessage }),
 		)
 		this.stopWatcher()
 	}

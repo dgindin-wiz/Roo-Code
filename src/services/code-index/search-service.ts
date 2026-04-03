@@ -4,6 +4,7 @@ import { IEmbedder } from "./interfaces/embedder"
 import { IVectorStore } from "./interfaces/vector-store"
 import { CodeIndexConfigManager } from "./config-manager"
 import { CodeIndexStateManager } from "./state-manager"
+import { SEARCH_EMBEDDING_TIMEOUT_MS } from "./constants"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 
@@ -19,9 +20,37 @@ export class CodeIndexSearchService {
 	) {}
 
 	/**
+	 * Wraps a promise with a timeout. Rejects with a descriptive error if the
+	 * promise does not settle within `timeoutMs` milliseconds.
+	 */
+	private _withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				reject(new Error(`${label} timed out after ${timeoutMs}ms`))
+			}, timeoutMs)
+
+			promise.then(
+				(value) => {
+					clearTimeout(timer)
+					resolve(value)
+				},
+				(error) => {
+					clearTimeout(timer)
+					reject(error)
+				},
+			)
+		})
+	}
+
+	/**
 	 * Searches the code index for relevant content.
+	 *
+	 * IMPORTANT: Search errors do NOT transition the system to Error state when
+	 * indexing is in progress. A transient embedding or Qdrant failure during a
+	 * search query should not abort an active indexing operation. The Error state
+	 * is only set when the system is idle (Indexed state).
+	 *
 	 * @param query The search query
-	 * @param limit Maximum number of results to return
 	 * @param directoryPrefix Optional directory path to filter results by
 	 * @returns Array of search results
 	 * @throws Error if the service is not properly configured or ready
@@ -41,8 +70,14 @@ export class CodeIndexSearchService {
 		}
 
 		try {
-			// Generate embedding for query with isQuery flag for asymmetric prefix support
-			const embeddingResponse = await this.embedder.createEmbeddings([query], undefined, { isQuery: true })
+			// Generate embedding for query with timeout to prevent indefinite hangs.
+			// The scanner has _withBatchTimeout() for indexing batches; search needs
+			// the same protection since it calls the same embedder API.
+			const embeddingResponse = await this._withTimeout(
+				this.embedder.createEmbeddings([query], undefined, { isQuery: true }),
+				SEARCH_EMBEDDING_TIMEOUT_MS,
+				"Search embedding generation",
+			)
 			const vector = embeddingResponse?.embeddings[0]
 			if (!vector) {
 				throw new Error("Failed to generate embedding for query.")
@@ -59,7 +94,14 @@ export class CodeIndexSearchService {
 			return results
 		} catch (error) {
 			console.error("[CodeIndexSearchService] Error during search:", error)
-			this.stateManager.setSystemState("Error", `Search failed: ${(error as Error).message}`)
+
+			// Only transition to Error state if we're in Indexed (idle) state.
+			// If indexing is in progress, a search failure should NOT disrupt it —
+			// the error is transient and the indexer should keep running.
+			const stateAtError = this.stateManager.getCurrentStatus().systemStatus
+			if (stateAtError !== "Indexing") {
+				this.stateManager.setSystemState("Error", `Search failed: ${(error as Error).message}`)
+			}
 
 			// Capture telemetry for the error
 			TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {

@@ -581,11 +581,12 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const progressPercentage = useMemo(() => {
 		// Use block-level progress during embedding (uniform cost per block → accurate ETA)
 		if (indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0) {
-			return Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100)
+			// Clamp to 100% — the estimate can lag behind actual embedded count
+			return Math.min(100, Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100))
 		}
 		// Fall back to legacy fields
 		return indexingStatus.totalItems > 0
-			? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
+			? Math.min(100, Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100))
 			: 0
 	}, [
 		indexingStatus.phase,
@@ -1662,32 +1663,46 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 						{/* Auto-enable default */}
 						{currentSettings.codebaseIndexEnabled && (
 							<div className="flex items-center gap-2 pt-4 pb-1">
-								<VSCodeCheckbox
+								<input
+									type="checkbox"
+									id="auto-enable-default-toggle"
 									checked={indexingStatus.autoEnableDefault ?? true}
-									onChange={(e: any) =>
+									onChange={(e) =>
 										vscode.postMessage({
 											type: "setAutoEnableDefault",
 											bool: e.target.checked,
 										})
-									}>
-									<span className="text-xs">{t("settings:codeIndex.autoEnableDefaultLabel")}</span>
-								</VSCodeCheckbox>
+									}
+									className="accent-vscode-focusBorder"
+								/>
+								<label
+									htmlFor="auto-enable-default-toggle"
+									className="text-xs text-vscode-foreground cursor-pointer">
+									{t("settings:codeIndex.autoEnableDefaultLabel")}
+								</label>
 							</div>
 						)}
 
 						{/* Workspace Toggle */}
 						{currentSettings.codebaseIndexEnabled && (
 							<div className="flex items-center gap-2 pt-1 pb-2">
-								<VSCodeCheckbox
+								<input
+									type="checkbox"
+									id="workspace-indexing-toggle"
 									checked={indexingStatus.workspaceEnabled ?? false}
-									onChange={(e: any) =>
+									onChange={(e) =>
 										vscode.postMessage({
 											type: "toggleWorkspaceIndexing",
 											bool: e.target.checked,
 										})
-									}>
-									<span className="text-xs">{t("settings:codeIndex.workspaceToggleLabel")}</span>
-								</VSCodeCheckbox>
+									}
+									className="accent-vscode-focusBorder"
+								/>
+								<label
+									htmlFor="workspace-indexing-toggle"
+									className="text-xs text-vscode-foreground cursor-pointer">
+									{t("settings:codeIndex.workspaceToggleLabel")}
+								</label>
 							</div>
 						)}
 

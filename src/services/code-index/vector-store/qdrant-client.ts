@@ -1,4 +1,5 @@
-import { QdrantClient, Schemas } from "@qdrant/js-client-rest"
+// @ts-expect-error — destroyAllDispatchers & getDispatcherCount are added by our pnpm patch (see qdrant/qdrant-js#52)
+import { QdrantClient, Schemas, destroyAllDispatchers, getDispatcherCount } from "@qdrant/js-client-rest"
 import { createHash } from "crypto"
 import * as path from "path"
 import { v5 as uuidv5 } from "uuid"
@@ -822,6 +823,79 @@ export class QdrantVectorStore implements IVectorStore {
 		} catch (error) {
 			console.warn("[QdrantVectorStore] Failed to get point count:", error)
 			return 0
+		}
+	}
+
+	/**
+	 * Recreates the underlying Qdrant HTTP client to release accumulated native
+	 * memory (undici connection pool buffers). Called periodically by the scanner
+	 * during long indexing runs.
+	 */
+	/**
+	 * Returns the number of tracked Qdrant undici Agents (diagnostic).
+	 * Uses getDispatcherCount() from our pnpm patch. Returns -1 if patch unavailable.
+	 */
+	getDispatcherCount(): number {
+		try {
+			return getDispatcherCount()
+		} catch {
+			return -1
+		}
+	}
+
+	async recycleClient(): Promise<void> {
+		// Destroy all Qdrant undici Agents and AWAIT socket teardown.
+		// Awaiting is critical — without it, socket close events never get
+		// processed and native TLS buffers accumulate in V8 external memory.
+		// destroyAllDispatchers() is exported by our pnpm patch of dispatcher.js
+		// (see qdrant/qdrant-js#52 — the library has no built-in cleanup API).
+		try {
+			await destroyAllDispatchers()
+		} catch {
+			// Patch not applied or function unavailable
+		}
+
+		try {
+			const parsedUrl = this.parseQdrantUrl(this.qdrantUrl)
+			const urlObj = new URL(parsedUrl)
+
+			let port: number
+			let useHttps: boolean
+
+			if (urlObj.port) {
+				port = Number(urlObj.port)
+				useHttps = urlObj.protocol === "https:"
+			} else {
+				if (urlObj.protocol === "https:") {
+					port = 443
+					useHttps = true
+				} else {
+					port = 80
+					useHttps = false
+				}
+			}
+
+			this.client = new QdrantClient({
+				host: urlObj.hostname,
+				https: useHttps,
+				port: port,
+				prefix: urlObj.pathname === "/" ? undefined : urlObj.pathname.replace(/\/+$/, ""),
+				headers: {
+					"User-Agent": "Roo-Code",
+				},
+			})
+		} catch {
+			// If URL parsing fails, fall back to URL-based config
+			try {
+				this.client = new QdrantClient({
+					url: this.qdrantUrl,
+					headers: {
+						"User-Agent": "Roo-Code",
+					},
+				})
+			} catch {
+				// If recreation fails entirely, keep the existing client
+			}
 		}
 	}
 }

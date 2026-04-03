@@ -170,7 +170,7 @@ describe("CodeIndexStateManager", () => {
 
 	describe("reportEmbedProgress", () => {
 		it("should update blocks embedded and total", () => {
-			stateManager.reportScanProgress(0, 100) // set totalFiles
+			stateManager.reportScanProgress(0, 25) // totalFiles = filesParsed (no extrapolation)
 			stateManager.startEmbedPhase(5000, true)
 			stateManager.reportEmbedProgress(500, 5000, 25)
 			const status = stateManager.getCurrentStatus()
@@ -193,7 +193,7 @@ describe("CodeIndexStateManager", () => {
 		})
 
 		it("should track filesParsed when provided", () => {
-			stateManager.reportScanProgress(0, 100) // set totalFiles
+			stateManager.reportScanProgress(0, 20) // set totalFiles = filesParsed (no extrapolation)
 			stateManager.startEmbedPhase(500, true)
 			stateManager.reportEmbedProgress(10, 100, 20)
 			const status = stateManager.getCurrentStatus()
@@ -204,7 +204,7 @@ describe("CodeIndexStateManager", () => {
 		})
 
 		it("should show block progress in embed progress message", () => {
-			stateManager.reportScanProgress(0, 2500)
+			stateManager.reportScanProgress(0, 500) // totalFiles = filesParsed (no extrapolation)
 			stateManager.startEmbedPhase(3000, true)
 			stateManager.reportEmbedProgress(100, 3000, 500)
 			const status = stateManager.getCurrentStatus()
@@ -231,7 +231,7 @@ describe("CodeIndexStateManager", () => {
 		})
 
 		it("should include startingBlockCount offset in effective embedded display", () => {
-			stateManager.reportScanProgress(0, 1000)
+			stateManager.reportScanProgress(0, 50) // totalFiles = filesParsed (no extrapolation)
 			stateManager.startEmbedPhase(50000, true, undefined, 10000)
 			stateManager.reportEmbedProgress(500, 50000, 50)
 			const status = stateManager.getCurrentStatus()
@@ -265,11 +265,216 @@ describe("CodeIndexStateManager", () => {
 			expect(status.message).toContain("50 of 1,000 files checked")
 		})
 
+		it("should auto-revise totalBlocks upward when effectiveEmbedded exceeds estimate", () => {
+			// Simulate: cache-based estimate is 1000, but startingBlockCount from Qdrant is 800
+			// and we embed 300 new blocks → effectiveEmbedded = 800 + 300 = 1100 > 1000
+			stateManager.startEmbedPhase(1000, true, undefined, 800)
+			stateManager.reportEmbedProgress(300, 1000)
+			const status = stateManager.getCurrentStatus()
+
+			// totalBlocks should have been auto-revised to effectiveEmbedded (1100)
+			expect(status.totalBlocks).toBe(1100)
+			expect(status.blocksEmbedded).toBe(1100) // 800 + 300
+			// processedItems should never exceed totalItems
+			expect(status.processedItems).toBeLessThanOrEqual(status.totalItems)
+		})
+
+		it("should not revise totalBlocks when effectiveEmbedded is within estimate", () => {
+			stateManager.startEmbedPhase(5000, true, undefined, 1000)
+			stateManager.reportEmbedProgress(500, 5000)
+			const status = stateManager.getCurrentStatus()
+
+			// effectiveEmbedded = 1000 + 500 = 1500 < 5000, no revision needed
+			expect(status.totalBlocks).toBe(5000)
+			expect(status.blocksEmbedded).toBe(1500)
+		})
+
 		it("should not override Stopping state", () => {
 			stateManager.startEmbedPhase(1000, true)
 			stateManager.setSystemState("Stopping", "Stop...")
 			stateManager.reportEmbedProgress(100)
 			expect(stateManager.state).toBe("Stopping")
+		})
+
+		describe("backpressure hint in file line", () => {
+			it("should NOT show backpressure hint when files are still advancing", () => {
+				const now = Date.now()
+				vi.spyOn(Date, "now").mockReturnValue(now)
+
+				stateManager.reportScanProgress(0, 1000)
+				stateManager.startEmbedPhase(5000, true)
+
+				// Advance both blocks and files
+				vi.spyOn(Date, "now").mockReturnValue(now + 3000)
+				stateManager.reportEmbedProgress(100, 5000, 200)
+
+				const status = stateManager.getCurrentStatus()
+				expect(status.message).toContain("200 of 1,000 files checked")
+				expect(status.message).not.toContain("waiting for embeddings")
+
+				vi.restoreAllMocks()
+			})
+
+			it("should show backpressure hint when files stalled for >2s but blocks advancing", () => {
+				const now = Date.now()
+				vi.spyOn(Date, "now").mockReturnValue(now)
+
+				stateManager.reportScanProgress(0, 1000)
+				stateManager.startEmbedPhase(5000, true)
+
+				// First: some file progress
+				stateManager.reportEmbedProgress(50, 5000, 200)
+
+				// 3s later: blocks advance but files stay at 200
+				vi.spyOn(Date, "now").mockReturnValue(now + 3000)
+				stateManager.reportEmbedProgress(200, 5000, 200)
+
+				const status = stateManager.getCurrentStatus()
+				expect(status.message).toContain("200 of 1,000 files checked (waiting for embeddings)")
+
+				vi.restoreAllMocks()
+			})
+
+			it("should NOT show backpressure hint when all files are parsed", () => {
+				const now = Date.now()
+				vi.spyOn(Date, "now").mockReturnValue(now)
+
+				stateManager.reportScanProgress(0, 1000)
+				stateManager.startEmbedPhase(5000, true)
+				stateManager.reportEmbedProgress(50, 5000, 1000) // all files parsed
+
+				// 3s later: blocks advance, all files already parsed
+				vi.spyOn(Date, "now").mockReturnValue(now + 3000)
+				stateManager.reportEmbedProgress(200, 5000, 1000)
+
+				const status = stateManager.getCurrentStatus()
+				expect(status.message).toContain("1,000 of 1,000 files checked")
+				expect(status.message).not.toContain("waiting for embeddings")
+
+				vi.restoreAllMocks()
+			})
+
+			it("should clear backpressure hint when files advance again", () => {
+				const now = Date.now()
+				vi.spyOn(Date, "now").mockReturnValue(now)
+
+				stateManager.reportScanProgress(0, 1000)
+				stateManager.startEmbedPhase(5000, true)
+				stateManager.reportEmbedProgress(50, 5000, 200)
+
+				// 3s later: stalled — hint should appear
+				vi.spyOn(Date, "now").mockReturnValue(now + 3000)
+				stateManager.reportEmbedProgress(200, 5000, 200)
+				expect(stateManager.getCurrentStatus().message).toContain("waiting for embeddings")
+
+				// Now files advance again — hint should disappear
+				vi.spyOn(Date, "now").mockReturnValue(now + 3100)
+				stateManager.reportEmbedProgress(210, 5000, 250)
+				expect(stateManager.getCurrentStatus().message).toContain("250 of 1,000 files checked")
+				expect(stateManager.getCurrentStatus().message).not.toContain("waiting for embeddings")
+
+				vi.restoreAllMocks()
+			})
+
+			it("should NOT show backpressure hint within the 2s threshold", () => {
+				const now = Date.now()
+				vi.spyOn(Date, "now").mockReturnValue(now)
+
+				stateManager.reportScanProgress(0, 1000)
+				stateManager.startEmbedPhase(5000, true)
+				stateManager.reportEmbedProgress(50, 5000, 200)
+
+				// Only 1.5s later: files stalled but under threshold
+				vi.spyOn(Date, "now").mockReturnValue(now + 1500)
+				stateManager.reportEmbedProgress(100, 5000, 200)
+
+				const status = stateManager.getCurrentStatus()
+				expect(status.message).toContain("200 of 1,000 files checked")
+				expect(status.message).not.toContain("waiting for embeddings")
+
+				vi.restoreAllMocks()
+			})
+		})
+	})
+
+	describe("ETA extrapolation (from-scratch index)", () => {
+		it("should extrapolate total blocks when parsing is incomplete", () => {
+			const now = Date.now()
+			vi.spyOn(Date, "now").mockReturnValue(now)
+
+			// 65K files total, only 1000 parsed so far with 20,000 blocks found
+			// Extrapolated: (20000 / 1000) * 65000 = 1,300,000
+			stateManager.reportScanProgress(0, 65000)
+			stateManager.startEmbedPhase(20000, true)
+
+			vi.spyOn(Date, "now").mockReturnValue(now + 10000)
+			stateManager.reportEmbedProgress(5000, 20000, 1000)
+
+			const status = stateManager.getCurrentStatus()
+			// Display total should be extrapolated (~1,300,000), not raw 20,000
+			expect(status.message).toContain("1,300,000 total blocks")
+			// totalItems (progress bar denominator) should also be extrapolated
+			expect(status.totalItems).toBe(1300000)
+
+			vi.restoreAllMocks()
+		})
+
+		it("should use extrapolated total for ETA (not raw partial total)", () => {
+			const now = Date.now()
+			vi.spyOn(Date, "now").mockReturnValue(now)
+
+			// 1000 files total, 100 parsed with 500 blocks → 5 blocks/file → extrapolated = 5000
+			stateManager.reportScanProgress(0, 1000)
+			stateManager.startEmbedPhase(500, true)
+
+			// 100 blocks embedded in 10s → 10 blocks/s
+			// Remaining = 5000 - 100 = 4900 blocks → ETA = 490s = 490000ms
+			vi.spyOn(Date, "now").mockReturnValue(now + 10000)
+			stateManager.reportEmbedProgress(100, 500, 100)
+
+			const status = stateManager.getCurrentStatus()
+			expect(status.estimatedTimeRemainingMs).toBe(490000)
+
+			vi.restoreAllMocks()
+		})
+
+		it("should NOT extrapolate when all files are parsed", () => {
+			stateManager.reportScanProgress(0, 100) // totalFiles = 100
+			stateManager.startEmbedPhase(500, true)
+			stateManager.reportEmbedProgress(100, 500, 100) // filesParsed = totalFiles
+
+			const status = stateManager.getCurrentStatus()
+			// No extrapolation — raw total used
+			expect(status.message).toContain("~500 total blocks")
+			expect(status.totalItems).toBe(500)
+		})
+
+		it("should NOT extrapolate when isEstimatedTotal is false", () => {
+			stateManager.reportScanProgress(0, 1000)
+			stateManager.startEmbedPhase(500, false) // exact total
+			stateManager.reportEmbedProgress(100, 500, 200)
+
+			const status = stateManager.getCurrentStatus()
+			// isEstimatedTotal = false → no extrapolation even though filesParsed < totalFiles
+			expect(status.message).toContain("500 total blocks")
+			expect(status.totalItems).toBe(500)
+		})
+
+		it("should converge extrapolation as more files are parsed", () => {
+			stateManager.reportScanProgress(0, 1000) // 1000 files total
+
+			stateManager.startEmbedPhase(500, true)
+			stateManager.reportEmbedProgress(100, 500, 100) // 100/1000 parsed
+			// Extrapolated: (500/100) * 1000 = 5000
+			expect(stateManager.getCurrentStatus().totalItems).toBe(5000)
+
+			stateManager.reportEmbedProgress(400, 2000, 500) // 500/1000 parsed
+			// Extrapolated: (2000/500) * 1000 = 4000
+			expect(stateManager.getCurrentStatus().totalItems).toBe(4000)
+
+			stateManager.reportEmbedProgress(800, 3000, 1000) // 1000/1000 parsed — all done
+			// No extrapolation — exact total
+			expect(stateManager.getCurrentStatus().totalItems).toBe(3000)
 		})
 	})
 
@@ -350,7 +555,7 @@ describe("CodeIndexStateManager", () => {
 			vi.spyOn(Date, "now").mockReturnValue(now)
 
 			stateManager.startIndexingTimer()
-			stateManager.reportScanProgress(0, 1000)
+			stateManager.reportScanProgress(0, 20) // totalFiles = filesParsed (no extrapolation)
 			stateManager.startEmbedPhase(5000, true)
 
 			// 2% block progress (100 of 5000 blocks) in 10s — above 1% threshold
@@ -405,7 +610,7 @@ describe("CodeIndexStateManager", () => {
 			vi.spyOn(Date, "now").mockReturnValue(now)
 
 			stateManager.startIndexingTimer()
-			stateManager.reportScanProgress(0, 100)
+			stateManager.reportScanProgress(0, 20) // totalFiles = filesParsed (no extrapolation)
 			stateManager.startEmbedPhase(100, true)
 
 			// 20 blocks of 100 = 20% block progress in 10s
@@ -443,7 +648,7 @@ describe("CodeIndexStateManager", () => {
 			vi.spyOn(Date, "now").mockReturnValue(now)
 
 			stateManager.startIndexingTimer()
-			stateManager.reportScanProgress(0, 1000)
+			stateManager.reportScanProgress(0, 100) // totalFiles = filesParsed (no extrapolation)
 			// Resume scenario: 8000 blocks already in Qdrant, 10000 total
 			stateManager.startEmbedPhase(10000, true, undefined, 8000)
 

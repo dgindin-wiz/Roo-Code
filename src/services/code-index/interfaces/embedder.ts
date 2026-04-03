@@ -21,6 +21,15 @@ export interface IEmbedder {
 	 */
 	validateConfiguration(): Promise<{ valid: boolean; error?: string }>
 
+	/**
+	 * Recycles the underlying HTTP client to release accumulated native memory.
+	 * Called periodically by the scanner during long indexing runs.
+	 * Optional — embedders using stateless transports (e.g. fetch) can skip this.
+	 * Returns a Promise so the caller can await socket teardown (critical for
+	 * freeing V8 external memory — unawaited destroys never process close events).
+	 */
+	recycleClient?(): Promise<void>
+
 	get embedderInfo(): EmbedderInfo
 }
 

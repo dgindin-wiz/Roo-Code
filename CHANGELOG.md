@@ -2,158 +2,226 @@
 
 ## [Unreleased]
 
-### Codebase Indexing: UI Responsive Improvements & New Controls (2026-03-30 08:47)
+### Fix: Await agent.destroy() & Route All Fetch Through Isolated Agents (2026-04-02 23:05)
 
 #### Fixed
 
-- **Missing Stopping status color in popover**: Status dot had no color mapping for the "Stopping" state, rendering an invisible dot. Added `bg-amber-500 animate-pulse` matching IndexingStatusBadge behavior.
-- **Inline style violation**: Replaced `style={{ display: "inline" }}` with Tailwind class `className="inline"` in the Learn More link.
-- **Inconsistent checkboxes**: Auto-enable default and workspace toggle used raw `<input type="checkbox">` instead of `VSCodeCheckbox`, causing visual inconsistency with the global enable toggle.
+- **`agent.destroy()` now properly awaited**: undici's `Agent.destroy()` returns a Promise, but it was never awaited in `isolated-fetch.ts` or the Qdrant dispatcher patch. Without `await`, socket close events never processed within the recycle window, making recycling have zero effect on external memory. Now `destroy` is `async` and awaited in both locations.
+- **`makeDirectEmbeddingRequest` routed through isolated fetch**: The Azure/full-URL code path in `OpenAICompatibleEmbedder` was calling `global.fetch()` which uses Node's default global dispatcher — completely bypassing the isolated agent that `recycleClient()` destroys. Changed to `this._isolatedFetch.fetch()` so all HTTP traffic flows through the recyclable agent.
+- **All `recycleClient()` methods now async**: Changed from `void` to `Promise<void>` in both `IEmbedder` and `IVectorStore` interfaces, and all implementations (`OpenAICompatibleEmbedder`, `OpenAiEmbedder`, `OpenRouterEmbedder`, `BedrockEmbedder`, `QdrantVectorStore`). Scanner now `await`s both recycle calls.
+- **Qdrant patch: `destroyAllDispatchers` now async with `await Promise.all(destroys)`**: The patched `destroyAllDispatchers()` was calling `agent.destroy()` in a fire-and-forget loop. Now collects all destroy promises and awaits them before returning.
 
 #### Changed
 
-- **Sticky action footer**: Moved Save/Start/Stop/Clear buttons from the scrollable body into a fixed footer with `border-t` separator. Popover body now scrolls independently via `flex-col` + `overflow-y-auto` + `min-h-0`.
-- **Flex-wrap on button row**: Action buttons now use `flex-wrap` to stack gracefully at narrow panel widths instead of colliding.
-- **Slider minimum width**: Added `min-w-[80px]` to both Search Score and Max Results sliders to prevent them from being squeezed to unusable sizes.
-- **Progress bar minimum width**: Added `min-w-[80px]` to the indexing progress bar for consistent sizing.
-
-#### Added
-
-- **ETA display below progress bar**: Shows estimated time remaining during embedding phase using `estimatedTimeRemainingMs` from IndexingStatus (e.g., "~3m remaining").
-- **Phase label during indexing**: Displays current phase — "Scanning files… 120/500" or "Embedding blocks… 340/1200" — using the two-phase progress data from IndexingStatus.
-- **Index stats when Indexed**: Shows summary (e.g., "500 files · 1,200 blocks") in the status section when indexing is complete.
-- **Re-index button**: New button in the Indexed state that triggers re-indexing without requiring Clear → Start. Sends the existing `startIndexing` message.
-- **"stopping" translation key**: Added missing `"stopping": "Stopping"` to `indexingStatuses` in en/settings.json.
+- **`isolated-fetch.ts`**: `destroy` property type changed from `() => void` to `() => Promise<void>`, implementation now `async` with `await agent.destroy()`.
+- **`openai-compatible.spec.ts`**: Added `vitest.mock("../../utils/isolated-fetch")` to delegate `createIsolatedFetch().fetch` to `global.fetch` so existing test mocks for Azure/full-URL paths continue to work.
 
 #### Tested
 
-- 26 new tests covering: formatEtaForDisplay helper, status dot color mapping for all 5 states, phase label rendering logic, index stats rendering, re-index button visibility/disabled conditions, and ETA display conditions.
-- All 43 CodeIndex-related webview tests passing.
+- All 53 openai-compatible embedder tests pass
+- All 29 scanner tests pass
+- All 18 openrouter embedder tests pass
+- All 71 qdrant-client tests pass
 
-### Codebase Indexing: Embed Pipeline Robustness & Stuck Prevention (2026-03-28 00:29)
-
-#### Fixed
-
-- **File info tracking bug in embed phase**: `currentBatchFileInfos.push()` was placed AFTER the block accumulation loop, but `submitBatch()` was called INSIDE it. Batches were snapshotted with missing file info for the current file, causing cache updates to be skipped and files re-processed on resume. Fix: moved file info tracking BEFORE the block loop.
-- **No batch timeout causing pipeline deadlocks**: `_processBatch()` called `embedder.createEmbeddings()` and `qdrantClient.upsertPoints()` with no timeout. If the API or Qdrant hung, all `batchLimiter` slots filled, `Promise.race(activeBatchPromises)` never resolved, the BoundedChannel filled (200 capacity), and all `channel.push()` calls from the parse phase blocked — total deadlock. Fix: added `_withBatchTimeout()` wrapper (2-minute timeout per batch attempt) so hung batches fail fast and count toward `consecutiveBatchFailures`.
-- **Missing `isFeatureEnabled` guard in orchestrator**: `startIndexing()` checked `isFeatureConfigured` but NOT `isFeatureEnabled`. If the "Enable Codebase Indexing" checkbox was unchecked, the scan could still start via the orchestrator. Fix: added `isFeatureEnabled` check as defense-in-depth.
+### Diagnostic Logging for Residual Memory Growth Attribution (2026-04-02 15:57)
 
 #### Added
 
-- `BATCH_PROCESSING_TIMEOUT_MS` constant (120s) — per-batch timeout to prevent indefinite hangs from API/network issues
-- Debug logging for batch errors with timeout detection (`batch-error` events in debug log)
+- **Per-source memory attribution at recycle boundaries** (`scanner.ts`): Recycle block now snapshots `process.memoryUsage()` at 3 points — before any recycle, after embedder recycle, after Qdrant recycle — and logs `embedderExternalDeltaMB` vs `qdrantExternalDeltaMB` to isolate which source accounts for residual external memory growth.
+- **IsolatedFetch agent lifecycle tracking** (`isolated-fetch.ts`): Added `getIsolatedFetchStats()` returning `{ created, destroyed, alive }` counters. `_totalCreated++` on create, `_totalDestroyed++` on destroy. Logged at recycle boundaries to verify embedder agents are properly freed.
+- **Qdrant dispatcher count diagnostic** (`qdrant-client.ts`): Added `getDispatcherCount()` method that calls the patched `getDispatcherCount()` from `@qdrant/js-client-rest`. Returns `_agents.length` from the patch module, or `-1` if unavailable.
+- **pnpm patch: `getDispatcherCount` export** (`patches/@qdrant__js-client-rest@1.14.0.patch`): Extended the existing Qdrant dispatcher patch to also export `getDispatcherCount = () => _agents.length` for diagnostic visibility into how many undici Agents are tracked at any point.
 
-#### Tests
+#### Tested
 
-- Updated all orchestrator test mocks to include `isFeatureEnabled: true`
+- All 29 scanner tests pass
+- pnpm install applies updated patch successfully (verified `getDispatcherCount` in both CJS and ESM builds)
 
-### Codebase Indexing: Fix Block Count Inflation on Resume (2026-03-28 23:48)
-
-#### Fixed
-
-- **Scanner totalBlockEstimate was non-additive**: `totalBlockEstimate` used `max(cachedBlockEstimate, blocksFound)` but cached files (unchanged, mtime-matched) and candidates (new/changed) are **disjoint** sets. Once candidates' `blocksFound` exceeded the cached count, the cached value was lost. Total should be `cachedBlockEstimate + blocksFound`. Fix: replaced mutable `totalBlockEstimate` with `getTotalEstimate()` function that always returns `cachedBlockEstimate + blocksFound`. This was the dominant cause of inflated block counts on resume (e.g., 239K cached + 200K candidates showing as 440K instead of 440K — both numbers happened to be close in this case, but would diverge badly in other scenarios).
-- **Orphaned cache entries inflating getTotalCachedBlockCount()**: When quitting VS Code mid-index, `updateBlockCount()` is called during parse but `updateHash()` only happens after successful embedding. `flush()` from any completed batch writes ALL in-memory blockCounts to disk. On resume, `getTotalCachedBlockCount()` summed ALL blockCount entries including orphans (no hash). Fix: only count files that also have a hash entry.
-- **Orchestrator double-counting startingBlockCount**: Orchestrator was adding `startingBlockCount` (pre-existing Qdrant points) to `totalBlocksEstimate` (already represents ALL workspace blocks). Fix: pass `totalBlocksEstimate` directly — `startingBlockCount` is only a display offset.
-
-#### Tests
-
-- Updated `getTotalCachedBlockCount` test to require hash entries alongside blockCounts
-- Added test: "should exclude orphaned blockCounts (no hash) from total"
-- Added test: "should return 0 when all blockCounts are orphaned (no hashes)"
-- Added test: "should NOT add startingBlockCount to totalBlocksEstimate on resume (no double-counting)" in orchestrator tests
-
-### Codebase Indexing: Scanner Pipeline Re-Architecture (2026-03-28 01:18)
-
-Complete re-architecture of the scanner pipeline from a monolithic single-method design to a clean three-phase pipeline (Discover → Parse → Embed) with bounded backpressure and event-based progress reporting.
-
-#### Added
-
-- **`BoundedChannel<T>` utility** (`processors/bounded-channel.ts`): async producer-consumer queue with `push()`, `drain()` (AsyncGenerator), `close()`, and AbortSignal support for clean backpressure between parse and embed phases
-- **Event-based scanner progress**: `IDirectoryScanner` now uses `onProgress: Event<ScanProgress>` and `onError: Event<Error>` instead of 6+ callback parameters
-- **`ScanProgress` and `ScanResult` interfaces** for clean typed data flow between scanner and orchestrator
-- **15 new BoundedChannel tests** covering push/drain, backpressure, abort signal, and close behavior
+### Code Indexing Memory Optimizations — Lazy Cache Payload & Base64 Decode Streamlining (2026-04-01 14:03)
 
 #### Changed
 
-- **Scanner rewritten with three-phase pipeline**:
-    - Phase 1 (Discover): list → filter → stat → classify by mtime. Unchanged files counted instantly (~90% of files in incremental scan), so file progress jumps to ~90% within 3 seconds
-    - Phase 2 (Parse): `parseLimiter` reads/hashes/parses candidates. Slots release IMMEDIATELY after parse — never wait on embedding
-    - Phase 3 (Embed): consumes from BoundedChannel, batches, embeds, upserts with fail-fast. Runs concurrently with Phase 2
-- **Backpressure moved outside `parseLimiter`**: `channel.push()` blocks the per-file outer promise, NOT the parseLimiter slot. Other files keep parsing while backpressure is applied
-- **Orchestrator simplified**: single `_runScan()` method replaces duplicate `_runIncrementalScan`/`_runFullScan`. Subscribes to scanner progress events and forwards to state manager
-- **Scanner API simplified**: `scanDirectory(directory, signal)` returns `ScanResult` — no more 6-parameter callback signature
+- **CacheManager lazy disk payload** (`cache-manager.ts`): `_buildDiskPayload()` now returns a Proxy over the in-memory Map instead of eagerly materializing all 65K+ cache entries into a plain object. `JsonStreamStringify` enumerates keys via `ownKeys` and fetches each `[hash, mtimeMs, blockCount]` tuple lazily on access, keeping peak memory proportional to the streaming window rather than the full cache size.
+- **Embedder base64 decode single-pass** (`openai-compatible.ts`, `openrouter.ts`): Replaced double `.map()` with intermediate `{...item, embedding: Array.from(float32)}` object spread + second `.map(item => item.embedding)` with a single `.map()` that decodes base64 → Float32Array → `number[]` directly, eliminating one intermediate array allocation and one object spread per embedding item per batch.
+
+#### Tested
+
+- All 46 cache-manager tests pass
+- All 53 openai-compatible embedder tests pass
+- All 18 openrouter embedder tests pass
+- All 29 scanner tests pass
+- TypeScript compiles clean (`tsc --noEmit`)
+
+### Fix Memory Growth During Code Indexing — Periodic HTTP Client Recycling (2026-04-01 12:05)
 
 #### Fixed
 
-- **File/block progress out of sync**: Root cause was backpressure wait inside `parseLimiter` — when 10 changed files all block on embed backpressure, all 10 parseLimiter slots are occupied and remaining ~60K unchanged files can't even be counted. Fixed by moving backpressure to BoundedChannel outside parseLimiter
-- **parseLimiter starvation**: parseLimiter slots could be held indefinitely while waiting for embed queue depth to decrease. Now parseLimiter always releases after parse, and backpressure is in the BoundedChannel push
-
-#### Tests
-
-- Scanner tests updated for new `scanDirectory(dir, signal)` API and event-based progress
-- Orchestrator tests updated with `createMockScanner()` helper supporting `onProgress`/`onError` events
-- 15 new BoundedChannel tests (constructor validation, push/drain, backpressure, abort signal, close behavior)
-- All 574 code-index tests passing
-
-### Codebase Indexing: Reliability, Performance, and Progress Accuracy Overhaul
-
-Major improvements to the codebase indexing feature making it production-ready for large workspaces (65K+ files, 2M+ code blocks). Addresses indexing stability on VS Code restart, accurate progress display, and resilience to transient errors.
+- **Native memory (external) growth during code indexing**: The embedder and Qdrant HTTP clients (OpenAI SDK / undici / AWS SDK) accumulated native C++ connection pool buffers during long indexing runs. On a 65K-file workspace (wiz), `externalMB` grew monotonically from 53→1200+ MB while `heapUsedMB` stayed flat at ~140 MB, causing RSS to exceed 1.5 GB and lock up the Extension Host. Root cause: the HTTP clients were created once at the start of indexing and never recycled, so their underlying undici connection pools accumulated native buffers that V8's garbage collector cannot reclaim.
 
 #### Added
 
-- **Two-phase indexing progress with ETA**: scanning → embedding phases with accurate block-level throughput, percentage, and estimated time remaining in the UI
-    - `StateManager` rewritten with phase-aware progress: `startIndexingTimer()`, `reportScanProgress()`, `startEmbedPhase()`, `reportEmbedProgress()`, `reportComplete()`
-    - `formatEta()` utility for human-readable time remaining display
-    - `~` (tilde) prefix on block counts when total is estimated (self-corrects as parsing proceeds)
-    - Two-line status: "Embedded X of ~Y total blocks (N blocks/sec) — ~Z remaining" + "X of Y files checked"
-    - `CacheManager` extended with per-file `blockCounts` for progress estimation on future scans
-    - `IndexingStatus` type extended with `phase`, `totalBlocks`, `blocksEmbedded`, `estimatedTimeRemainingMs`, `isEstimatedTotal`
-    - WebView components (`CodeIndexPopover` + `IndexingStatusBadge`) updated with progress bar, percentage label, and ETA
-- **Configurable file cap**: `roo-cline.codeIndex.maxFiles` VS Code setting (default 100K, min 1K, max 500K). Applied after extension filtering so non-code files don't consume the budget.
-- **Auto-retry with exponential backoff** (5s, 15s, 30s) on transient Qdrant errors instead of requiring manual restart
+- **`recycleClient()` method on `IEmbedder` interface** (`interfaces/embedder.ts`): Optional method allowing embedder implementations to recreate their HTTP clients, releasing accumulated native memory.
+- **`recycleClient()` method on `IVectorStore` interface** (`interfaces/vector-store.ts`): Optional method allowing vector store implementations to recreate their HTTP clients.
+- **`recycleClient()` implementations**: Added to `OpenAICompatibleEmbedder`, `OpenAiEmbedder`, `OpenRouterEmbedder`, `BedrockEmbedder`, `GeminiEmbedder` (delegates), `MistralEmbedder` (delegates), `VercelAiGatewayEmbedder` (delegates), and `QdrantVectorStore`.
+- **`CLIENT_RECYCLE_INTERVAL` constant** (`constants/index.ts`): Set to 25 — recycles both clients every 25 embedding batches.
+- **Periodic client recycling in scanner** (`scanner.ts`): After every `CLIENT_RECYCLE_INTERVAL` batches, calls `this.embedder.recycleClient?.()` and `this.qdrantClient.recycleClient?.()` to discard old connection pools and their native buffers.
 
-#### Changed
+#### Tested
 
-- **Orchestrator refactored** into `_runFullScan()`, `_runIncrementalScan()`, `_validateScanResults()`, `_handleIndexingError()` — extracted from monolithic `startIndexing()`
-- **~100x faster incremental scans**: two-tier mtime+hash check — `stat()` mtime comparison first (microseconds), only reads+hashes file if mtime changed
-- **File-size-weighted block estimation** for accurate first-index progress — scanner pre-stats all files before parsing; orchestrator computes `(blocksFound / bytesParsed) × totalBytes` so progress converges to true total as files are parsed
-- **Cache format upgraded** to `{hashes, mtimes, blockCounts}` with full backward compatibility for old formats
-- **Serialized cache flush** via `_flushPromise` coalescing pattern — prevents concurrent `safeWriteJson()` calls from lock contention
-- `deactivate()` now awaits cache flush before process exit — previously fire-and-forget async that lost data
-- Structured `[REINDEX-DECISION]` logging at all decision points for debugging reindex behavior
+- All 29 scanner tests pass (26 original + 3 new recycling tests)
+- All 283 embedder + vector store + service factory tests pass
+- All 26 orchestrator tests pass
+- TypeScript compiles clean (`tsc --noEmit`)
+
+### Qdrant Client: Fix undici Agent Memory Leak (2025-03-31 14:53)
 
 #### Fixed
 
-- **Indexing lockup when Qdrant collection deleted mid-indexing**: Scanner would futilely retry 13K+ batches × 3 retries × 3.5s each with no status change. Added fail-fast mechanism: `MAX_CONSECUTIVE_BATCH_FAILURES=5` — after 5 consecutive batch failures, `systemicBatchError` is set, all blocked parsers and embed workers are woken, and the error propagates to the orchestrator's `_handleIndexingError()` which shows "Error" status in the UI. (2026-03-27 17:49)
-- **File parsing stall at ~23K files**: Unbounded embed queue accumulated 380K+ blocks in closures (~380MB) causing GC thrashing and event loop stalls. Added `MAX_EMBED_QUEUE_FILES=200` backpressure — parsing pauses when embed queue exceeds depth limit, then resumes as queue drains. (2026-03-27 17:25)
-- **Growing total estimate on incremental scans**: `startingBlockCount + cumulativeBlocksFound` kept climbing (432K→839K) as more files were parsed. Now uses cache-based frozen estimate (like full scans) — total stays stable unless actual exceeds it. (2026-03-27 17:25)
-- **JSON block explosion (25x)**: JSON files parsed via tree-sitter JavaScript query captured every `object`, `pair`, and `array` node, creating ~19,811 blocks from a 790KB file. Moved `.json` to fallback line-based chunking which produces ~790 blocks instead — a 25x reduction. Affects total index size significantly for workspaces with large JSON fixtures. (2026-03-27 16:50)
-- **File progress stuck on resume**: "X of Y files checked" counter no longer freezes during resumed indexing — `reportEmbedProgress()` change detection now includes `filesParsed`, so skipped (unchanged) files still update the UI (2026-03-27 15:19)
-- **Resume progress accuracy**: on resume after interrupted indexing, progress bar, block counts, totals, and ETA are now correct
-    - Block count includes pre-existing Qdrant points (`startingBlockCount`) so display shows real index size, not just this session's work
-    - Total block estimate extrapolated from partial cache when it covers <90% of files (e.g., 10K of 65K files → proportional scale-up)
-    - ETA uses session-only throughput so it reflects actual embedding speed, not inflated by pre-existing blocks
-- **Cache persistence**: fixed bug where only ~16% of file entries persisted across VS Code restarts (concurrent batch flushes caused lock contention; replaced with single orchestrator-level flush)
-- **Unnecessary full re-indexes** eliminated on transient Qdrant/embedder errors, VS Code restarts, and macOS sleep/wake cycles:
-    - Distinguish HTTP 404 from transient network errors in Qdrant client
-    - Preserve collection data on embedder-only failures
-    - Retry logic and optimistic fallback in `hasIndexedData()` to prevent full re-index on transient connectivity issues
-    - Treat partially-indexed collections as having data (incremental scan, not full re-index)
-    - Guard against stale macOS keychain secrets causing spurious config change detection
-    - Deduplicate redundant `initialize()` + `startIndexing()` calls in webview handler
-- **Embedding prefix bug**: `queryPrefix` was applied to both documents and queries, degrading search quality for models like `nomic-embed-code` — now only applied to queries via `{ isQuery: true }`
-- **Edge case**: externally clearing Qdrant collection points (without deleting the collection) now correctly detected and triggers cache clear instead of silently skipping all files
-- **Stale cache pruning** on startup removes entries for files that no longer exist on disk
-- **File watcher** now distinguishes transient Qdrant errors from permanent failures — transient errors skip cache updates so files are retried on next change
-- Parse `Retry-After` header from 429 rate-limit responses for more precise backoff in OpenAI-compatible embedder
+- **Qdrant undici Agent native memory leak** (`qdrant-client.ts`): The Qdrant JS client (`@qdrant/js-client-rest` v1.14.0) creates an `undici.Agent` with 25 persistent connections. Over 930+ batches of upsert/delete calls, the Agent's native C++ connection pool buffers accumulated in V8's "external" memory category, growing from 78 MB → 1,239 MB while heap stayed flat at ~150 MB. This was the root cause of the RSS growing from ~550 MB to 1,777 MB during wiz workspace indexing. Fixed by adding `resetClient()` to `QdrantVectorStore` that recreates the entire `QdrantClient` (and its undici Agent), allowing the old Agent's native buffers to be garbage-collected.
 
-#### Tests
+#### Added
 
-- 60 new tests across the indexing subsystem (553 total passing):
-    - StateManager: two-phase progress, ETA calculation, `formatEta()`, resume with `startingBlockCount`, "files checked" wording, `reportComplete` reset
-    - Orchestrator: edge case empty collection cache clear, normal resume preserves cache, transient error handling, auto-retry backoff
-    - QdrantVectorStore: `getPointCount()` metadata subtraction, empty/missing/transient error cases
-    - Scanner: `onFileParsed(0)` for skipped files (oversized, mtime-cached, hash-matched), fail-fast after consecutive batch failures, below-threshold batch failures don't abort
+- **`resetClient()` method on `IVectorStore` interface** (`interfaces/vector-store.ts`): Optional method allowing vector store implementations to recycle their underlying HTTP clients, releasing accumulated native memory.
+- **`resetClient()` implementation on `QdrantVectorStore`** (`qdrant-client.ts`): Recreates the `QdrantClient` instance (with its `undici.Agent` connection pool) using stored constructor parameters. Extracted client creation into `_createQdrantClient()` helper.
+- **Qdrant client recycling in scanner** (`scanner.ts`): Every `CLIENT_RECYCLE_INTERVAL` (25) batches, now calls `this.qdrantClient.resetClient?.()` alongside `this.embedder.resetClient?.()` to release both the OpenAI SDK and Qdrant undici Agent native memory.
+
+#### Changed
+
+- **`CLIENT_RECYCLE_INTERVAL` lowered from 200 to 25** (`constants/index.ts`): Ensures client recycling fires frequently enough for short-to-medium indexing runs. At 200 batches, a 59-batch run would never trigger recycling.
+- **Diagnostic log throttle bypass** (`scanner.ts`): Added `phaseTransition: true` to `memory-breakdown`, `client-recycled`, and `rss-warning` log calls to bypass the 1-second throttle in `debug-logger.ts` that was silently dropping these entries.
+
+#### Tested
+
+- All 75 qdrant-client tests pass
+- All 26 scanner tests pass
+- All 50 orchestrator + manager tests pass
+- TypeScript compiles clean (`tsc --noEmit`)
+
+### Embedder: Fix Native Memory (RSS) Leak During Embed Phase (2025-03-31 10:50)
+
+#### Fixed
+
+- **Native RSS leak from OpenAI SDK response retention** (`openai-compatible.ts`, `openrouter.ts`): The `_embedBatchWithRetries` method used `response.data.map(item => ({...item}))` to extract embeddings, which kept references to the original SDK response objects and their underlying native HTTP buffers (connection pools, TLS contexts, response buffers). Over ~1,785 API calls, RSS grew from ~325MB to 2,665MB while V8 heap stayed flat at ~170MB. Fixed by extracting only numeric arrays in a `for` loop, eagerly nulling each `item.embedding` after conversion, then nulling `response.data` and `response` itself.
+- **Rate limit test mock shared object corruption** (`openai-compatible-rate-limit.spec.ts`): Test used `.mockResolvedValue()` which returns the same object reference for all calls. The new eager-release code nulls `response.data` after extraction, corrupting the shared mock for subsequent calls. Fixed by switching to `.mockImplementation(() => Promise.resolve({...}))` which creates a fresh object per call, matching real-world behavior.
+
+#### Added
+
+- **`resetClient()` method on `IEmbedder` interface** (`interfaces/embedder.ts`): Optional method allowing embedders to recycle their underlying HTTP clients, releasing accumulated native memory.
+- **`resetClient()` implementations**: Added to `OpenAICompatibleEmbedder`, `OpenRouterEmbedder`, `OpenAiEmbedder` (direct), and `GeminiEmbedder`, `MistralEmbedder`, `VercelAiGatewayEmbedder` (delegation to inner OpenAICompatibleEmbedder).
+- **Periodic client recycling in scanner** (`scanner.ts`): Every `CLIENT_RECYCLE_INTERVAL` (25) batches, calls `embedder.resetClient?.()` to release accumulated native HTTP client state.
+- **RSS soft-limit monitoring** (`scanner.ts`): Every 50 batches, checks `process.memoryUsage().rss` against `RSS_SOFT_LIMIT_MB` (2048). Logs warning and triggers `global.gc()` hint when exceeded.
+- **Memory breakdown diagnostic logging** (`scanner.ts`): Every 10 batches, logs detailed `process.memoryUsage()` breakdown (rss, heapUsed, heapTotal, external, arrayBuffers) via `IndexDebugLogger`.
+- **New constants** (`constants/index.ts`): `CLIENT_RECYCLE_INTERVAL = 25`, `RSS_SOFT_LIMIT_MB = 2048`.
+
+#### Tested
+
+- All 174 embedder tests pass (including rate-limit suite)
+- All 26 scanner tests pass
+- TypeScript compiles clean (`tsc --noEmit`)
+
+### Cache Manager: Fix Silent Data Loss on Large Workspaces (2025-03-30 22:55)
+
+#### Fixed
+
+- **Silent cache data loss** (`cache-manager.ts`): Debounced save path previously called `_performSave()` directly, bypassing the serialized `flush()` pipeline. This caused concurrent `safeWriteJson()` calls fighting over `proper-lockfile`, with the losers silently swallowing errors. On a 65K-file workspace, ~41,500 of 65,581 cache entries were lost between sessions, triggering full reindexing on restart.
+- **Infinite flush loop on save failure** (`cache-manager.ts`): `_serializedFlush()` loop condition `while (this._dirtyAfterFlushStart || this._dirty)` retried forever when `_performSave()` failed (since `_dirty` was restored to `true`). Fixed by having `_performSave()` return a boolean and breaking on failure instead.
+- **Potential deadlock in embed phase** (`scanner.ts`): `Promise.race([...activeBatchPromises])` at line 655 could silently hang forever if `activeBatchPromises` was empty (per JS spec, `Promise.race([])` never resolves). Added guard: `if (activeBatchPromises.size === 0) break` before the race.
+
+#### Changed
+
+- **Debounced save routes through `flush()`** (`cache-manager.ts`): The debounce callback now calls `void this.flush()` instead of `_performSave()` directly, ensuring all writes share the same serialization pipeline — no more file-lock contention.
+- **`flush()` cancels pending debounce** (`cache-manager.ts`): `this._debouncedSaveCache.cancel()` is called at the start of `flush()`, preventing a redundant trailing write after an explicit flush.
+- **Dirty flag skip/retry semantics** (`cache-manager.ts`): `_dirty` flag tracks in-memory vs disk divergence. `_serializedFlush()` skips writes when clean (making per-batch `flush()` calls near-free), and restores `_dirty = true` on failure so the next flush retries automatically.
+- **Consolidated to single `Map<string, CacheEntry>`** (`cache-manager.ts`): Replaced three parallel `Record<string, T>` maps (hashes, mtimes, blockCounts) with a single `Map<string, CacheEntry>` for memory efficiency and single-lookup access.
+- **Compact v4 disk format** (`cache-manager.ts`): New `{ v: 4, entries: Record<string, [hash, mtimeMs|null, blockCount|null]> }` format is ~40% smaller than v2/v3. Backward-compatible reader supports v1 (flat hash record), v2/v3 (separate maps), and v4.
+- **O(1) `hashCount` getter** (`cache-manager.ts`, `orchestrator.ts`): Replaces `Object.keys(getAllHashes()).length` (which allocated full key arrays) with `this._entries.size`.
+- **Zero-copy `cachedFilePaths()` iterator** (`cache-manager.ts`, `scanner.ts`): Replaces `Object.keys(getAllHashes())` in `_handleDeletedFiles()` with a Map key iterator — no intermediate array allocation.
+- **`updateBlockCount()` sets dirty flag** (`cache-manager.ts`): Previously mutations from `updateBlockCount()` were not tracked as dirty, meaning block counts could be lost if no hash update followed before flush.
+- **Save failure logging** (`cache-manager.ts`): `_performSave()` now logs failures via `IndexDebugLogger.log()` and telemetry instead of silently swallowing errors.
+
+#### Tested
+
+- Updated `cache-manager.spec.ts` for v4 disk format, Map internals, debounce→flush routing, dirty flag semantics
+- Added tests: v4/v3/v1 backward-compat loading, dirty skip on clean flush, debounce cancel on flush, retry after save failure, save failure restores dirty flag
+- Updated `scanner.spec.ts` mock with `cachedFilePaths()` method
+- All 46 cache-manager, 26 orchestrator, 26 scanner, 24 manager tests pass
+
+### Codebase Indexing: Comprehensive Overhaul
+
+Major overhaul of the codebase indexing feature for production readiness on large workspaces (65K+ files, 2M+ code blocks). Addresses pipeline architecture, indexing stability, progress accuracy, debug observability, UI improvements, and error resilience.
+
+#### Added
+
+- **Three-phase scanner pipeline** (`scanner.ts`): Complete re-architecture from monolithic single-method to Discover → Parse → Embed pipeline with `BoundedChannel<T>` backpressure between phases
+- **Two-phase indexing progress with ETA** (`state-manager.ts`): Scanning → embedding phases with block-level throughput, percentage, and estimated time remaining. `formatEta()` utility, tilde prefix on estimated totals, two-line status messages
+- **ETA extrapolation for from-scratch indexes** (`state-manager.ts`): `_getExtrapolatedTotal()` projects `(totalBlocks / filesParsed) * totalFiles` when parsing is incomplete, converging to the real value as more files are parsed
+- **Backpressure hint in file progress** (`state-manager.ts`): When file parsing stalls for >2s due to embed queue backpressure, shows "(waiting for embeddings)" in status message
+- **Debug logger with dual-output and rich context** (`debug-logger.ts`): "Roo Code: Index" OutputChannel for always-visible phase transitions; `setContext()` with workspace/provider/model/platform info; `[workspaceName]` tags; `+H:MM:SS` elapsed time; `heapMB` memory stats; session summary on close; `logToChannel()` for errors
+- **Log rotation with compression** (`debug-logger.ts`): Auto-rotates `~/roo-index-debug.log` at 5 MB with gzip compression, keeping up to 2 rotated files
+- **User-controllable debug logging**: `roo-cline.codeIndex.debugLogging` VS Code setting (default: `false`), checked lazily on each log call for runtime toggling
+- **UI improvements** (`CodeIndexPopover.tsx`): ETA display below progress bar, phase labels during indexing, index stats when complete, re-index button, sticky action footer, flex-wrap on button row, slider/progress bar minimum widths, "Stopping" status color
+- **Configurable file cap**: `roo-cline.codeIndex.maxFiles` VS Code setting (default 100K)
+- **Auto-retry with exponential backoff** (5s, 15s, 30s) on transient Qdrant errors
+- **Batch timeout** (`BATCH_PROCESSING_TIMEOUT_MS = 120s`): Prevents indefinite hangs from API/network issues in embed pipeline
+- **Defense-in-depth constants**: `SEARCH_EMBEDDING_TIMEOUT_MS`, `MAX_PARSEABLE_FILE_SIZE_BYTES`, `PARSER_LOAD_TIMEOUT_MS`, `PARSE_CHUNK_SIZE`, `PROGRESS_THROTTLE_MS`
+
+#### Changed
+
+- **Scanner pipeline** (`scanner.ts`): Event-based `onProgress`/`onError` API replaces 6+ callback parameters; `scanDirectory(dir, signal)` returns typed `ScanResult`; chunked parse iteration (100 files/chunk); 250ms progress throttle; `setTimeout(0)` yield in backpressure loop
+- **Orchestrator** (`orchestrator.ts`): Single `_runScan()` replaces duplicate full/incremental methods; wires up `IndexDebugLogger.setContext()`; logs completions/errors to OutputChannel; handles permanent vs transient watcher batch errors
+- **Cache format** (`cache-manager.ts`): Upgraded to `{hashes, mtimes, blockCounts}` with backward compatibility; serialized flush via `_flushPromise` coalescing; `getTotalCachedBlockCount()` excludes orphaned entries (no hash)
+- **State manager** (`state-manager.ts`): Phase-aware progress with `startIndexingTimer()`, `reportScanProgress()`, `startEmbedPhase()`, `reportEmbedProgress()`, `reportComplete()`; auto-revises `totalBlocks` upward when exceeded; `getCurrentStatus()` returns extrapolated total
+- **`deactivate()`** now awaits cache flush before process exit
+- **`MAX_EMBED_QUEUE_FILES`** reduced from 200 → 50 for bounded peak memory
+- **Webview message handlers** (`webviewMessageHandler.ts`): `toggleWorkspaceIndexing` and `startIndexing` now send `postMessageToWebview` outside `try/catch` so the webview always receives status updates
+
+#### Fixed
+
+- **Full re-indexing on every VS Code restart** (`manager.ts`, `orchestrator.ts`): Removed aggressive `pruneStaleEntries()` from startup that deleted valid cache entries for briefly-inaccessible files; added abort signal guard after `vectorStore.initialize()` to preserve cache on user cancel
+- **Extension Host freeze on large workspaces** (`scanner.ts`): Replaced `Promise.all(candidates.map(...))` creating 65K+ simultaneous Promises with chunked iteration; added event-loop yield in backpressure busy-wait; added progress event throttling (4/sec max)
+- **Indexing lockup when Qdrant deleted mid-indexing**: Fail-fast after `MAX_CONSECUTIVE_BATCH_FAILURES=5` instead of retrying 13K+ batches
+- **File parsing stall at ~23K files**: Backpressure cap prevents unbounded embed queue (~380MB closure accumulation)
+- **Pipeline deadlocks**: Added 2-minute batch timeout (`_withBatchTimeout()`) so hung API/Qdrant calls fail fast
+- **File info tracking bug in embed phase**: Moved `currentBatchFileInfos.push()` before block loop so batch snapshots include all file info for correct cache updates
+- **Block count inflation on resume**: Scanner `getTotalEstimate()` now correctly sums disjoint cached + candidate blocks; orphaned cache entries excluded; orchestrator no longer double-counts `startingBlockCount`
+- **Progress bar >100%**: Backend auto-revises `totalBlocks` upward when exceeded; frontend clamps to `Math.min(100, ...)`
+- **Progress bar using raw total instead of extrapolated**: `getCurrentStatus()` now returns extrapolated total for consistent progress bar and text
+- **Growing total estimate on incremental scans**: Uses cache-based frozen estimate instead of cumulative
+- **JSON block explosion (25x)**: Moved `.json` to line-based chunking (790 blocks vs 19,811)
+- **File progress stuck on resume**: Change detection now includes `filesParsed`
+- **Resume progress accuracy**: Includes pre-existing Qdrant points, extrapolates from partial cache, uses session-only throughput for ETA
+- **Cache persistence**: Fixed concurrent batch flush lock contention (only ~16% of entries persisted)
+- **Unnecessary full re-indexes**: Distinguished HTTP 404 from transient errors; preserved collection on embedder failures; guarded against stale macOS keychain secrets; deduplicated `initialize()` + `startIndexing()` calls
+- **Search failure killing active indexing** (`search-service.ts`): Only transitions to Error state when not actively indexing
+- **Search embedding timeout** (`search-service.ts`): 30s timeout on query embedding generation
+- **`deletePointsByMultipleFilePaths` silently swallowing errors** (`qdrant-client.ts`): Now re-throws for proper caller handling
+- **`getPointCount` transient errors** (`qdrant-client.ts`): Added retry logic (1 retry, 500ms delay)
+- **Parser OOM on oversized files** (`parser.ts`): Defense-in-depth `stat()` check (2MB limit) before `readFile()`
+- **Parser WASM load hangs** (`parser.ts`): 30s timeout with eviction from `pendingLoads` Map
+- **`clearIndexData` race condition** (`manager.ts`): Calls `stopIndexing()` before clearing to prevent active scan writes during deletion
+- **`startIndexing` from Error state** (`manager.ts`): Auto-recovers via `recoverFromError()` then `initialize()` instead of silently returning
+- **Missing `isFeatureEnabled` guard** (`orchestrator.ts`): Prevents scan start when global checkbox is unchecked
+- **Embedding prefix bug**: `queryPrefix` now only applied to queries, not documents
+- **File watcher reliability** (`file-watcher.ts`): Cache flush after every batch; `_disposed` flag at phase boundaries; atomic changed-file deletion (Phase 3 instead of Phase 1); `_pendingRetryDeletions` queue for transient failures
+- **Permanent watcher errors silently ignored** (`orchestrator.ts`): Now transitions to Error state and stops watcher
+- **Workspace checkbox feedback loop** (`CodeIndexPopover.tsx`): Reverted checkboxes from `<VSCodeCheckbox>` (fires onChange on programmatic property changes) back to native `<input type="checkbox">` (fires only on user interaction)
+- **Missing Stopping status color** in popover: Added `bg-amber-500 animate-pulse`
+
+#### Tested
+
+- **~200 new tests** across the indexing subsystem, bringing total to ~600:
+    - `state-manager.spec.ts` (59 tests): Two-phase progress, ETA calculation, `formatEta()`, resume with `startingBlockCount`, auto-revision, extrapolation, backpressure hints
+    - `debug-logger.spec.ts` (39 tests): `setContext`, workspace tag, elapsed time, OutputChannel, `logToChannel`, memory stats, session summary, throttling, log rotation
+    - `scanner.spec.ts` (26 tests): Three-phase pipeline, chunked iteration, progress throttling, abort, backpressure, fail-fast
+    - `orchestrator.spec.ts` (26 tests): Multi-session persistence, abort timing, idempotency, batch error handling, `setContext()` wiring
+    - `file-watcher.spec.ts` (33 tests): Debounce, batch pipeline, cache flush, disposed guard, atomic deletions, transient retry, permanent errors
+    - `cache-manager.spec.ts` (38 tests): `pruneStaleEntries`, flush reliability, orphaned entry exclusion
+    - `manager.spec.ts` (24 tests): `clearIndexData` race, `startIndexing` recovery
+    - `search-service.spec.ts` (15 tests): Basic functionality, search-during-indexing, timeout, telemetry
+    - `qdrant-client.spec.ts` (75 tests): Retry logic, re-throw on deletion, transient error handling
+    - `parser.spec.ts` (46 tests): File size guard, parser load timeout
+    - `bounded-channel.spec.ts` (15 tests): Push/drain, backpressure, abort signal, close behavior
+    - `CodeIndexPopover.ui-improvements.spec.tsx` (43 tests): Progress clamping, status dots, phase labels, ETA display
 
 ## 3.51.1
 

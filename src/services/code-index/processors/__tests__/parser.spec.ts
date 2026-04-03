@@ -3,8 +3,9 @@
 import { CodeParser, codeParser } from "../parser"
 import { loadRequiredLanguageParsers } from "../../../tree-sitter/languageParser"
 import { parseMarkdown } from "../../../tree-sitter/markdownParser"
-import { readFile } from "fs/promises"
+import { readFile, stat } from "fs/promises"
 import { Node } from "web-tree-sitter"
+import { MAX_PARSEABLE_FILE_SIZE_BYTES, PARSER_LOAD_TIMEOUT_MS } from "../../constants"
 
 // Mock TelemetryService
 vi.mock("../../../../../packages/telemetry/src/TelemetryService", () => ({
@@ -23,6 +24,7 @@ vi.mock("fs/promises", () => ({
 		mkdir: vi.fn(),
 		access: vi.fn(),
 		rename: vi.fn(),
+		stat: vi.fn(),
 		constants: {},
 	},
 	readFile: vi.fn(),
@@ -30,6 +32,7 @@ vi.mock("fs/promises", () => ({
 	mkdir: vi.fn(),
 	access: vi.fn(),
 	rename: vi.fn(),
+	stat: vi.fn(),
 }))
 
 vi.mock("../../../tree-sitter/languageParser")
@@ -61,7 +64,8 @@ describe("CodeParser", () => {
 		vi.clearAllMocks()
 		parser = new CodeParser()
 		;(loadRequiredLanguageParsers as any).mockResolvedValue(mockLanguageParser as any)
-		// Set up default fs.readFile mock return value
+		// Set up default fs mocks
+		vi.mocked(stat).mockResolvedValue({ size: 100 } as any)
 		vi.mocked(readFile).mockResolvedValue("// default test content")
 	})
 
@@ -96,17 +100,20 @@ describe("CodeParser", () => {
 			}
 			// More comments to pad the length to ensure we hit the minimum character requirement */`
 
-			// Reset the mock and set new return value
+			// Reset the mocks and set new return values
+			vi.mocked(stat).mockResolvedValue({ size: testContent.length } as any)
 			vi.mocked(readFile).mockReset()
 			vi.mocked(readFile).mockResolvedValue(testContent)
 
 			const result = await parser.parseFile("test.js")
+			expect(vi.mocked(stat)).toHaveBeenCalledWith("test.js")
 			expect(vi.mocked(readFile)).toHaveBeenCalledWith("test.js", "utf8")
 			expect(result.length).toBeGreaterThan(0)
 		})
 
 		it("should handle file read errors gracefully", async () => {
 			// Reset the mock and set it to reject
+			vi.mocked(stat).mockResolvedValue({ size: 100 } as any)
 			vi.mocked(readFile).mockReset()
 			vi.mocked(readFile).mockRejectedValue(new Error("File not found"))
 			const result = await parser.parseFile("test.js")
@@ -1007,6 +1014,148 @@ This content verifies that processing continues after multiple oversized lines.`
 			// Should return empty array since content is below MIN_BLOCK_CHARS (50)
 			expect(results.length).toBe(0)
 			expect(smallContent.length).toBeLessThan(50) // Verify our test assumption
+		})
+	})
+
+	describe("File size guard (defense-in-depth)", () => {
+		it("should skip files exceeding MAX_PARSEABLE_FILE_SIZE_BYTES", async () => {
+			const oversizeBytes = MAX_PARSEABLE_FILE_SIZE_BYTES + 1
+			vi.mocked(stat).mockResolvedValue({ size: oversizeBytes } as any)
+
+			const result = await parser.parseFile("big-file.js")
+
+			expect(vi.mocked(stat)).toHaveBeenCalledWith("big-file.js")
+			expect(vi.mocked(readFile)).not.toHaveBeenCalled()
+			expect(result).toEqual([])
+		})
+
+		it("should allow files at exactly MAX_PARSEABLE_FILE_SIZE_BYTES", async () => {
+			const content = `/* Long content that passes the size guard */
+			const a = 1; const b = 2; const c = 3;
+			function test() { return a + b + c; }
+			class Example { constructor() { this.value = 42; } }
+			// Padding to ensure enough characters for the parser to produce results`
+
+			vi.mocked(stat).mockResolvedValue({ size: MAX_PARSEABLE_FILE_SIZE_BYTES } as any)
+			vi.mocked(readFile).mockResolvedValue(content)
+
+			const result = await parser.parseFile("exact-limit.js")
+
+			expect(vi.mocked(stat)).toHaveBeenCalledWith("exact-limit.js")
+			expect(vi.mocked(readFile)).toHaveBeenCalledWith("exact-limit.js", "utf8")
+			expect(result.length).toBeGreaterThan(0)
+		})
+
+		it("should not call stat when content is provided via options", async () => {
+			const content = `/* Provided content bypasses stat check */
+			const x = 10; const y = 20;
+			function calc() { return x * y; }
+			// Extra padding to meet minimum block size`
+
+			const result = await parser.parseFile("test.js", { content })
+
+			expect(vi.mocked(stat)).not.toHaveBeenCalled()
+			expect(vi.mocked(readFile)).not.toHaveBeenCalled()
+			expect(result.length).toBeGreaterThan(0)
+		})
+
+		it("should handle stat errors gracefully (e.g. file deleted between discover and parse)", async () => {
+			vi.mocked(stat).mockRejectedValue(new Error("ENOENT: no such file or directory"))
+
+			const result = await parser.parseFile("deleted.js")
+
+			expect(result).toEqual([])
+		})
+	})
+
+	describe("Parser load timeout (_withParserLoadTimeout)", () => {
+		it("should resolve when parser loads within timeout", async () => {
+			const result = await parser["_withParserLoadTimeout"](Promise.resolve({ js: mockLanguageParser.js }), "js")
+			expect(result).toEqual({ js: mockLanguageParser.js })
+		})
+
+		it("should reject with timeout error when parser load hangs", async () => {
+			vi.useFakeTimers()
+
+			// Create a never-resolving promise
+			const neverResolves = new Promise<any>(() => {})
+			parser["pendingLoads"].set("js", neverResolves)
+
+			const timeoutPromise = parser["_withParserLoadTimeout"](neverResolves, "js")
+
+			// Advance past the timeout
+			vi.advanceTimersByTime(PARSER_LOAD_TIMEOUT_MS + 1)
+
+			await expect(timeoutPromise).rejects.toThrow(/timed out/)
+
+			vi.useRealTimers()
+		})
+
+		it("should evict hung promise from pendingLoads on timeout", async () => {
+			vi.useFakeTimers()
+
+			const neverResolves = new Promise<any>(() => {})
+			parser["pendingLoads"].set("js", neverResolves)
+
+			const timeoutPromise = parser["_withParserLoadTimeout"](neverResolves, "js")
+
+			// Before timeout, pendingLoads should still have the entry
+			expect(parser["pendingLoads"].has("js")).toBe(true)
+
+			vi.advanceTimersByTime(PARSER_LOAD_TIMEOUT_MS + 1)
+
+			try {
+				await timeoutPromise
+			} catch {
+				// expected
+			}
+
+			// After timeout, pendingLoads should be evicted so future requests retry
+			expect(parser["pendingLoads"].has("js")).toBe(false)
+
+			vi.useRealTimers()
+		})
+
+		it("should propagate original error when parser load rejects before timeout", async () => {
+			const originalError = new Error("WASM load failed")
+			const rejectingPromise = Promise.reject(originalError)
+
+			await expect(parser["_withParserLoadTimeout"](rejectingPromise, "js")).rejects.toThrow("WASM load failed")
+		})
+
+		it("should return empty array from parseContent when pending load times out", async () => {
+			vi.useFakeTimers()
+
+			// Set up a hung pending load
+			const neverResolves = new Promise<any>(() => {})
+			parser["pendingLoads"].set("js", neverResolves)
+
+			// parseContent should eventually timeout and return []
+			const parsePromise = parser["parseContent"]("test.js", "const a = 1", "hash")
+
+			vi.advanceTimersByTime(PARSER_LOAD_TIMEOUT_MS + 1)
+
+			const result = await parsePromise
+			expect(result).toEqual([])
+
+			vi.useRealTimers()
+		})
+
+		it("should return empty array from parseContent when new load times out", async () => {
+			vi.useFakeTimers()
+
+			// Mock loadRequiredLanguageParsers to return a never-resolving promise
+			const neverResolves = new Promise<any>(() => {})
+			;(loadRequiredLanguageParsers as any).mockReturnValue(neverResolves)
+
+			const parsePromise = parser["parseContent"]("test.js", "const a = 1", "hash")
+
+			vi.advanceTimersByTime(PARSER_LOAD_TIMEOUT_MS + 1)
+
+			const result = await parsePromise
+			expect(result).toEqual([])
+
+			vi.useRealTimers()
 		})
 	})
 })

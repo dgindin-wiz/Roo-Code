@@ -9,6 +9,17 @@ vitest.mock("openai")
 // Mock global fetch
 global.fetch = vitest.fn()
 
+// Mock createIsolatedFetch so that _isolatedFetch.fetch delegates to global.fetch.
+// This allows tests to mock global.fetch as before and have assertions work correctly,
+// even though makeDirectEmbeddingRequest now uses this._isolatedFetch.fetch (not global.fetch).
+vitest.mock("../../utils/isolated-fetch", () => ({
+	createIsolatedFetch: () => ({
+		fetch: (...args: any[]) => (global.fetch as any)(...args),
+		destroy: vitest.fn().mockResolvedValue(undefined),
+	}),
+	getIsolatedFetchStats: () => ({ created: 0, destroyed: 0, alive: 0 }),
+}))
+
 // Mock TelemetryService
 vitest.mock("@roo-code/telemetry", () => ({
 	TelemetryService: {
@@ -95,20 +106,24 @@ describe("OpenAICompatibleEmbedder", () => {
 		it("should create embedder with valid configuration", () => {
 			embedder = new OpenAICompatibleEmbedder(testBaseUrl, testApiKey, testModelId)
 
-			expect(MockedOpenAI).toHaveBeenCalledWith({
-				baseURL: testBaseUrl,
-				apiKey: testApiKey,
-			})
+			expect(MockedOpenAI).toHaveBeenCalledWith(
+				expect.objectContaining({
+					baseURL: testBaseUrl,
+					apiKey: testApiKey,
+				}),
+			)
 			expect(embedder).toBeDefined()
 		})
 
 		it("should use default model when modelId is not provided", () => {
 			embedder = new OpenAICompatibleEmbedder(testBaseUrl, testApiKey)
 
-			expect(MockedOpenAI).toHaveBeenCalledWith({
-				baseURL: testBaseUrl,
-				apiKey: testApiKey,
-			})
+			expect(MockedOpenAI).toHaveBeenCalledWith(
+				expect.objectContaining({
+					baseURL: testBaseUrl,
+					apiKey: testApiKey,
+				}),
+			)
 			expect(embedder).toBeDefined()
 		})
 

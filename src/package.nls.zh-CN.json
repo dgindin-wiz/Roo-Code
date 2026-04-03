@@ -43,6 +43,7 @@
 	"settings.newTaskRequireTodos.description": "使用 new_task 工具创建新任务时需要 todos 参数",
 	"settings.codeIndex.embeddingBatchSize.description": "代码索引期间嵌入操作的批处理大小。根据 API 提供商的限制调整此设置。默认值为 60。",
 	"settings.codeIndex.maxFiles.description": "要索引的最大代码文件数。对于非常大的 monorepo 请增加此值。在扩展名过滤后应用。默认值：100,000。",
+	"settings.codeIndex.debugLogging.description": "Enable verbose debug logging for codebase indexing. Writes detailed progress and timing data to ~/roo-index-debug.log for troubleshooting. Default: off.",
 	"settings.debug.description": "启用调试模式以显示额外按钮，用于在临时文件中以格式化 JSON 查看 API 对话历史和 UI 消息。",
 	"settings.debugProxy.enabled.description": "**启用 Debug Proxy** — 通过代理转发所有出站网络请求，用于 MITM 调试。只在调试模式 (F5) 运行时生效。",
 	"settings.debugProxy.serverUrl.description": "代理 URL（例如 `http://127.0.0.1:8888`）。仅在启用 **Debug Proxy** 时使用。",

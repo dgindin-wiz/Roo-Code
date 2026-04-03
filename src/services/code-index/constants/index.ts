@@ -23,9 +23,19 @@ export const MAX_BATCH_RETRIES = 3
 export const INITIAL_RETRY_DELAY_MS = 500
 export const PARSING_CONCURRENCY = 10
 export const MAX_PENDING_BATCHES = 20 // Maximum number of batches to accumulate before waiting
-export const MAX_EMBED_QUEUE_FILES = 200 // Max files queued in embedLimiter before parsing pauses (bounds memory)
+export const PARSE_CHUNK_SIZE = 100 // Number of candidate files to process per iteration (prevents 65K Promise explosion)
+export const PROGRESS_THROTTLE_MS = 250 // Min interval between progress events (4/sec max, prevents event storm)
+export const MAX_EMBED_QUEUE_FILES = 50 // Max files queued in embed channel before parsing pauses (bounds memory)
 export const MAX_CONSECUTIVE_BATCH_FAILURES = 5 // Abort scan after N consecutive batch failures (fail fast)
 export const BATCH_PROCESSING_TIMEOUT_MS = 120_000 // 2 minutes — if a single batch takes longer, treat as hung
+export const CLIENT_RECYCLE_INTERVAL = 25 // Recycle HTTP clients every N batches to release accumulated native memory
+
+/**Search */
+export const SEARCH_EMBEDDING_TIMEOUT_MS = 30_000 // 30 seconds — timeout for generating query embedding during search
+
+/**Parser */
+export const MAX_PARSEABLE_FILE_SIZE_BYTES = 2 * 1024 * 1024 // 2MB — skip files larger than this to prevent OOM
+export const PARSER_LOAD_TIMEOUT_MS = 30_000 // 30 seconds — timeout for loading a tree-sitter WASM parser
 
 /**OpenAI Embedder */
 export const MAX_BATCH_TOKENS = 100000
