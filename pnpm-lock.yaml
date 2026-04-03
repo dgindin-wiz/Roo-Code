@@ -16,6 +16,11 @@ overrides:
   '@types/react-dom': ^18.3.5
   zod: 3.25.76
 
+patchedDependencies:
+  '@qdrant/js-client-rest@1.14.0':
+    hash: e073708ca702b2db0c91b76ded898f7aed302284d0aa1012210c842e81aaae8e
+    path: patches/@qdrant__js-client-rest@1.14.0.patch
+
 importers:
 
   .:
@@ -799,7 +804,7 @@ importers:
         version: 1.12.0
       '@qdrant/js-client-rest':
         specifier: ^1.14.0
-        version: 1.14.0(typescript@5.8.3)
+        version: 1.14.0(patch_hash=e073708ca702b2db0c91b76ded898f7aed302284d0aa1012210c842e81aaae8e)(typescript@5.8.3)
       '@roo-code/cloud':
         specifier: workspace:^
         version: link:../packages/cloud
@@ -13052,7 +13057,7 @@ snapshots:
       - bare-buffer
       - supports-color
 
-  '@qdrant/js-client-rest@1.14.0(typescript@5.8.3)':
+  '@qdrant/js-client-rest@1.14.0(patch_hash=e073708ca702b2db0c91b76ded898f7aed302284d0aa1012210c842e81aaae8e)(typescript@5.8.3)':
     dependencies:
       '@qdrant/openapi-typescript-fetch': 1.2.6
       '@sevinf/maybe': 0.5.0

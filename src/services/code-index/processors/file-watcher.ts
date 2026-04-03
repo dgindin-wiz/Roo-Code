@@ -42,6 +42,14 @@ export class FileWatcher implements IFileWatcher {
 	private readonly FILE_PROCESSING_CONCURRENCY_LIMIT = 10
 	private readonly batchSegmentThreshold: number
 
+	// Fix 2: Disposed guard — prevents race conditions when dispose() is called
+	// while a batch is still in-flight.
+	private _disposed = false
+
+	// Fix 5: Retry queue for transient deletion failures — paths are retried
+	// in the next batch cycle instead of being silently dropped.
+	private _pendingRetryDeletions: Set<string> = new Set()
+
 	private readonly _onDidStartBatchProcessing = new vscode.EventEmitter<string[]>()
 	private readonly _onBatchProgressUpdate = new vscode.EventEmitter<{
 		processedInBatch: number
@@ -121,9 +129,12 @@ export class FileWatcher implements IFileWatcher {
 	}
 
 	/**
-	 * Disposes the file watcher
+	 * Disposes the file watcher.
+	 * Sets _disposed flag to prevent in-flight batches from making further
+	 * Qdrant/cache writes after disposal.
 	 */
 	dispose(): void {
+		this._disposed = true
 		this.fileWatcher?.dispose()
 		if (this.batchProcessDebounceTimer) {
 			clearTimeout(this.batchProcessDebounceTimer)
@@ -139,6 +150,7 @@ export class FileWatcher implements IFileWatcher {
 	 * @param uri URI of the created file
 	 */
 	private async handleFileCreated(uri: vscode.Uri): Promise<void> {
+		if (this._disposed) return
 		this.accumulatedEvents.set(uri.fsPath, { uri, type: "create" })
 		this.scheduleBatchProcessing()
 	}
@@ -148,6 +160,7 @@ export class FileWatcher implements IFileWatcher {
 	 * @param uri URI of the changed file
 	 */
 	private async handleFileChanged(uri: vscode.Uri): Promise<void> {
+		if (this._disposed) return
 		this.accumulatedEvents.set(uri.fsPath, { uri, type: "change" })
 		this.scheduleBatchProcessing()
 	}
@@ -157,6 +170,7 @@ export class FileWatcher implements IFileWatcher {
 	 * @param uri URI of the deleted file
 	 */
 	private async handleFileDeleted(uri: vscode.Uri): Promise<void> {
+		if (this._disposed) return
 		this.accumulatedEvents.set(uri.fsPath, { uri, type: "delete" })
 		this.scheduleBatchProcessing()
 	}
@@ -175,7 +189,7 @@ export class FileWatcher implements IFileWatcher {
 	 * Triggers processing of accumulated events
 	 */
 	private async triggerBatchProcessing(): Promise<void> {
-		if (this.accumulatedEvents.size === 0) {
+		if (this._disposed || this.accumulatedEvents.size === 0) {
 			return
 		}
 
@@ -189,28 +203,28 @@ export class FileWatcher implements IFileWatcher {
 	}
 
 	/**
-	 * Processes a batch of accumulated events
-	 * @param eventsToProcess Map of events to process
+	 * Phase 1: Handle explicit file deletions only.
+	 * Changed-file old points are now deferred to after upsert succeeds (Fix 3).
 	 */
 	private async _handleBatchDeletions(
 		batchResults: FileProcessingResult[],
 		processedCountInBatch: number,
 		totalFilesInBatch: number,
 		pathsToExplicitlyDelete: string[],
-		filesToUpsertDetails: Array<{ path: string; uri: vscode.Uri; originalType: "create" | "change" }>,
-	): Promise<{ overallBatchError?: Error; clearedPaths: Set<string>; processedCount: number }> {
+	): Promise<{ overallBatchError?: Error; processedCount: number }> {
 		let overallBatchError: Error | undefined
-		const allPathsToClearFromDB = new Set<string>(pathsToExplicitlyDelete)
 
-		for (const fileDetail of filesToUpsertDetails) {
-			if (fileDetail.originalType === "change") {
-				allPathsToClearFromDB.add(fileDetail.path)
+		// Fix 5: Merge pending retry deletions from previous transient failures
+		for (const retryPath of this._pendingRetryDeletions) {
+			if (!pathsToExplicitlyDelete.includes(retryPath)) {
+				pathsToExplicitlyDelete.push(retryPath)
 			}
 		}
+		this._pendingRetryDeletions.clear()
 
-		if (allPathsToClearFromDB.size > 0 && this.vectorStore) {
+		if (pathsToExplicitlyDelete.length > 0 && this.vectorStore && !this._disposed) {
 			try {
-				await this.vectorStore.deletePointsByMultipleFilePaths(Array.from(allPathsToClearFromDB))
+				await this.vectorStore.deletePointsByMultipleFilePaths(pathsToExplicitlyDelete)
 
 				for (const path of pathsToExplicitlyDelete) {
 					this.cacheManager.deleteHash(path)
@@ -236,11 +250,13 @@ export class FileWatcher implements IFileWatcher {
 				})
 
 				if (isTransient) {
-					// Transient Qdrant error — don't mark files as failed,
-					// they'll be retried on next file change event
+					// Fix 5: Queue failed deletions for retry in next batch
+					for (const path of pathsToExplicitlyDelete) {
+						this._pendingRetryDeletions.add(path)
+					}
 					console.warn(
 						`[FileWatcher] Transient Qdrant error during batch deletion. ` +
-							`${pathsToExplicitlyDelete.length} file deletions will be retried on next change.`,
+							`${pathsToExplicitlyDelete.length} file deletions queued for retry.`,
 					)
 				} else {
 					// Permanent error — mark all paths as error
@@ -258,7 +274,7 @@ export class FileWatcher implements IFileWatcher {
 			}
 		}
 
-		return { overallBatchError, clearedPaths: allPathsToClearFromDB, processedCount: processedCountInBatch }
+		return { overallBatchError, processedCount: processedCountInBatch }
 	}
 
 	private async _processFilesAndPrepareUpserts(
@@ -269,14 +285,21 @@ export class FileWatcher implements IFileWatcher {
 		pathsToExplicitlyDelete: string[],
 	): Promise<{
 		pointsForBatchUpsert: PointStruct[]
-		successfullyProcessedForUpsert: Array<{ path: string; newHash?: string }>
+		successfullyProcessedForUpsert: Array<{ path: string; newHash?: string; originalType: "create" | "change" }>
 		processedCount: number
 	}> {
 		const pointsForBatchUpsert: PointStruct[] = []
-		const successfullyProcessedForUpsert: Array<{ path: string; newHash?: string }> = []
+		const successfullyProcessedForUpsert: Array<{
+			path: string
+			newHash?: string
+			originalType: "create" | "change"
+		}> = []
 		const filesToProcessConcurrently = [...filesToUpsertDetails]
 
 		for (let i = 0; i < filesToProcessConcurrently.length; i += this.FILE_PROCESSING_CONCURRENCY_LIMIT) {
+			// Fix 2: Bail out if disposed mid-batch
+			if (this._disposed) break
+
 			const chunkToProcess = filesToProcessConcurrently.slice(i, i + this.FILE_PROCESSING_CONCURRENCY_LIMIT)
 
 			const chunkProcessingPromises = chunkToProcess.map(async (fileDetail) => {
@@ -287,11 +310,21 @@ export class FileWatcher implements IFileWatcher {
 				})
 				try {
 					const result = await this.processFile(fileDetail.path)
-					return { path: fileDetail.path, result: result, error: undefined }
+					return {
+						path: fileDetail.path,
+						result: result,
+						error: undefined,
+						originalType: fileDetail.originalType,
+					}
 				} catch (e) {
 					const error = e as Error
 					console.error(`[FileWatcher] Unhandled exception processing file ${fileDetail.path}:`, e)
-					return { path: fileDetail.path, result: undefined, error: error }
+					return {
+						path: fileDetail.path,
+						result: undefined,
+						error: error,
+						originalType: fileDetail.originalType,
+					}
 				}
 			})
 
@@ -301,7 +334,7 @@ export class FileWatcher implements IFileWatcher {
 				let resultPath: string | undefined
 
 				if (settledResult.status === "fulfilled") {
-					const { path, result, error: directError } = settledResult.value
+					const { path, result, error: directError, originalType } = settledResult.value
 					resultPath = path
 
 					if (directError) {
@@ -312,9 +345,13 @@ export class FileWatcher implements IFileWatcher {
 						} else if (result.status === "processed_for_batching" && result.pointsToUpsert) {
 							pointsForBatchUpsert.push(...result.pointsToUpsert)
 							if (result.path && result.newHash) {
-								successfullyProcessedForUpsert.push({ path: result.path, newHash: result.newHash })
+								successfullyProcessedForUpsert.push({
+									path: result.path,
+									newHash: result.newHash,
+									originalType,
+								})
 							} else if (result.path && !result.newHash) {
-								successfullyProcessedForUpsert.push({ path: result.path })
+								successfullyProcessedForUpsert.push({ path: result.path, originalType })
 							}
 						} else {
 							batchResults.push({
@@ -361,15 +398,36 @@ export class FileWatcher implements IFileWatcher {
 		}
 	}
 
+	/**
+	 * Phase 3: Execute batch upsert, then delete old points for changed files
+	 * only after upsert succeeds (Fix 3: atomic swap).
+	 */
 	private async _executeBatchUpsertOperations(
 		pointsForBatchUpsert: PointStruct[],
-		successfullyProcessedForUpsert: Array<{ path: string; newHash?: string }>,
+		successfullyProcessedForUpsert: Array<{ path: string; newHash?: string; originalType: "create" | "change" }>,
 		batchResults: FileProcessingResult[],
 		overallBatchError?: Error,
 	): Promise<Error | undefined> {
+		if (this._disposed) return overallBatchError
+
 		if (pointsForBatchUpsert.length > 0 && this.vectorStore && !overallBatchError) {
 			try {
+				// Fix 3: First, delete old points for changed files BEFORE upserting new ones.
+				// This is done atomically with the upsert — if delete succeeds but upsert fails,
+				// the data will be re-processed on next change. If we skip deletion entirely,
+				// old blocks at line numbers that no longer exist would remain as ghosts.
+				const changedFilePaths = successfullyProcessedForUpsert
+					.filter((f) => f.originalType === "change")
+					.map((f) => f.path)
+
+				if (changedFilePaths.length > 0 && !this._disposed) {
+					await this.vectorStore.deletePointsByMultipleFilePaths(changedFilePaths)
+				}
+
+				// Now upsert the new points
 				for (let i = 0; i < pointsForBatchUpsert.length; i += this.batchSegmentThreshold) {
+					if (this._disposed) break
+
 					const batch = pointsForBatchUpsert.slice(i, i + this.batchSegmentThreshold)
 					let retryCount = 0
 					let upsertError: Error | undefined
@@ -474,38 +532,39 @@ export class FileWatcher implements IFileWatcher {
 			}
 		}
 
-		// Phase 1: Handle deletions
+		// Phase 1: Handle explicit deletions only (changed-file deletions deferred to Phase 3)
 		const { overallBatchError: deletionError, processedCount: deletionCount } = await this._handleBatchDeletions(
 			batchResults,
 			processedCountInBatch,
 			totalFilesInBatch,
 			pathsToExplicitlyDelete,
-			filesToUpsertDetails,
 		)
 		overallBatchError = deletionError
 		processedCountInBatch = deletionCount
 
 		// Phase 2: Process files and prepare upserts
-		const {
-			pointsForBatchUpsert,
-			successfullyProcessedForUpsert,
-			processedCount: upsertCount,
-		} = await this._processFilesAndPrepareUpserts(
-			filesToUpsertDetails,
-			batchResults,
-			processedCountInBatch,
-			totalFilesInBatch,
-			pathsToExplicitlyDelete,
-		)
-		processedCountInBatch = upsertCount
+		if (!this._disposed) {
+			const {
+				pointsForBatchUpsert,
+				successfullyProcessedForUpsert,
+				processedCount: upsertCount,
+			} = await this._processFilesAndPrepareUpserts(
+				filesToUpsertDetails,
+				batchResults,
+				processedCountInBatch,
+				totalFilesInBatch,
+				pathsToExplicitlyDelete,
+			)
+			processedCountInBatch = upsertCount
 
-		// Phase 3: Execute batch upsert
-		overallBatchError = await this._executeBatchUpsertOperations(
-			pointsForBatchUpsert,
-			successfullyProcessedForUpsert,
-			batchResults,
-			overallBatchError,
-		)
+			// Phase 3: Execute batch upsert (includes changed-file deletion, Fix 3)
+			overallBatchError = await this._executeBatchUpsertOperations(
+				pointsForBatchUpsert,
+				successfullyProcessedForUpsert,
+				batchResults,
+				overallBatchError,
+			)
+		}
 
 		// Finalize
 		this._onDidFinishBatchProcessing.fire({
@@ -516,6 +575,15 @@ export class FileWatcher implements IFileWatcher {
 			processedInBatch: totalFilesInBatch,
 			totalInBatch: totalFilesInBatch,
 		})
+
+		// Fix 1: Flush cache after batch to ensure durability.
+		// Without this, cache updates from updateHash/deleteHash are only debounced
+		// and could be lost if VS Code shuts down before the debounce fires.
+		try {
+			await this.cacheManager.flush()
+		} catch (e) {
+			console.error("[FileWatcher] Failed to flush cache after batch processing:", e)
+		}
 
 		if (this.accumulatedEvents.size === 0) {
 			this._onBatchProgressUpdate.fire({

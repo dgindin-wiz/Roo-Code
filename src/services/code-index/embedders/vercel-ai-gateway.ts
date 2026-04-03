@@ -94,6 +94,13 @@ export class VercelAiGatewayEmbedder implements IEmbedder {
 	}
 
 	/**
+	 * Propagates client recycling to the underlying OpenAI-compatible embedder.
+	 */
+	async recycleClient(): Promise<void> {
+		await this.openAICompatibleEmbedder.recycleClient()
+	}
+
+	/**
 	 * Returns information about this embedder
 	 */
 	get embedderInfo(): EmbedderInfo {

@@ -1,0 +1,103 @@
+diff --git a/dist/cjs/dispatcher.js b/dist/cjs/dispatcher.js
+index 4c7c7f628eccbad0778d7519c54386272a80562b..a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 100644
+--- a/dist/cjs/dispatcher.js
++++ b/dist/cjs/dispatcher.js
+@@ -1,16 +1,30 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+-exports.createDispatcher = void 0;
++exports.getDispatcherCount = exports.destroyAllDispatchers = exports.createDispatcher = void 0;
+ const undici_1 = require("undici");
+-const createDispatcher = (connections = 25) => new undici_1.Agent({
+-    // timeouts are handled by AbortSignal in our middleware
+-    bodyTimeout: 0,
+-    headersTimeout: 0,
+-    // https://stackoverflow.com/a/36437932/558180
+-    // pipelining: 1,
+-    // a sensible max connections value
+-    connections,
+-    // will be overriden by header Keep-Alive, just as sensible default
+-    keepAliveTimeout: 10000,
+-});
++// Track all created Agents so they can be destroyed to free native memory.
++// See: https://github.com/qdrant/qdrant-js/issues/52
++const _agents = [];
++const createDispatcher = (connections = 25) => {
++    const agent = new undici_1.Agent({
++        bodyTimeout: 0,
++        headersTimeout: 0,
++        connections,
++        keepAliveTimeout: 10000,
++    });
++    _agents.push(agent);
++    return agent;
++};
+ exports.createDispatcher = createDispatcher;
++/** Destroys all tracked Agents and awaits socket teardown. */
++const destroyAllDispatchers = async () => {
++    const destroys = _agents.map(agent => {
++        try { return agent.destroy(); } catch { return Promise.resolve(); }
++    });
++    _agents.length = 0;
++    await Promise.all(destroys);
++};
++exports.destroyAllDispatchers = destroyAllDispatchers;
++/** Returns the number of tracked Qdrant undici Agents (diagnostic). */
++const getDispatcherCount = () => _agents.length;
++exports.getDispatcherCount = getDispatcherCount;
+diff --git a/dist/cjs/index.js b/dist/cjs/index.js
+index 5d21352f6d3853d14032d5ac39cba0e974371339..593dd91f58d28823569ab0d8cd5ca14d61bca9f9 100644
+--- a/dist/cjs/index.js
++++ b/dist/cjs/index.js
+@@ -18,3 +18,5 @@ exports.QdrantClient = void 0;
+ var qdrant_client_js_1 = require("./qdrant-client.js");
+ Object.defineProperty(exports, "QdrantClient", { enumerable: true, get: function () { return qdrant_client_js_1.QdrantClient; } });
+ __exportStar(require("./errors.js"), exports);
++__exportStar(require("./dispatcher.js"), exports);
++__exportStar(require("./dispatcher.js"), exports);
+diff --git a/dist/esm/dispatcher.js b/dist/esm/dispatcher.js
+index 0850425dc1e3e3c4811d2860c14489fbffad646f..b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1 100644
+--- a/dist/esm/dispatcher.js
++++ b/dist/esm/dispatcher.js
+@@ -1,12 +1,22 @@
+ import { Agent } from 'undici';
+-export const createDispatcher = (connections = 25) => new Agent({
+-    // timeouts are handled by AbortSignal in our middleware
+-    bodyTimeout: 0,
+-    headersTimeout: 0,
+-    // https://stackoverflow.com/a/36437932/558180
+-    // pipelining: 1,
+-    // a sensible max connections value
+-    connections,
+-    // will be overriden by header Keep-Alive, just as sensible default
+-    keepAliveTimeout: 10000,
+-});
++const _agents = [];
++export const createDispatcher = (connections = 25) => {
++    const agent = new Agent({
++        bodyTimeout: 0,
++        headersTimeout: 0,
++        connections,
++        keepAliveTimeout: 10000,
++    });
++    _agents.push(agent);
++    return agent;
++};
++/** Destroys all tracked Agents and awaits socket teardown. */
++export const destroyAllDispatchers = async () => {
++    const destroys = _agents.map(agent => {
++        try { return agent.destroy(); } catch { return Promise.resolve(); }
++    });
++    _agents.length = 0;
++    await Promise.all(destroys);
++};
++/** Returns the number of tracked Qdrant undici Agents (diagnostic). */
++export const getDispatcherCount = () => _agents.length;
+diff --git a/dist/esm/index.js b/dist/esm/index.js
+index 689daa7c6d53c644fce968635432e026068f1e32..c9ed5de710bcb7ed2dd26eec4bee51bdc935d6f1 100644
+--- a/dist/esm/index.js
++++ b/dist/esm/index.js
+@@ -1,2 +1,3 @@
+ export { QdrantClient } from './qdrant-client.js';
+ export * from './errors.js';
++export { destroyAllDispatchers, getDispatcherCount } from './dispatcher.js';

@@ -43,6 +43,7 @@
 	"settings.newTaskRequireTodos.description": "new_task aracıyla yeni görevler oluştururken todos parametresini gerekli kıl",
 	"settings.codeIndex.embeddingBatchSize.description": "Kod indeksleme sırasında gömme işlemleri için toplu iş boyutu. Bunu API sağlayıcınızın sınırlarına göre ayarlayın. Varsayılan 60'tır.",
 	"settings.codeIndex.maxFiles.description": "İndekslenecek maksimum kod dosyası sayısı. Çok büyük monorepo'lar için bu değeri artırın. Uzantı filtrelemesinden sonra uygulanır. Varsayılan: 100.000.",
+	"settings.codeIndex.debugLogging.description": "Enable verbose debug logging for codebase indexing. Writes detailed progress and timing data to ~/roo-index-debug.log for troubleshooting. Default: off.",
 	"settings.debug.description": "API konuşma geçmişini ve kullanıcı arayüzü mesajlarını geçici dosyalarda biçimlendirilmiş JSON olarak görüntülemek için ek düğmeler göstermek üzere hata ayıklama modunu etkinleştir.",
 	"settings.debugProxy.enabled.description": "**Debug Proxy'yi etkinleştir** — Tüm giden ağ isteklerini MITM hata ayıklaması için bir proxy üzerinden yönlendir. Yalnızca debug modunda (F5) çalıştırırken aktiftir.",
 	"settings.debugProxy.serverUrl.description": "Proxy URL'si (ör. `http://127.0.0.1:8888`). Yalnızca **Debug Proxy** etkin olduğunda kullanılır.",

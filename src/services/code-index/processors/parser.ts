@@ -1,4 +1,4 @@
-import { readFile } from "fs/promises"
+import { readFile, stat } from "fs/promises"
 import { createHash } from "crypto"
 import * as path from "path"
 import { Node } from "web-tree-sitter"
@@ -6,7 +6,14 @@ import { LanguageParser, loadRequiredLanguageParsers } from "../../tree-sitter/l
 import { parseMarkdown } from "../../tree-sitter/markdownParser"
 import { ICodeParser, CodeBlock } from "../interfaces"
 import { scannerExtensions, shouldUseFallbackChunking } from "../shared/supported-extensions"
-import { MAX_BLOCK_CHARS, MIN_BLOCK_CHARS, MIN_CHUNK_REMAINDER_CHARS, MAX_CHARS_TOLERANCE_FACTOR } from "../constants"
+import {
+	MAX_BLOCK_CHARS,
+	MIN_BLOCK_CHARS,
+	MIN_CHUNK_REMAINDER_CHARS,
+	MAX_CHARS_TOLERANCE_FACTOR,
+	MAX_PARSEABLE_FILE_SIZE_BYTES,
+	PARSER_LOAD_TIMEOUT_MS,
+} from "../constants"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 import { sanitizeErrorMessage } from "../shared/validation-helpers"
@@ -50,6 +57,16 @@ export class CodeParser implements ICodeParser {
 			fileHash = options.fileHash || this.createFileHash(content)
 		} else {
 			try {
+				// Defense-in-depth: check file size before reading to prevent OOM.
+				// Both scanner and file-watcher already guard size, but the parser
+				// can be called directly.
+				const fileStat = await stat(filePath)
+				if (fileStat.size > MAX_PARSEABLE_FILE_SIZE_BYTES) {
+					console.warn(
+						`[CodeParser] Skipping file too large for parsing: ${filePath} (${fileStat.size} bytes, limit ${MAX_PARSEABLE_FILE_SIZE_BYTES})`,
+					)
+					return []
+				}
 				content = await readFile(filePath, "utf8")
 				fileHash = this.createFileHash(content)
 			} catch (error) {
@@ -86,6 +103,32 @@ export class CodeParser implements ICodeParser {
 	}
 
 	/**
+	 * Wraps a parser load promise with a timeout to prevent indefinite hangs.
+	 * If a WASM parser load takes longer than PARSER_LOAD_TIMEOUT_MS, the
+	 * pending promise is evicted from the cache and an error is thrown.
+	 */
+	private _withParserLoadTimeout<T>(promise: Promise<T>, ext: string): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				// Evict the hung promise so future requests retry
+				this.pendingLoads.delete(ext)
+				reject(new Error(`Parser load for .${ext} timed out after ${PARSER_LOAD_TIMEOUT_MS}ms`))
+			}, PARSER_LOAD_TIMEOUT_MS)
+
+			promise.then(
+				(value) => {
+					clearTimeout(timer)
+					resolve(value)
+				},
+				(error) => {
+					clearTimeout(timer)
+					reject(error)
+				},
+			)
+		})
+	}
+
+	/**
 	 * Parses file content into code blocks
 	 * @param filePath Path to the file
 	 * @param content File content
@@ -111,7 +154,7 @@ export class CodeParser implements ICodeParser {
 			const pendingLoad = this.pendingLoads.get(ext)
 			if (pendingLoad) {
 				try {
-					await pendingLoad
+					await this._withParserLoadTimeout(pendingLoad, ext)
 				} catch (error) {
 					console.error(`Error in pending parser load for ${filePath}:`, error)
 					TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
@@ -125,7 +168,7 @@ export class CodeParser implements ICodeParser {
 				const loadPromise = loadRequiredLanguageParsers([filePath])
 				this.pendingLoads.set(ext, loadPromise)
 				try {
-					const newParsers = await loadPromise
+					const newParsers = await this._withParserLoadTimeout(loadPromise, ext)
 					if (newParsers) {
 						this.loadedParsers = { ...this.loadedParsers, ...newParsers }
 					}

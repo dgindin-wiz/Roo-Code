@@ -197,6 +197,64 @@ describe("CodeIndexPopover - Re-index button rendering logic", () => {
 	})
 })
 
+describe("CodeIndexPopover - Progress percentage clamping", () => {
+	// Mirrors the progressPercentage useMemo logic in CodeIndexPopover.tsx
+
+	function calcProgressPercentage(indexingStatus: {
+		phase?: string
+		blocksEmbedded?: number
+		totalBlocks?: number
+		processedItems: number
+		totalItems: number
+	}): number {
+		if (indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0) {
+			return Math.min(100, Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100))
+		}
+		return indexingStatus.totalItems > 0
+			? Math.min(100, Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100))
+			: 0
+	}
+
+	test("clamps embedding progress to 100% when blocksEmbedded exceeds totalBlocks", () => {
+		// Reproduces the 102% bug scenario from the screenshot
+		const result = calcProgressPercentage({
+			phase: "embedding",
+			blocksEmbedded: 111_397,
+			totalBlocks: 108_906,
+			processedItems: 111_397,
+			totalItems: 108_906,
+		})
+		expect(result).toBe(100)
+	})
+
+	test("clamps legacy progress to 100% when processedItems exceeds totalItems", () => {
+		const result = calcProgressPercentage({
+			processedItems: 1050,
+			totalItems: 1000,
+		})
+		expect(result).toBe(100)
+	})
+
+	test("returns correct percentage when within bounds", () => {
+		const result = calcProgressPercentage({
+			phase: "embedding",
+			blocksEmbedded: 500,
+			totalBlocks: 1000,
+			processedItems: 500,
+			totalItems: 1000,
+		})
+		expect(result).toBe(50)
+	})
+
+	test("returns 0 when totalItems is 0", () => {
+		const result = calcProgressPercentage({
+			processedItems: 0,
+			totalItems: 0,
+		})
+		expect(result).toBe(0)
+	})
+})
+
 describe("CodeIndexPopover - ETA display rendering logic", () => {
 	test("shows ETA when estimatedTimeRemainingMs is provided", () => {
 		const estimatedTimeRemainingMs: number | null = 180_000

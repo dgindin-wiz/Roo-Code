@@ -2713,41 +2713,45 @@ export const webviewMessageHandler = async (
 			break
 		}
 		case "startIndexing": {
+			const startManager = provider.getCurrentWorkspaceCodeIndexManager()
+			if (!startManager) {
+				provider.postMessageToWebview({
+					type: "indexingStatusUpdate",
+					values: {
+						systemStatus: "Error",
+						message: t("embeddings:orchestrator.indexingRequiresWorkspace"),
+						processedItems: 0,
+						totalItems: 0,
+						currentItemUnit: "items",
+					},
+				})
+				provider.log("Cannot start indexing: No workspace folder open")
+				break
+			}
 			try {
-				const manager = provider.getCurrentWorkspaceCodeIndexManager()
-				if (!manager) {
-					provider.postMessageToWebview({
-						type: "indexingStatusUpdate",
-						values: {
-							systemStatus: "Error",
-							message: t("embeddings:orchestrator.indexingRequiresWorkspace"),
-							processedItems: 0,
-							totalItems: 0,
-							currentItemUnit: "items",
-						},
-					})
-					provider.log("Cannot start indexing: No workspace folder open")
-					return
-				}
-
 				// "Start Indexing" implicitly enables the workspace
-				await manager.setWorkspaceEnabled(true)
+				await startManager.setWorkspaceEnabled(true)
 
-				if (manager.isFeatureEnabled && manager.isFeatureConfigured) {
+				if (startManager.isFeatureEnabled && startManager.isFeatureConfigured) {
 					// initialize() handles service creation and will call startIndexing()
 					// internally when shouldStartOrRestartIndexing is true.
 					// We only need a single initialize() call, then check if we need
 					// an explicit startIndexing() for cases where initialize() didn't trigger it.
-					await manager.initialize(provider.contextProxy)
+					await startManager.initialize(provider.contextProxy)
 
-					const currentState = manager.state
+					const currentState = startManager.state
 					if (currentState === "Standby" || currentState === "Error") {
-						manager.startIndexing()
+						startManager.startIndexing()
 					}
 				}
 			} catch (error) {
 				provider.log(`Error starting indexing: ${error instanceof Error ? error.message : String(error)}`)
 			}
+			// Always send the current status back so the webview reflects reality.
+			provider.postMessageToWebview({
+				type: "indexingStatusUpdate",
+				values: startManager.getCurrentStatus(),
+			})
 			break
 		}
 		case "stopIndexing": {
@@ -2768,29 +2772,31 @@ export const webviewMessageHandler = async (
 			break
 		}
 		case "toggleWorkspaceIndexing": {
+			const toggleManager = provider.getCurrentWorkspaceCodeIndexManager()
+			if (!toggleManager) {
+				provider.log("Cannot toggle workspace indexing: No workspace folder open")
+				break
+			}
 			try {
-				const manager = provider.getCurrentWorkspaceCodeIndexManager()
-				if (!manager) {
-					provider.log("Cannot toggle workspace indexing: No workspace folder open")
-					return
-				}
 				const enabled = message.bool ?? false
-				await manager.setWorkspaceEnabled(enabled)
-				if (enabled && manager.isFeatureEnabled && manager.isFeatureConfigured) {
-					await manager.initialize(provider.contextProxy)
-					manager.startIndexing()
+				await toggleManager.setWorkspaceEnabled(enabled)
+				if (enabled && toggleManager.isFeatureEnabled && toggleManager.isFeatureConfigured) {
+					await toggleManager.initialize(provider.contextProxy)
+					toggleManager.startIndexing()
 				} else if (!enabled) {
-					manager.stopIndexing()
+					toggleManager.stopIndexing()
 				}
-				provider.postMessageToWebview({
-					type: "indexingStatusUpdate",
-					values: manager.getCurrentStatus(),
-				})
 			} catch (error) {
 				provider.log(
 					`Error toggling workspace indexing: ${error instanceof Error ? error.message : String(error)}`,
 				)
 			}
+			// Always send the current status back to the webview, even if initialize() threw,
+			// so the checkbox reflects the persisted workspaceEnabled state.
+			provider.postMessageToWebview({
+				type: "indexingStatusUpdate",
+				values: toggleManager.getCurrentStatus(),
+			})
 			break
 		}
 		case "setAutoEnableDefault": {

@@ -805,4 +805,173 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "Code indexing is disabled")
 		})
 	})
+
+	describe("clearIndexData — stops active scan before clearing", () => {
+		it("should call stopIndexing before clearing index data", async () => {
+			const callOrder: string[] = []
+
+			const mockOrchestrator = {
+				stopIndexing: vi.fn(() => callOrder.push("stopIndexing")),
+				stopWatcher: vi.fn(),
+				clearIndexData: vi.fn(async () => callOrder.push("clearIndexData")),
+				state: "Indexing",
+			}
+			const mockCacheManager = {
+				clearCacheFile: vi.fn(async () => callOrder.push("clearCacheFile")),
+			}
+
+			const mockConfigManager = {
+				isFeatureEnabled: true,
+				isFeatureConfigured: true,
+			}
+			;(manager as any)._configManager = mockConfigManager
+			;(manager as any)._orchestrator = mockOrchestrator
+			;(manager as any)._searchService = {}
+			;(manager as any)._cacheManager = mockCacheManager
+
+			vi.spyOn(manager, "isFeatureEnabled", "get").mockReturnValue(true)
+
+			await manager.clearIndexData()
+
+			// stopIndexing must be called BEFORE clearIndexData
+			expect(callOrder).toEqual(["stopIndexing", "clearIndexData", "clearCacheFile"])
+		})
+
+		it("should still clear data when not currently indexing", async () => {
+			const mockOrchestrator = {
+				stopIndexing: vi.fn(),
+				stopWatcher: vi.fn(),
+				clearIndexData: vi.fn(),
+				state: "Indexed",
+			}
+			const mockCacheManager = {
+				clearCacheFile: vi.fn(),
+			}
+
+			const mockConfigManager = {
+				isFeatureEnabled: true,
+				isFeatureConfigured: true,
+			}
+			;(manager as any)._configManager = mockConfigManager
+			;(manager as any)._orchestrator = mockOrchestrator
+			;(manager as any)._searchService = {}
+			;(manager as any)._cacheManager = mockCacheManager
+
+			vi.spyOn(manager, "isFeatureEnabled", "get").mockReturnValue(true)
+
+			await manager.clearIndexData()
+
+			expect(mockOrchestrator.stopIndexing).toHaveBeenCalled()
+			expect(mockOrchestrator.clearIndexData).toHaveBeenCalled()
+			expect(mockCacheManager.clearCacheFile).toHaveBeenCalled()
+		})
+	})
+
+	describe("startIndexing — auto-recovery from Error state", () => {
+		it("should re-initialize and start indexing after recovering from Error", async () => {
+			const mockStateManager = (manager as any)._stateManager
+			mockStateManager.setSystemState = vi.fn()
+			mockStateManager.getCurrentStatus = vi.fn().mockReturnValue({
+				systemStatus: "Error",
+				message: "Failed during initial scan",
+				processedItems: 0,
+				totalItems: 0,
+				currentItemUnit: "items",
+			})
+
+			const mockConfigManager = {
+				loadConfiguration: vi.fn().mockResolvedValue({ requiresRestart: false }),
+				isFeatureEnabled: true,
+				isFeatureConfigured: true,
+				getConfig: vi.fn().mockReturnValue({
+					isConfigured: true,
+					embedderProvider: "openai",
+					modelId: "text-embedding-3-small",
+					openAiOptions: { openAiNativeApiKey: "test-key" },
+					qdrantUrl: "http://localhost:6333",
+					qdrantApiKey: "test-key",
+					searchMinScore: 0.4,
+				}),
+			}
+			;(manager as any)._configManager = mockConfigManager
+			;(manager as any)._orchestrator = { stopWatcher: vi.fn(), stopIndexing: vi.fn(), state: "Error" }
+			;(manager as any)._searchService = {}
+			;(manager as any)._serviceFactory = {}
+			;(manager as any)._cacheManager = { initialize: vi.fn(), clearCacheFile: vi.fn() }
+
+			// Store a contextProxy so startIndexing can re-initialize
+			const mockContextProxy = {
+				getValue: vi.fn(),
+				setValue: vi.fn(),
+				storeSecret: vi.fn(),
+				getSecret: vi.fn(),
+				refreshSecrets: vi.fn().mockResolvedValue(undefined),
+				getGlobalState: vi.fn().mockReturnValue({
+					codebaseIndexEnabled: true,
+					codebaseIndexQdrantUrl: "http://localhost:6333",
+					codebaseIndexEmbedderProvider: "openai",
+				}),
+			}
+			;(manager as any)._contextProxy = mockContextProxy
+
+			vi.spyOn(manager, "isFeatureEnabled", "get").mockReturnValue(true)
+			vi.spyOn(manager, "isWorkspaceEnabled", "get").mockReturnValue(true)
+
+			// Mock initialize to set up services after recovery
+			const initializeSpy = vi.spyOn(manager, "initialize").mockResolvedValue({ requiresRestart: false })
+			const recoverSpy = vi.spyOn(manager, "recoverFromError")
+
+			// After initialize, orchestrator should be set back up
+			initializeSpy.mockImplementation(async () => {
+				;(manager as any)._orchestrator = {
+					startIndexing: vi.fn(),
+					stopIndexing: vi.fn(),
+					stopWatcher: vi.fn(),
+					state: "Standby",
+				}
+				;(manager as any)._searchService = {}
+				;(manager as any)._cacheManager = { initialize: vi.fn(), clearCacheFile: vi.fn() }
+				return { requiresRestart: false }
+			})
+
+			await manager.startIndexing()
+
+			// Should have called recoverFromError then initialize
+			expect(recoverSpy).toHaveBeenCalled()
+			expect(initializeSpy).toHaveBeenCalledWith(mockContextProxy)
+		})
+
+		it("should not re-initialize when not in Error state", async () => {
+			const mockStateManager = (manager as any)._stateManager
+			mockStateManager.getCurrentStatus = vi.fn().mockReturnValue({
+				systemStatus: "Indexed",
+				message: "",
+			})
+
+			const mockOrchestrator = {
+				startIndexing: vi.fn(),
+				stopIndexing: vi.fn(),
+				stopWatcher: vi.fn(),
+				state: "Indexed",
+			}
+			const mockConfigManager = {
+				isFeatureEnabled: true,
+				isFeatureConfigured: true,
+			}
+			;(manager as any)._configManager = mockConfigManager
+			;(manager as any)._orchestrator = mockOrchestrator
+			;(manager as any)._searchService = {}
+			;(manager as any)._cacheManager = {}
+
+			vi.spyOn(manager, "isFeatureEnabled", "get").mockReturnValue(true)
+			vi.spyOn(manager, "isWorkspaceEnabled", "get").mockReturnValue(true)
+
+			const recoverSpy = vi.spyOn(manager, "recoverFromError")
+
+			await manager.startIndexing()
+
+			expect(recoverSpy).not.toHaveBeenCalled()
+			expect(mockOrchestrator.startIndexing).toHaveBeenCalled()
+		})
+	})
 })

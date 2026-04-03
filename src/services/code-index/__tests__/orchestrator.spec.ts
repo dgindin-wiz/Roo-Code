@@ -674,6 +674,56 @@ describe("CodeIndexOrchestrator - transient error handling", () => {
 	})
 })
 
+describe("CodeIndexOrchestrator - abort guard before clearCacheFile", () => {
+	const workspacePath = "/test/workspace"
+
+	it("should NOT clear cache when abort signal fires during vectorStore.initialize()", async () => {
+		const stateManager = createMockStateManager()
+		const cacheManager = createMockCacheManager()
+		cacheManager.getAllHashes.mockReturnValue({ "a.ts": "hash1", "b.ts": "hash2" })
+
+		const vectorStore = {
+			initialize: vi.fn(), // will be overridden below after orchestrator is created
+			hasIndexedData: vi.fn().mockResolvedValue(false),
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			clearCollection: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(0),
+		}
+		const { scanner } = createMockScanner()
+		const fileWatcher = createMockFileWatcher()
+
+		const orchestrator = new CodeIndexOrchestrator(
+			{ isFeatureConfigured: true, isFeatureEnabled: true } as any,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore as any,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		// Hook vectorStore.initialize to abort the orchestrator's AbortController
+		// mid-call, simulating user clicking "Stop" while initialize() runs.
+		// collectionCreated=true would normally trigger clearCacheFile.
+		vectorStore.initialize.mockImplementation(async () => {
+			const controller = (orchestrator as any)._abortController as AbortController
+			controller.abort()
+			return true // collectionCreated = true
+		})
+
+		await orchestrator.startIndexing()
+
+		// The abort guard should prevent clearCacheFile from being called
+		expect(cacheManager.clearCacheFile).not.toHaveBeenCalled()
+		// Cache should be flushed (preserved), not cleared
+		expect(cacheManager.flush).toHaveBeenCalled()
+		// Should end in Standby, not Error
+		const lastCall = stateManager.setSystemState.mock.calls[stateManager.setSystemState.mock.calls.length - 1]
+		expect(lastCall[0]).toBe("Standby")
+	})
+})
+
 describe("CodeIndexOrchestrator - progress forwarding", () => {
 	const workspacePath = "/test/workspace"
 
@@ -824,5 +874,615 @@ describe("CodeIndexOrchestrator - progress forwarding", () => {
 			100,
 			true,
 		)
+	})
+})
+
+// ═══════════════════════════════════════════════════════════════════════
+// Category 2: Multi-session lifecycle tests
+// ═══════════════════════════════════════════════════════════════════════
+describe("CodeIndexOrchestrator - multi-session persistence", () => {
+	const workspacePath = "/test/workspace"
+
+	it("should preserve cache across restart when collection exists with data (normal resume)", async () => {
+		// Session 1 state: cache has 100 files, Qdrant has data
+		const stateManager = createMockStateManager()
+		const cacheManager = createMockCacheManager()
+		const sessionOneHashes: Record<string, string> = {}
+		for (let i = 0; i < 100; i++) {
+			sessionOneHashes[`file${i}.ts`] = `hash${i}`
+		}
+		cacheManager.getAllHashes.mockReturnValue(sessionOneHashes)
+
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(false), // collection exists — NOT newly created
+			hasIndexedData: vi.fn().mockResolvedValue(true), // has data from session 1
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			clearCollection: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(5000),
+		}
+		const { scanner } = createMockScanner({
+			totalFiles: 100,
+			processedFiles: 0,
+			skippedFiles: 100,
+			totalBlocks: 0,
+			blocksEmbedded: 0,
+			errors: [],
+		})
+		const fileWatcher = createMockFileWatcher()
+
+		const orchestrator = new CodeIndexOrchestrator(
+			{ isFeatureConfigured: true, isFeatureEnabled: true } as any,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore as any,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		await orchestrator.startIndexing()
+
+		// Cache should NOT be cleared — this is a normal resume
+		expect(cacheManager.clearCacheFile).not.toHaveBeenCalled()
+		// Scanner should have been called with incremental=true (inferred via isIncremental)
+		expect(scanner.scanDirectory).toHaveBeenCalled()
+	})
+
+	it("should clear cache only when collection is genuinely new", async () => {
+		const stateManager = createMockStateManager()
+		const cacheManager = createMockCacheManager()
+		cacheManager.getAllHashes.mockReturnValue({ stale: "data" })
+
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(true), // NEW collection created
+			hasIndexedData: vi.fn().mockResolvedValue(false),
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			clearCollection: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(0),
+		}
+		const { scanner } = createMockScanner()
+		const fileWatcher = createMockFileWatcher()
+
+		const orchestrator = new CodeIndexOrchestrator(
+			{ isFeatureConfigured: true, isFeatureEnabled: true } as any,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore as any,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		await orchestrator.startIndexing()
+
+		// Cache SHOULD be cleared because collection was genuinely new
+		expect(cacheManager.clearCacheFile).toHaveBeenCalled()
+	})
+
+	it("should start incremental scan when collection has data (simulating session 2 after session 1)", async () => {
+		const stateManager = createMockStateManager()
+		const cacheManager = createMockCacheManager()
+		cacheManager.getAllHashes.mockReturnValue({ "a.ts": "hashA", "b.ts": "hashB" })
+
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(false), // existing collection
+			hasIndexedData: vi.fn().mockResolvedValue(true), // has data
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			clearCollection: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(1000),
+		}
+		const { scanner } = createMockScanner({
+			totalFiles: 50,
+			processedFiles: 0,
+			skippedFiles: 50,
+			totalBlocks: 0,
+			blocksEmbedded: 0,
+			errors: [],
+		})
+		const fileWatcher = createMockFileWatcher()
+
+		const orchestrator = new CodeIndexOrchestrator(
+			{ isFeatureConfigured: true, isFeatureEnabled: true } as any,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore as any,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		await orchestrator.startIndexing()
+
+		// Should have set the resume message with cached file count
+		const indexingCalls = stateManager.setSystemState.mock.calls.filter(
+			(call: any[]) => call[0] === "Indexing" && typeof call[1] === "string" && call[1].includes("Resuming"),
+		)
+		expect(indexingCalls.length).toBeGreaterThan(0)
+		// Cache should NOT be cleared
+		expect(cacheManager.clearCacheFile).not.toHaveBeenCalled()
+	})
+})
+
+// ═══════════════════════════════════════════════════════════════════════
+// Category 3: Abort timing matrix tests
+// ═══════════════════════════════════════════════════════════════════════
+describe("CodeIndexOrchestrator - abort at every async boundary", () => {
+	const workspacePath = "/test/workspace"
+
+	it("should bail out safely when abort fires during hasIndexedData()", async () => {
+		const stateManager = createMockStateManager()
+		const cacheManager = createMockCacheManager()
+		cacheManager.getAllHashes.mockReturnValue({ "file.ts": "hash1" })
+
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(false), // existing collection
+			hasIndexedData: vi.fn(), // will abort during this call
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			clearCollection: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(0),
+		}
+		const { scanner } = createMockScanner()
+		const fileWatcher = createMockFileWatcher()
+
+		const orchestrator = new CodeIndexOrchestrator(
+			{ isFeatureConfigured: true, isFeatureEnabled: true } as any,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore as any,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		// Abort during hasIndexedData — this fires AFTER initialize() but BEFORE scan
+		vectorStore.hasIndexedData.mockImplementation(async () => {
+			const controller = (orchestrator as any)._abortController as AbortController
+			controller.abort()
+			return true // has data, but abort should prevent further processing
+		})
+
+		await orchestrator.startIndexing()
+
+		// Cache should NOT be cleared — abort happened before cache-clearing decisions
+		expect(cacheManager.clearCacheFile).not.toHaveBeenCalled()
+		// Cache should be flushed to preserve existing data
+		expect(cacheManager.flush).toHaveBeenCalled()
+		// Should end in Standby, not Error
+		const lastCall = stateManager.setSystemState.mock.calls[stateManager.setSystemState.mock.calls.length - 1]
+		expect(lastCall[0]).toBe("Standby")
+	})
+
+	it("should bail out safely when abort fires during markIndexingIncomplete()", async () => {
+		const stateManager = createMockStateManager()
+		const cacheManager = createMockCacheManager()
+
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(false),
+			hasIndexedData: vi.fn().mockResolvedValue(true),
+			markIndexingIncomplete: vi.fn(), // will abort here
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			clearCollection: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(500),
+		}
+		const { scanner } = createMockScanner()
+		const fileWatcher = createMockFileWatcher()
+
+		const orchestrator = new CodeIndexOrchestrator(
+			{ isFeatureConfigured: true, isFeatureEnabled: true } as any,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore as any,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		// Abort during markIndexingIncomplete (inside _runScan, before scanner starts)
+		vectorStore.markIndexingIncomplete.mockImplementation(async () => {
+			const controller = (orchestrator as any)._abortController as AbortController
+			controller.abort()
+			// Still resolves — abort signal is checked after this returns
+		})
+
+		// Scanner should detect abort signal and return immediately
+		scanner.scanDirectory.mockImplementation(async (_dir: string, signal: AbortSignal) => {
+			if (signal.aborted) {
+				return {
+					totalFiles: 0,
+					processedFiles: 0,
+					skippedFiles: 0,
+					totalBlocks: 0,
+					blocksEmbedded: 0,
+					errors: [],
+				} satisfies ScanResult
+			}
+			return {
+				totalFiles: 10,
+				processedFiles: 0,
+				skippedFiles: 10,
+				totalBlocks: 0,
+				blocksEmbedded: 0,
+				errors: [],
+			} satisfies ScanResult
+		})
+
+		await orchestrator.startIndexing()
+
+		// Cache should NOT be cleared
+		expect(cacheManager.clearCacheFile).not.toHaveBeenCalled()
+		// Cache should be flushed
+		expect(cacheManager.flush).toHaveBeenCalled()
+		// No Error state
+		const errorCalls = stateManager.setSystemState.mock.calls.filter((call: any[]) => call[0] === "Error")
+		expect(errorCalls).toHaveLength(0)
+	})
+
+	it("should preserve cache when abort fires between initialize() returning collectionCreated=true and clearCacheFile()", async () => {
+		// This is the EXACT bug scenario: initialize returns collectionCreated=true,
+		// but user aborted during that call. Without the guard, cache would be cleared.
+		const stateManager = createMockStateManager()
+		const cacheManager = createMockCacheManager()
+		// Pre-populate cache with significant data
+		const existingHashes: Record<string, string> = {}
+		for (let i = 0; i < 50; i++) {
+			existingHashes[`important-file-${i}.ts`] = `hash-${i}`
+		}
+		cacheManager.getAllHashes.mockReturnValue(existingHashes)
+
+		const vectorStore = {
+			initialize: vi.fn().mockImplementation(async function (this: any) {
+				// Abort while initialize is running
+				const controller = ((this as any)._orchestratorRef as any)?._abortController
+				return true // collectionCreated=true
+			}),
+			hasIndexedData: vi.fn().mockResolvedValue(false),
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			clearCollection: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(0),
+		}
+		const { scanner } = createMockScanner()
+		const fileWatcher = createMockFileWatcher()
+
+		const orchestrator = new CodeIndexOrchestrator(
+			{ isFeatureConfigured: true, isFeatureEnabled: true } as any,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore as any,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		// Properly abort during initialize
+		vectorStore.initialize.mockImplementation(async () => {
+			const controller = (orchestrator as any)._abortController as AbortController
+			controller.abort()
+			return true // collectionCreated=true — would normally trigger clearCacheFile
+		})
+
+		await orchestrator.startIndexing()
+
+		// The key assertion: cache is NOT cleared despite collectionCreated=true
+		expect(cacheManager.clearCacheFile).not.toHaveBeenCalled()
+		expect(cacheManager.flush).toHaveBeenCalled()
+	})
+})
+
+// ═══════════════════════════════════════════════════════════════════════
+// Category 4: Idempotency tests
+// ═══════════════════════════════════════════════════════════════════════
+describe("CodeIndexOrchestrator - idempotency guarantees", () => {
+	const workspacePath = "/test/workspace"
+
+	it("should reject concurrent startIndexing() calls (already processing guard)", async () => {
+		const stateManager = createMockStateManager()
+		const cacheManager = createMockCacheManager()
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(false),
+			hasIndexedData: vi.fn().mockResolvedValue(true),
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			clearCollection: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(0),
+		}
+		const fileWatcher = createMockFileWatcher()
+
+		// Scanner that hangs until aborted
+		const { scanner } = createMockScanner()
+		scanner.scanDirectory.mockImplementation(async (_dir: string, signal: AbortSignal) => {
+			await new Promise<void>((resolve) => {
+				if (signal?.aborted) {
+					resolve()
+					return
+				}
+				signal?.addEventListener("abort", () => resolve())
+			})
+			return {
+				totalFiles: 0,
+				processedFiles: 0,
+				skippedFiles: 0,
+				totalBlocks: 0,
+				blocksEmbedded: 0,
+				errors: [],
+			} satisfies ScanResult
+		})
+
+		const orchestrator = new CodeIndexOrchestrator(
+			{ isFeatureConfigured: true, isFeatureEnabled: true } as any,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore as any,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		// Start first indexing (don't await — it hangs)
+		const firstIndexing = orchestrator.startIndexing()
+
+		// Give it a tick to begin
+		await new Promise((resolve) => setTimeout(resolve, 10))
+
+		// Second call should be rejected because first is still processing
+		await orchestrator.startIndexing()
+
+		// initialize should only have been called once
+		expect(vectorStore.initialize).toHaveBeenCalledTimes(1)
+
+		// Clean up
+		orchestrator.stopIndexing()
+		await firstIndexing
+	})
+
+	it("should not re-embed files that are already cached (incremental scan skips everything)", async () => {
+		const stateManager = createMockStateManager()
+		const cacheManager = createMockCacheManager()
+		cacheManager.getAllHashes.mockReturnValue({
+			"a.ts": "hashA",
+			"b.ts": "hashB",
+			"c.ts": "hashC",
+		})
+		cacheManager.getTotalCachedBlockCount.mockReturnValue(30)
+
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(false),
+			hasIndexedData: vi.fn().mockResolvedValue(true),
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			clearCollection: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(30),
+		}
+		const fileWatcher = createMockFileWatcher()
+
+		// Scanner reports all files skipped (nothing to embed)
+		const { scanner } = createMockScanner({
+			totalFiles: 3,
+			processedFiles: 0,
+			skippedFiles: 3,
+			totalBlocks: 0,
+			blocksEmbedded: 0,
+			errors: [],
+		})
+
+		const orchestrator = new CodeIndexOrchestrator(
+			{ isFeatureConfigured: true, isFeatureEnabled: true } as any,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore as any,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		await orchestrator.startIndexing()
+
+		// All files skipped — no cache clearing, completion reported
+		expect(cacheManager.clearCacheFile).not.toHaveBeenCalled()
+		expect(stateManager.reportComplete).toHaveBeenCalled()
+		// Verify the reported total blocks matches cache
+		expect(stateManager.reportComplete).toHaveBeenCalledWith(30, 3)
+	})
+})
+
+// ─── Category F: Watcher batch error propagation (Fix 4) ─────────────────
+
+describe("CodeIndexOrchestrator - watcher batch error propagation (Fix 4)", () => {
+	it("should transition to Error state when watcher reports a permanent batch error", async () => {
+		const configManager = { isFeatureEnabled: true, isFeatureConfigured: true } as any
+		const stateManager = createMockStateManager()
+		const workspacePath = require("path").join(require("path").sep, "test", "workspace")
+		const cacheManager = createMockCacheManager()
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(false),
+			hasIndexedData: vi.fn().mockResolvedValue(true),
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(100),
+		} as any
+
+		const { scanner } = createMockScanner({
+			totalFiles: 1,
+			processedFiles: 0,
+			skippedFiles: 1,
+			totalBlocks: 0,
+			blocksEmbedded: 0,
+			errors: [],
+		})
+
+		// Capture the onDidFinishBatchProcessing listener
+		let batchFinishListener: ((summary: any) => void) | null = null
+		const fileWatcher = {
+			initialize: vi.fn().mockResolvedValue(undefined),
+			onDidStartBatchProcessing: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+			onBatchProgressUpdate: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+			onDidFinishBatchProcessing: vi.fn().mockImplementation((listener: any) => {
+				batchFinishListener = listener
+				return { dispose: vi.fn() }
+			}),
+			dispose: vi.fn(),
+		}
+
+		const orchestrator = new CodeIndexOrchestrator(
+			configManager,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		await orchestrator.startIndexing()
+
+		// Verify indexing completed and watcher started
+		expect(stateManager.state).toBe("Indexed")
+		expect(batchFinishListener).not.toBeNull()
+
+		// Simulate permanent batch error from watcher
+		batchFinishListener!({
+			processedFiles: [],
+			batchError: new Error("Qdrant permanently unavailable"),
+		})
+
+		// Should transition to Error state
+		expect(stateManager.setSystemState).toHaveBeenCalledWith(
+			"Error",
+			expect.stringContaining("Qdrant permanently unavailable"),
+		)
+		// Watcher should be stopped
+		expect(fileWatcher.dispose).toHaveBeenCalled()
+	})
+
+	it("should keep watcher running when batch error is transient", async () => {
+		const { QdrantTransientError } = await import("../vector-store/qdrant-client")
+		const configManager = { isFeatureEnabled: true, isFeatureConfigured: true } as any
+		const stateManager = createMockStateManager()
+		const workspacePath = require("path").join(require("path").sep, "test", "workspace")
+		const cacheManager = createMockCacheManager()
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(false),
+			hasIndexedData: vi.fn().mockResolvedValue(true),
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(100),
+		} as any
+
+		const { scanner } = createMockScanner({
+			totalFiles: 1,
+			processedFiles: 0,
+			skippedFiles: 1,
+			totalBlocks: 0,
+			blocksEmbedded: 0,
+			errors: [],
+		})
+
+		let batchFinishListener: ((summary: any) => void) | null = null
+		const fileWatcher = {
+			initialize: vi.fn().mockResolvedValue(undefined),
+			onDidStartBatchProcessing: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+			onBatchProgressUpdate: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+			onDidFinishBatchProcessing: vi.fn().mockImplementation((listener: any) => {
+				batchFinishListener = listener
+				return { dispose: vi.fn() }
+			}),
+			dispose: vi.fn(),
+		}
+
+		const orchestrator = new CodeIndexOrchestrator(
+			configManager,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		await orchestrator.startIndexing()
+
+		expect(stateManager.state).toBe("Indexed")
+
+		// Track setSystemState calls before the transient error
+		const callCountBefore = stateManager.setSystemState.mock.calls.length
+
+		// Simulate transient batch error
+		batchFinishListener!({
+			processedFiles: [],
+			batchError: new QdrantTransientError("temporary connection issue"),
+		})
+
+		// Should NOT transition to Error state
+		expect(stateManager.state).not.toBe("Error")
+		// setSystemState should not have been called with "Error"
+		const errorCalls = stateManager.setSystemState.mock.calls
+			.slice(callCountBefore)
+			.filter((call: any[]) => call[0] === "Error")
+		expect(errorCalls.length).toBe(0)
+	})
+
+	it("should stop watcher after permanent batch error", async () => {
+		const configManager = { isFeatureEnabled: true, isFeatureConfigured: true } as any
+		const stateManager = createMockStateManager()
+		const workspacePath = require("path").join(require("path").sep, "test", "workspace")
+		const cacheManager = createMockCacheManager()
+		const vectorStore = {
+			initialize: vi.fn().mockResolvedValue(false),
+			hasIndexedData: vi.fn().mockResolvedValue(true),
+			markIndexingIncomplete: vi.fn().mockResolvedValue(undefined),
+			markIndexingComplete: vi.fn().mockResolvedValue(undefined),
+			getPointCount: vi.fn().mockResolvedValue(100),
+		} as any
+
+		const { scanner } = createMockScanner({
+			totalFiles: 1,
+			processedFiles: 0,
+			skippedFiles: 1,
+			totalBlocks: 0,
+			blocksEmbedded: 0,
+			errors: [],
+		})
+
+		let batchFinishListener: ((summary: any) => void) | null = null
+		const fileWatcher = {
+			initialize: vi.fn().mockResolvedValue(undefined),
+			onDidStartBatchProcessing: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+			onBatchProgressUpdate: vi.fn().mockReturnValue({ dispose: vi.fn() }),
+			onDidFinishBatchProcessing: vi.fn().mockImplementation((listener: any) => {
+				batchFinishListener = listener
+				return { dispose: vi.fn() }
+			}),
+			dispose: vi.fn(),
+		}
+
+		const orchestrator = new CodeIndexOrchestrator(
+			configManager,
+			stateManager as any,
+			workspacePath,
+			cacheManager as any,
+			vectorStore,
+			scanner as any,
+			fileWatcher as any,
+		)
+
+		await orchestrator.startIndexing()
+
+		// Verify indexing completed
+		expect(stateManager.state).toBe("Indexed")
+
+		// Clear prior dispose calls from the scan cycle
+		fileWatcher.dispose.mockClear()
+
+		batchFinishListener!({
+			processedFiles: [],
+			batchError: new Error("database write error"),
+		})
+
+		// stopWatcher calls fileWatcher.dispose
+		expect(fileWatcher.dispose).toHaveBeenCalled()
 	})
 })

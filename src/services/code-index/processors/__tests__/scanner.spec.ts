@@ -126,6 +126,7 @@ describe("DirectoryScanner", () => {
 			getMtime: vi.fn().mockReturnValue(undefined),
 			getBlockCount: vi.fn().mockReturnValue(undefined),
 			getAllHashes: vi.fn().mockReturnValue({}),
+			cachedFilePaths: vi.fn().mockReturnValue([]),
 			updateHash: vi.fn().mockResolvedValue(undefined),
 			updateBlockCount: vi.fn(),
 			deleteHash: vi.fn().mockResolvedValue(undefined),
@@ -262,6 +263,7 @@ describe("DirectoryScanner", () => {
 
 		it("should delete points for removed files", async () => {
 			;(mockCacheManager.getAllHashes as any).mockReturnValue({ "old/file.js": "old-hash" })
+			;(mockCacheManager.cachedFilePaths as any).mockReturnValue(["old/file.js"])
 
 			await scanner.scanDirectory("/test", signal)
 			expect(mockVectorStore.deletePointsByFilePath).toHaveBeenCalledWith("old/file.js")
@@ -489,6 +491,7 @@ describe("DirectoryScanner", () => {
 
 			// Set up cached files that would normally be detected as deleted
 			;(mockCacheManager.getAllHashes as any).mockReturnValue({ "old/file.js": "old-hash" })
+			;(mockCacheManager.cachedFilePaths as any).mockReturnValue(["old/file.js"])
 
 			// Create an already-aborted signal
 			const controller = new AbortController()
@@ -745,6 +748,335 @@ describe("DirectoryScanner", () => {
 			expect(result.totalBlocks).toBe(0)
 			expect(mockCodeParser.parseFile).not.toHaveBeenCalled()
 			expect(mockEmbedder.createEmbeddings).not.toHaveBeenCalled()
+		})
+	})
+
+	// ─── Fix 1: Chunked Parse Iteration ──────────────────────────────────────
+
+	describe("chunked parse iteration (Fix 1)", () => {
+		it("should process all candidates when count exceeds PARSE_CHUNK_SIZE", async () => {
+			// Generate 250 files — exceeds PARSE_CHUNK_SIZE (100), forcing multiple chunks
+			const fileNames = Array.from({ length: 250 }, (_, i) => `test/file${i}.js`)
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([fileNames, false])
+
+			// Each file produces 1 block
+			;(mockCodeParser.parseFile as any).mockImplementation((filePath: string) => [
+				{
+					file_path: filePath,
+					content: "function test() {}",
+					start_line: 1,
+					end_line: 3,
+					identifier: "test",
+					type: "function",
+					fileHash: "hash",
+					segmentHash: `seg-${filePath}`,
+				},
+			])
+
+			const result = await scanner.scanDirectory("/test", signal)
+
+			// All 250 files should have been processed — chunking doesn't skip any
+			expect(result.processedFiles).toBe(250)
+			expect(mockCodeParser.parseFile).toHaveBeenCalledTimes(250)
+		})
+
+		it("should stop processing chunks when signal is aborted between chunks", async () => {
+			// Generate 500 files — at least 5 chunks of 100
+			const fileNames = Array.from({ length: 500 }, (_, i) => `test/file${i}.js`)
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([fileNames, false])
+
+			const controller = new AbortController()
+			let parseCallCount = 0
+
+			// Abort after ~50 files to stop mid-chunk
+			;(mockCodeParser.parseFile as any).mockImplementation(async (filePath: string) => {
+				parseCallCount++
+				if (parseCallCount >= 50) {
+					controller.abort()
+				}
+				return [
+					{
+						file_path: filePath,
+						content: "function test() {}",
+						start_line: 1,
+						end_line: 3,
+						identifier: "test",
+						type: "function",
+						fileHash: "hash",
+						segmentHash: `seg-${filePath}`,
+					},
+				]
+			})
+
+			const result = await scanner.scanDirectory("/test", controller.signal)
+
+			// Should have processed far fewer than 500 files
+			expect(parseCallCount).toBeLessThan(200)
+			expect(parseCallCount).toBeGreaterThanOrEqual(50)
+		})
+
+		it("should correctly accumulate hashSkipped across chunks", async () => {
+			// 200 files — 2 chunks. All have hash match → all skipped
+			const fileNames = Array.from({ length: 200 }, (_, i) => `test/file${i}.js`)
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([fileNames, false])
+
+			// No mtime match → all become candidates
+			mockCacheManager.getMtime.mockReturnValue(undefined)
+			// Hash matches for all → all skipped in parse phase
+			mockCacheManager.getHash.mockReturnValue("6ae8a75555209fd6c44157c0aed8016e763ff435a19cf186f76863140143ff72")
+
+			const result = await scanner.scanDirectory("/test", signal)
+
+			// All 200 should be counted as skipped (hash-matched across chunks)
+			expect(result.skippedFiles).toBe(200)
+			expect(result.processedFiles).toBe(0)
+			expect(mockEmbedder.createEmbeddings).not.toHaveBeenCalled()
+		})
+	})
+
+	// ─── Fix 2: Progress Event Throttling ────────────────────────────────────
+
+	describe("progress event throttling (Fix 2)", () => {
+		it("should throttle progress events during parse/embed phase", async () => {
+			// 50 files, each producing a block → many potential progress events
+			const fileNames = Array.from({ length: 50 }, (_, i) => `test/file${i}.js`)
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([fileNames, false])
+			;(mockCodeParser.parseFile as any).mockImplementation((filePath: string) => [
+				{
+					file_path: filePath,
+					content: "function test() {}",
+					start_line: 1,
+					end_line: 3,
+					identifier: "test",
+					type: "function",
+					fileHash: "hash",
+					segmentHash: `seg-${filePath}`,
+				},
+			])
+
+			const progress = collectProgress(scanner)
+			await scanner.scanDirectory("/test", signal)
+
+			// Without throttling, we'd get ~50 parse events + ~1 embed event + 2 discover + 1 complete = ~54
+			// With throttling at 250ms, should be significantly fewer
+			// (exact count depends on timing, but should be less than 50)
+			const parseOrEmbedEvents = progress.filter((p) => p.phase === "parsing" || p.phase === "embedding")
+			// The total progress events should be much less than the number of files
+			// We definitely should have fewer than 50 parse/embed events
+			expect(parseOrEmbedEvents.length).toBeLessThan(50)
+		})
+
+		it("should always emit phase transition events (not throttled)", async () => {
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([["test/file1.js"], false])
+			;(mockCodeParser.parseFile as any).mockResolvedValue([
+				{
+					file_path: "test/file1.js",
+					content: "function test() {}",
+					start_line: 1,
+					end_line: 3,
+					identifier: "test",
+					type: "function",
+					fileHash: "hash",
+					segmentHash: "seg-hash",
+				},
+			])
+
+			const progress = collectProgress(scanner)
+			await scanner.scanDirectory("/test", signal)
+
+			// Must have discovering, then parsing or embedding, then complete
+			const phases = progress.map((p) => p.phase)
+			expect(phases[0]).toBe("discovering")
+			expect(phases[phases.length - 1]).toBe("complete")
+		})
+
+		it("should force-emit the final progress update (exact total)", async () => {
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([["test/file1.js"], false])
+			;(mockCodeParser.parseFile as any).mockResolvedValue([
+				{
+					file_path: "test/file1.js",
+					content: "function test() {}",
+					start_line: 1,
+					end_line: 3,
+					identifier: "test",
+					type: "function",
+					fileHash: "hash",
+					segmentHash: "seg-hash",
+				},
+			])
+
+			const progress = collectProgress(scanner)
+			await scanner.scanDirectory("/test", signal)
+
+			// The 'complete' event should have isEstimatedTotal = false
+			const completeEvent = progress.find((p) => p.phase === "complete")
+			expect(completeEvent).toBeDefined()
+			expect(completeEvent!.isEstimatedTotal).toBe(false)
+
+			// The last non-complete event should also have isEstimatedTotal = false
+			// (force-emitted by reportProgress(true) after all parsing)
+			const nonCompleteEvents = progress.filter((p) => p.phase !== "complete" && p.phase !== "discovering")
+			if (nonCompleteEvents.length > 0) {
+				const lastNonComplete = nonCompleteEvents[nonCompleteEvents.length - 1]
+				expect(lastNonComplete.isEstimatedTotal).toBe(false)
+			}
+		})
+	})
+
+	// ─── Fix 4: Reduced MAX_EMBED_QUEUE_FILES ────────────────────────────────
+
+	describe("reduced embed queue (Fix 4)", () => {
+		it("should still complete indexing with reduced queue size", async () => {
+			// 100 files — tests that the reduced queue (50) doesn't block completion
+			const fileNames = Array.from({ length: 100 }, (_, i) => `test/file${i}.js`)
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([fileNames, false])
+			;(mockCodeParser.parseFile as any).mockImplementation((filePath: string) => [
+				{
+					file_path: filePath,
+					content: "function test() {}",
+					start_line: 1,
+					end_line: 3,
+					identifier: "test",
+					type: "function",
+					fileHash: "hash",
+					segmentHash: `seg-${filePath}`,
+				},
+			])
+
+			const result = await scanner.scanDirectory("/test", signal)
+
+			expect(result.processedFiles).toBe(100)
+			expect(result.blocksEmbedded).toBe(100)
+			expect(result.errors).toHaveLength(0)
+		})
+	})
+
+	describe("client recycling", () => {
+		it("should recycle embedder and qdrant clients every CLIENT_RECYCLE_INTERVAL batches", async () => {
+			// CLIENT_RECYCLE_INTERVAL is 25, with batchSegmentThreshold=1 each block = 1 batch.
+			const fileCount = 30
+			const fileNames = Array.from({ length: fileCount }, (_, i) => `test/file${i}.js`)
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([fileNames, false])
+			;(mockCodeParser.parseFile as any).mockImplementation((filePath: string) => [
+				{
+					file_path: filePath,
+					content: "function test() {}",
+					start_line: 1,
+					end_line: 3,
+					identifier: "test",
+					type: "function",
+					fileHash: "hash",
+					segmentHash: `seg-${filePath}`,
+				},
+			])
+
+			const embedderRecycleSpy = vi.fn()
+			const vectorStoreRecycleSpy = vi.fn()
+			mockEmbedder.recycleClient = embedderRecycleSpy
+			mockVectorStore.recycleClient = vectorStoreRecycleSpy
+
+			const recycleScanner = new DirectoryScanner(
+				mockEmbedder,
+				mockVectorStore,
+				mockCodeParser,
+				mockCacheManager,
+				mockIgnoreInstance,
+				1,
+			)
+
+			const result = await recycleScanner.scanDirectory("/test", signal)
+
+			expect(result.processedFiles).toBe(fileCount)
+			// Should have called recycleClient once (at batch 25)
+			expect(embedderRecycleSpy).toHaveBeenCalledTimes(1)
+			expect(vectorStoreRecycleSpy).toHaveBeenCalledTimes(1)
+		})
+
+		it("should NOT call recycleClient when the method is not present on embedder/vectorStore", async () => {
+			// Verify that the optional chaining (?.) doesn't throw when recycleClient is missing
+			const fileCount = 30
+			const fileNames = Array.from({ length: fileCount }, (_, i) => `test/file${i}.js`)
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([fileNames, false])
+			;(mockCodeParser.parseFile as any).mockImplementation((filePath: string) => [
+				{
+					file_path: filePath,
+					content: "function test() {}",
+					start_line: 1,
+					end_line: 3,
+					identifier: "test",
+					type: "function",
+					fileHash: "hash",
+					segmentHash: `seg-${filePath}`,
+				},
+			])
+
+			// Explicitly ensure recycleClient is NOT set on mocks (default state)
+			delete mockEmbedder.recycleClient
+			delete mockVectorStore.recycleClient
+
+			const recycleScanner = new DirectoryScanner(
+				mockEmbedder,
+				mockVectorStore,
+				mockCodeParser,
+				mockCacheManager,
+				mockIgnoreInstance,
+				1,
+			)
+
+			// Should not throw even without recycleClient methods
+			const result = await recycleScanner.scanDirectory("/test", signal)
+			expect(result.processedFiles).toBe(fileCount)
+			expect(result.errors).toHaveLength(0)
+		})
+
+		it("should recycle multiple times for large batch counts", async () => {
+			// 60 files with batchSegmentThreshold=1 → batches at 25 and 50
+			const fileCount = 60
+			const fileNames = Array.from({ length: fileCount }, (_, i) => `test/file${i}.js`)
+			const { listFiles } = await import("../../../glob/list-files")
+			vi.mocked(listFiles).mockResolvedValue([fileNames, false])
+			;(mockCodeParser.parseFile as any).mockImplementation((filePath: string) => [
+				{
+					file_path: filePath,
+					content: "function test() {}",
+					start_line: 1,
+					end_line: 3,
+					identifier: "test",
+					type: "function",
+					fileHash: "hash",
+					segmentHash: `seg-${filePath}`,
+				},
+			])
+
+			const embedderRecycleSpy = vi.fn()
+			const vectorStoreRecycleSpy = vi.fn()
+			mockEmbedder.recycleClient = embedderRecycleSpy
+			mockVectorStore.recycleClient = vectorStoreRecycleSpy
+
+			const recycleScanner = new DirectoryScanner(
+				mockEmbedder,
+				mockVectorStore,
+				mockCodeParser,
+				mockCacheManager,
+				mockIgnoreInstance,
+				1,
+			)
+
+			const result = await recycleScanner.scanDirectory("/test", signal)
+
+			expect(result.processedFiles).toBe(fileCount)
+			// Should have recycled at batch 25 and batch 50 → 2 times
+			expect(embedderRecycleSpy).toHaveBeenCalledTimes(2)
+			expect(vectorStoreRecycleSpy).toHaveBeenCalledTimes(2)
 		})
 	})
 })

@@ -2,6 +2,7 @@ import { OpenAI } from "openai"
 import { OpenAiNativeHandler } from "../../../api/providers/openai-native"
 import { ApiHandlerOptions } from "../../../shared/api"
 import { IEmbedder, EmbeddingResponse, EmbedderInfo } from "../interfaces"
+import { createIsolatedFetch, type IsolatedFetch } from "../utils/isolated-fetch"
 import {
 	MAX_BATCH_TOKENS,
 	MAX_ITEM_TOKENS,
@@ -20,6 +21,7 @@ import { handleOpenAIError } from "../../../api/providers/utils/openai-error-han
  */
 export class OpenAiEmbedder extends OpenAiNativeHandler implements IEmbedder {
 	private embeddingsClient: OpenAI
+	private _isolatedFetch!: IsolatedFetch
 	private readonly defaultModelId: string
 
 	/**
@@ -30,15 +32,34 @@ export class OpenAiEmbedder extends OpenAiNativeHandler implements IEmbedder {
 		super(options)
 		const apiKey = this.options.openAiNativeApiKey ?? "not-provided"
 
+		this._isolatedFetch = createIsolatedFetch()
+
 		// Wrap OpenAI client creation to handle invalid API key characters
 		try {
-			this.embeddingsClient = new OpenAI({ apiKey })
+			this.embeddingsClient = new OpenAI({ apiKey, fetch: this._isolatedFetch.fetch })
 		} catch (error) {
+			this._isolatedFetch.destroy()
 			// Use the error handler to transform ByteString conversion errors
 			throw handleOpenAIError(error, "OpenAI")
 		}
 
 		this.defaultModelId = options.openAiEmbeddingModelId || "text-embedding-3-small"
+	}
+
+	/**
+	 * Destroys the old undici Agent and recreates the OpenAI client with a
+	 * fresh connection pool. This immediately frees native TLS/socket buffers.
+	 */
+	async recycleClient(): Promise<void> {
+		try {
+			const apiKey = this.options.openAiNativeApiKey ?? "not-provided"
+			// Await socket teardown — critical for freeing V8 external memory
+			await this._isolatedFetch.destroy()
+			this._isolatedFetch = createIsolatedFetch()
+			this.embeddingsClient = new OpenAI({ apiKey, fetch: this._isolatedFetch.fetch })
+		} catch {
+			// If recreation fails, keep the existing client
+		}
 	}
 
 	/**

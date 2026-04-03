@@ -43,6 +43,7 @@
 	"settings.newTaskRequireTodos.description": "new_task टूल के साथ नए कार्य बनाते समय टूडू पैरामीटर की आवश्यकता होती है",
 	"settings.codeIndex.embeddingBatchSize.description": "कोड इंडेक्सिंग के दौरान एम्बेडिंग ऑपरेशन के लिए बैच साइज़। इसे अपने API प्रदाता की सीमाओं के अनुसार समायोजित करें। डिफ़ॉल्ट 60 है।",
 	"settings.codeIndex.maxFiles.description": "इंडेक्स करने के लिए कोड फ़ाइलों की अधिकतम संख्या। बहुत बड़े मोनोरेपो के लिए इसे बढ़ाएँ। एक्सटेंशन फ़िल्टरिंग के बाद लागू होता है। डिफ़ॉल्ट: 100,000।",
+	"settings.codeIndex.debugLogging.description": "Enable verbose debug logging for codebase indexing. Writes detailed progress and timing data to ~/roo-index-debug.log for troubleshooting. Default: off.",
 	"settings.debug.description": "API conversation history और UI messages को temporary files में prettified JSON के रूप में देखने के लिए अतिरिक्त बटन दिखाने के लिए debug mode सक्षम करें।",
 	"settings.debugProxy.enabled.description": "**Debug Proxy सक्षम करो** — सभी आउटबाउंड network requests को MITM debugging के लिए proxy के ज़रिए route करो। सिर्फ तब active रहेगा जब तुम debug mode (F5) में चला रहे हो।",
 	"settings.debugProxy.serverUrl.description": "Proxy URL (जैसे `http://127.0.0.1:8888`)। सिर्फ तब इस्तेमाल होती है जब **Debug Proxy** enabled हो।",

@@ -50,6 +50,23 @@ export class BedrockEmbedder implements IEmbedder {
 	}
 
 	/**
+	 * Recreates the underlying AWS Bedrock client to release accumulated native
+	 * memory from HTTP connection pools.
+	 */
+	async recycleClient(): Promise<void> {
+		try {
+			const credentials = this.profile ? fromIni({ profile: this.profile }) : fromNodeProviderChain()
+			this.bedrockClient = new BedrockRuntimeClient({
+				userAgentAppId: `RooCode#${Package.version}`,
+				region: this.region,
+				credentials,
+			})
+		} catch {
+			// If recreation fails, keep the existing client
+		}
+	}
+
+	/**
 	 * Creates embeddings for the given texts with batching and rate limiting
 	 * @param texts Array of text strings to embed
 	 * @param model Optional model identifier

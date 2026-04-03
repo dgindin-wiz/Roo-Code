@@ -1,4 +1,5 @@
 import { OpenAI } from "openai"
+import { createIsolatedFetch, type IsolatedFetch } from "../utils/isolated-fetch"
 import { IEmbedder, EmbeddingResponse, EmbedderInfo } from "../interfaces/embedder"
 import {
 	MAX_BATCH_TOKENS,
@@ -37,6 +38,7 @@ interface OpenRouterEmbeddingResponse {
  */
 export class OpenRouterEmbedder implements IEmbedder {
 	private embeddingsClient: OpenAI
+	private _isolatedFetch!: IsolatedFetch
 	private readonly defaultModelId: string
 	private readonly apiKey: string
 	private readonly maxItemTokens: number
@@ -70,6 +72,8 @@ export class OpenRouterEmbedder implements IEmbedder {
 		this.specificProvider =
 			specificProvider && specificProvider !== OPENROUTER_DEFAULT_PROVIDER_NAME ? specificProvider : undefined
 
+		this._isolatedFetch = createIsolatedFetch()
+
 		// Wrap OpenAI client creation to handle invalid API key characters
 		try {
 			this.embeddingsClient = new OpenAI({
@@ -79,14 +83,39 @@ export class OpenRouterEmbedder implements IEmbedder {
 					"HTTP-Referer": "https://github.com/RooCodeInc/Roo-Code",
 					"X-Title": "Roo Code",
 				},
+				fetch: this._isolatedFetch.fetch,
 			})
 		} catch (error) {
+			this._isolatedFetch.destroy()
 			// Use the error handler to transform ByteString conversion errors
 			throw handleOpenAIError(error, "OpenRouter")
 		}
 
 		this.defaultModelId = modelId || getDefaultModelId("openrouter")
 		this.maxItemTokens = maxItemTokens || MAX_ITEM_TOKENS
+	}
+
+	/**
+	 * Recreates the underlying OpenAI HTTP client to release accumulated native
+	 * memory (undici connection pool buffers).
+	 */
+	async recycleClient(): Promise<void> {
+		try {
+			// Await socket teardown — critical for freeing V8 external memory
+			await this._isolatedFetch.destroy()
+			this._isolatedFetch = createIsolatedFetch()
+			this.embeddingsClient = new OpenAI({
+				baseURL: this.baseUrl,
+				apiKey: this.apiKey,
+				defaultHeaders: {
+					"HTTP-Referer": "https://github.com/RooCodeInc/Roo-Code",
+					"X-Title": "Roo Code",
+				},
+				fetch: this._isolatedFetch.fetch,
+			})
+		} catch {
+			// If recreation fails, keep the existing client
+		}
 	}
 
 	/**
@@ -216,26 +245,16 @@ export class OpenRouterEmbedder implements IEmbedder {
 					requestParams,
 				)) as OpenRouterEmbeddingResponse
 
-				// Convert base64 embeddings to float32 arrays
-				const processedEmbeddings = response.data.map((item: EmbeddingItem) => {
+				// Decode base64 embeddings to number[] in a single pass —
+				// no intermediate object spread or second .map() needed.
+				const embeddings = response.data.map((item: EmbeddingItem) => {
 					if (typeof item.embedding === "string") {
 						const buffer = Buffer.from(item.embedding, "base64")
-
-						// Create Float32Array view over the buffer
-						const float32Array = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4)
-
-						return {
-							...item,
-							embedding: Array.from(float32Array),
-						}
+						const float32 = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4)
+						return Array.from(float32) as number[]
 					}
-					return item
+					return item.embedding as number[]
 				})
-
-				// Replace the original data with processed embeddings
-				response.data = processedEmbeddings
-
-				const embeddings = response.data.map((item) => item.embedding as number[])
 
 				return {
 					embeddings: embeddings,

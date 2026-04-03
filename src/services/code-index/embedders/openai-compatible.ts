@@ -1,5 +1,6 @@
 import { OpenAI } from "openai"
 import { IEmbedder, EmbeddingResponse, EmbedderInfo } from "../interfaces/embedder"
+import { createIsolatedFetch, type IsolatedFetch } from "../utils/isolated-fetch"
 import {
 	MAX_BATCH_TOKENS,
 	MAX_ITEM_TOKENS,
@@ -39,6 +40,7 @@ interface OpenAIEmbeddingResponse {
 
 export class OpenAICompatibleEmbedder implements IEmbedder {
 	private embeddingsClient: OpenAI
+	private _isolatedFetch!: IsolatedFetch
 	private readonly defaultModelId: string
 	private readonly baseUrl: string
 	private readonly apiKey: string
@@ -73,13 +75,19 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 		this.baseUrl = baseUrl
 		this.apiKey = apiKey
 
+		// Create a dedicated undici Agent so recycleClient() can destroy it
+		// and immediately free native connection pool buffers.
+		this._isolatedFetch = createIsolatedFetch()
+
 		// Wrap OpenAI client creation to handle invalid API key characters
 		try {
 			this.embeddingsClient = new OpenAI({
 				baseURL: baseUrl,
 				apiKey: apiKey,
+				fetch: this._isolatedFetch.fetch,
 			})
 		} catch (error) {
+			this._isolatedFetch.destroy()
 			// Use the error handler to transform ByteString conversion errors
 			throw handleOpenAIError(error, "OpenAI Compatible")
 		}
@@ -88,6 +96,28 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 		// Cache the URL type check for performance
 		this.isFullUrl = this.isFullEndpointUrl(baseUrl)
 		this.maxItemTokens = maxItemTokens || MAX_ITEM_TOKENS
+	}
+
+	/**
+	 * Recreates the underlying OpenAI HTTP client to release accumulated native
+	 * memory (undici connection pool buffers). Called periodically by the scanner
+	 * during long indexing runs to prevent external memory growth.
+	 */
+	async recycleClient(): Promise<void> {
+		try {
+			// Destroy the old Agent's connections and AWAIT socket teardown.
+			// Awaiting is CRITICAL — without it, the socket close events never
+			// get processed and native TLS buffers accumulate in V8 external memory.
+			await this._isolatedFetch.destroy()
+			this._isolatedFetch = createIsolatedFetch()
+			this.embeddingsClient = new OpenAI({
+				baseURL: this.baseUrl,
+				apiKey: this.apiKey,
+				fetch: this._isolatedFetch.fetch,
+			})
+		} catch {
+			// If recreation fails, keep the existing client
+		}
 	}
 
 	/**
@@ -214,7 +244,10 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 		batchTexts: string[],
 		model: string,
 	): Promise<OpenAIEmbeddingResponse> {
-		const response = await fetch(url, {
+		// Use the isolated fetch (private undici Agent) instead of global fetch.
+		// Global fetch routes through Node's shared dispatcher whose native TLS
+		// buffers are never freed, causing monotonic external memory growth.
+		const response = await this._isolatedFetch.fetch(url, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
@@ -299,26 +332,16 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 					})) as OpenAIEmbeddingResponse
 				}
 
-				// Convert base64 embeddings to float32 arrays
-				const processedEmbeddings = response.data.map((item: EmbeddingItem) => {
+				// Decode base64 embeddings to number[] in a single pass —
+				// no intermediate object spread or second .map() needed.
+				const embeddings = response.data.map((item: EmbeddingItem) => {
 					if (typeof item.embedding === "string") {
 						const buffer = Buffer.from(item.embedding, "base64")
-
-						// Create Float32Array view over the buffer
-						const float32Array = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4)
-
-						return {
-							...item,
-							embedding: Array.from(float32Array),
-						}
+						const float32 = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4)
+						return Array.from(float32) as number[]
 					}
-					return item
+					return item.embedding as number[]
 				})
-
-				// Replace the original data with processed embeddings
-				response.data = processedEmbeddings
-
-				const embeddings = response.data.map((item) => item.embedding as number[])
 
 				return {
 					embeddings: embeddings,
