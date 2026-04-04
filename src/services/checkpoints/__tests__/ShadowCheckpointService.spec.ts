@@ -14,6 +14,29 @@ import { RepoPerTaskCheckpointService } from "../RepoPerTaskCheckpointService"
 
 const tmpDir = path.join(os.tmpdir(), "CheckpointService")
 
+const removeDir = async (dir: string) => {
+	await fs.rm(dir, {
+		recursive: true,
+		force: true,
+		maxRetries: 5,
+		retryDelay: 100,
+	})
+}
+
+const createTempDir = async (prefix: string) => {
+	await fs.mkdir(tmpDir, { recursive: true })
+	return fs.mkdtemp(path.join(tmpDir, `${prefix}-`))
+}
+
+const createTempWorkspaceAndShadowDirs = async (prefix: string) => {
+	const rootDir = await createTempDir(prefix)
+	return {
+		rootDir,
+		shadowDir: path.join(rootDir, "shadow"),
+		workspaceDir: path.join(rootDir, "workspace"),
+	}
+}
+
 const initWorkspaceRepo = async ({
 	workspaceDir,
 	userName = "Roo Code",
@@ -55,11 +78,12 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 		let workspaceGit: SimpleGit
 		let testFile: string
 		let service: RepoPerTaskCheckpointService
+		let tempDirsToCleanup: string[] = []
 
 		beforeEach(async () => {
-			const shadowDir = path.join(tmpDir, `${prefix}-${Date.now()}`)
-			const workspaceDir = path.join(tmpDir, `workspace-${Date.now()}`)
+			const { rootDir, shadowDir, workspaceDir } = await createTempWorkspaceAndShadowDirs(prefix)
 			const repo = await initWorkspaceRepo({ workspaceDir })
+			tempDirsToCleanup.push(rootDir)
 
 			workspaceGit = repo.git
 			testFile = repo.testFile
@@ -70,10 +94,14 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 
 		afterEach(async () => {
 			vitest.restoreAllMocks()
+			for (const dir of tempDirsToCleanup) {
+				await removeDir(dir)
+			}
+			tempDirsToCleanup = []
 		})
 
 		afterAll(async () => {
-			await fs.rm(tmpDir, { recursive: true, force: true })
+			await removeDir(tmpDir)
 		}, 60_000) // 60 second timeout for Windows cleanup
 
 		describe(`${klass.name}#getDiff`, () => {
@@ -343,8 +371,8 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 
 		describe(`${klass.name}#create`, () => {
 			it("initializes a git repository if one does not already exist", async () => {
-				const shadowDir = path.join(tmpDir, `${prefix}2-${Date.now()}`)
-				const workspaceDir = path.join(tmpDir, `workspace2-${Date.now()}`)
+				const { rootDir, shadowDir, workspaceDir } = await createTempWorkspaceAndShadowDirs(`${prefix}2`)
+				tempDirsToCleanup.push(rootDir)
 				await fs.mkdir(workspaceDir)
 
 				const newTestFile = path.join(workspaceDir, "test.txt")
@@ -381,8 +409,10 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 		describe(`${klass.name}#hasNestedGitRepositories`, () => {
 			it("throws error when nested git repositories are detected during initialization", async () => {
 				// Create a new temporary workspace and service for this test.
-				const shadowDir = path.join(tmpDir, `${prefix}-nested-git-${Date.now()}`)
-				const workspaceDir = path.join(tmpDir, `workspace-nested-git-${Date.now()}`)
+				const { rootDir, shadowDir, workspaceDir } = await createTempWorkspaceAndShadowDirs(
+					`${prefix}-nested-git`,
+				)
+				tempDirsToCleanup.push(rootDir)
 
 				// Create a primary workspace repo.
 				await fs.mkdir(workspaceDir, { recursive: true })
@@ -445,14 +475,14 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 
 				// Clean up.
 				vitest.restoreAllMocks()
-				await fs.rm(shadowDir, { recursive: true, force: true })
-				await fs.rm(workspaceDir, { recursive: true, force: true })
 			})
 
 			it("succeeds when no nested git repositories are detected", async () => {
 				// Create a new temporary workspace and service for this test.
-				const shadowDir = path.join(tmpDir, `${prefix}-no-nested-git-${Date.now()}`)
-				const workspaceDir = path.join(tmpDir, `workspace-no-nested-git-${Date.now()}`)
+				const { rootDir, shadowDir, workspaceDir } = await createTempWorkspaceAndShadowDirs(
+					`${prefix}-no-nested-git`,
+				)
+				tempDirsToCleanup.push(rootDir)
 
 				// Create a primary workspace repo without any nested repos.
 				await fs.mkdir(workspaceDir, { recursive: true })
@@ -480,15 +510,13 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 
 				// Clean up.
 				vitest.restoreAllMocks()
-				await fs.rm(shadowDir, { recursive: true, force: true })
-				await fs.rm(workspaceDir, { recursive: true, force: true })
 			})
 		})
 
 		describe(`${klass.name}#events`, () => {
 			it("emits initialize event when service is created", async () => {
-				const shadowDir = path.join(tmpDir, `${prefix}3-${Date.now()}`)
-				const workspaceDir = path.join(tmpDir, `workspace3-${Date.now()}`)
+				const { rootDir, shadowDir, workspaceDir } = await createTempWorkspaceAndShadowDirs(`${prefix}3`)
+				tempDirsToCleanup.push(rootDir)
 				await fs.mkdir(workspaceDir, { recursive: true })
 
 				const newTestFile = path.join(workspaceDir, "test.txt")
@@ -533,8 +561,6 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 				expect(typeof initializeEvent.duration).toBe("number")
 
 				// Clean up.
-				await fs.rm(shadowDir, { recursive: true, force: true })
-				await fs.rm(workspaceDir, { recursive: true, force: true })
 			})
 
 			it("emits checkpoint event when saving checkpoint", async () => {
@@ -730,9 +756,11 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 
 			it("logs correct message for allowEmpty option", async () => {
 				const logMessages: string[] = []
+				const logTestShadowDir = await createTempDir("log-test")
+				tempDirsToCleanup.push(logTestShadowDir)
 				const testService = await klass.create({
 					taskId: "log-test",
-					shadowDir: path.join(tmpDir, `log-test-${Date.now()}`),
+					shadowDir: logTestShadowDir,
 					workspaceDir: service.workspaceDir,
 					log: (message: string) => logMessages.push(message),
 				})
@@ -832,8 +860,12 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 				await fs.mkdir(hooksDir, { recursive: true })
 				await fs.writeFile(path.join(hooksDir, "pre-commit"), "#!/bin/sh\nexit 1", { mode: 0o755 })
 
-				const testShadowDir = path.join(tmpDir, `shadow-template-test-${Date.now()}`)
-				const testWorkspaceDir = path.join(tmpDir, `workspace-template-test-${Date.now()}`)
+				const {
+					rootDir,
+					shadowDir: testShadowDir,
+					workspaceDir: testWorkspaceDir,
+				} = await createTempWorkspaceAndShadowDirs("shadow-template-test")
+				tempDirsToCleanup.push(rootDir)
 				await initWorkspaceRepo({ workspaceDir: testWorkspaceDir })
 
 				const originalTemplateDir = process.env.GIT_TEMPLATE_DIR
@@ -867,8 +899,6 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 						delete process.env.GIT_TEMPLATE_DIR
 					}
 
-					await fs.rm(testShadowDir, { recursive: true, force: true })
-					await fs.rm(testWorkspaceDir, { recursive: true, force: true })
 					await fs.rm(templateDir, { recursive: true, force: true })
 				}
 			})
@@ -880,8 +910,8 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 				// so we need to set it BEFORE creating the checkpoint service.
 
 				// Create a separate git directory to simulate GIT_DIR pointing elsewhere
-				const externalGitDir = path.join(tmpDir, `external-git-${Date.now()}`)
-				await fs.mkdir(externalGitDir, { recursive: true })
+				const externalGitDir = await createTempDir("external-git")
+				tempDirsToCleanup.push(externalGitDir)
 				const externalGit = simpleGit(externalGitDir)
 				await externalGit.init()
 				await externalGit.addConfig("user.name", "External User")
@@ -899,8 +929,12 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 
 				// Initialize the workspace repo BEFORE setting GIT_DIR
 				// (In Dev Containers, the workspace repo already exists before GIT_DIR is set)
-				const testShadowDir = path.join(tmpDir, `shadow-git-dir-test-${Date.now()}`)
-				const testWorkspaceDir = path.join(tmpDir, `workspace-git-dir-test-${Date.now()}`)
+				const {
+					rootDir,
+					shadowDir: testShadowDir,
+					workspaceDir: testWorkspaceDir,
+				} = await createTempWorkspaceAndShadowDirs("shadow-git-dir-test")
+				tempDirsToCleanup.push(rootDir)
 				const testRepo = await initWorkspaceRepo({ workspaceDir: testWorkspaceDir })
 
 				// Set GIT_DIR to point to the external repository BEFORE creating the service
@@ -956,9 +990,6 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 					} else {
 						delete process.env.GIT_DIR
 					}
-
-					// Clean up external git directory
-					await fs.rm(externalGitDir, { recursive: true, force: true })
 				}
 			})
 		})
@@ -967,19 +998,14 @@ describe.each([[RepoPerTaskCheckpointService, "RepoPerTaskCheckpointService"]])(
 
 describe("worktree path comparison", () => {
 	it("accepts core.worktree with trailing newline from git output", async () => {
-		const shadowDir = path.join(tmpDir, `worktree-trim-${Date.now()}`)
-		const workspaceDir = path.join(tmpDir, `workspace-trim-${Date.now()}`)
+		const { rootDir, shadowDir, workspaceDir } = await createTempWorkspaceAndShadowDirs("worktree-trim")
 
 		try {
-			await fs.mkdir(workspaceDir, { recursive: true })
-			const mainGit = simpleGit(workspaceDir)
-			await mainGit.init()
-			await mainGit.addConfig("user.name", "Roo Code")
-			await mainGit.addConfig("user.email", "support@roocode.com")
-
-			await fs.writeFile(path.join(workspaceDir, "main.txt"), "main content")
-			await mainGit.add("main.txt")
-			await mainGit.commit("Initial commit")
+			await initWorkspaceRepo({
+				workspaceDir,
+				testFileName: "main.txt",
+				textFileContent: "main content",
+			})
 
 			vitest.spyOn(fileSearch, "executeRipgrep").mockImplementation(() => {
 				return Promise.resolve([])
@@ -996,25 +1022,19 @@ describe("worktree path comparison", () => {
 			await service2.initShadowGit()
 		} finally {
 			vitest.restoreAllMocks()
-			await fs.rm(shadowDir, { recursive: true, force: true })
-			await fs.rm(workspaceDir, { recursive: true, force: true })
+			await removeDir(rootDir)
 		}
 	})
 
 	it("throws when core.worktree is missing", async () => {
-		const shadowDir = path.join(tmpDir, `worktree-missing-${Date.now()}`)
-		const workspaceDir = path.join(tmpDir, `workspace-missing-${Date.now()}`)
+		const { rootDir, shadowDir, workspaceDir } = await createTempWorkspaceAndShadowDirs("worktree-missing")
 
 		try {
-			await fs.mkdir(workspaceDir, { recursive: true })
-			const mainGit = simpleGit(workspaceDir)
-			await mainGit.init()
-			await mainGit.addConfig("user.name", "Roo Code")
-			await mainGit.addConfig("user.email", "support@roocode.com")
-
-			await fs.writeFile(path.join(workspaceDir, "main.txt"), "main content")
-			await mainGit.add("main.txt")
-			await mainGit.commit("Initial commit")
+			await initWorkspaceRepo({
+				workspaceDir,
+				testFileName: "main.txt",
+				textFileContent: "main content",
+			})
 
 			vitest.spyOn(fileSearch, "executeRipgrep").mockImplementation(() => {
 				return Promise.resolve([])
@@ -1033,8 +1053,7 @@ describe("worktree path comparison", () => {
 			await expect(service2.initShadowGit()).rejects.toThrowError(/core\.worktree to be set/)
 		} finally {
 			vitest.restoreAllMocks()
-			await fs.rm(shadowDir, { recursive: true, force: true })
-			await fs.rm(workspaceDir, { recursive: true, force: true })
+			await removeDir(rootDir)
 		}
 	})
 })

@@ -388,14 +388,15 @@ describe("IndexDebugLogger", () => {
 			expect(logLine).toMatch(/heapMB=\d+/)
 		})
 
-		it("should NOT include heapMB in non-transition logs", () => {
+		it("should include heapMB in non-transition logs", () => {
 			mockDebugLoggingSetting = true
 
 			IndexDebugLogger.log("Test", "method", { key: "value" })
 
 			const mockStream = (fs.createWriteStream as any).mock.results[0].value
 			const logLine = mockStream.write.mock.calls[0][0] as string
-			expect(logLine).not.toContain("heapMB=")
+			expect(logLine).toMatch(/heapMB=\d+/)
+			expect(logLine).toMatch(/rssMB=\d+/)
 		})
 
 		it("should track peak heap memory", () => {
