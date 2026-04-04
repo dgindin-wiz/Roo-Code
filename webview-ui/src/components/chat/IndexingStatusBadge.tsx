@@ -63,22 +63,13 @@ export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ classN
 		}
 	}, [cwd])
 
-	const progressPercentage = useMemo(() => {
+	const progressPercentage =
 		// Use block-level progress during embedding (uniform cost per block → accurate ETA)
-		if (indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0) {
-			return Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100)
-		}
-		// Fall back to legacy fields
-		return indexingStatus.totalItems > 0
-			? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
-			: 0
-	}, [
-		indexingStatus.phase,
-		indexingStatus.blocksEmbedded,
-		indexingStatus.totalBlocks,
-		indexingStatus.processedItems,
-		indexingStatus.totalItems,
-	])
+		indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0
+			? Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100)
+			: indexingStatus.totalItems > 0
+				? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
+				: 0
 
 	const tooltipText = useMemo(() => {
 		switch (indexingStatus.systemStatus) {
