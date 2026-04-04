@@ -4,6 +4,24 @@ import { IndexDebugLogger } from "./debug-logger"
 export type IndexingState = "Standby" | "Indexing" | "Indexed" | "Error" | "Stopping"
 
 export type IndexingPhase = "scanning" | "embedding" | "complete"
+export type EstimationConfidence = "low" | "medium" | "high"
+
+interface IndexingResilienceStats {
+	resumedRetryJobs: number
+	resumedPendingJobs: number
+	retryingParseRevisions: number
+	terminalFailedParseRevisions: number
+	degradedRevisions: number
+	terminalFailedRevisions: number
+	terminallyFailedChunks: number
+	retryingChunks: number
+	warningDetails: Array<{
+		relativePath: string
+		state: "degraded" | "terminal_failed" | "failed"
+		category?: "parser_failed" | "failed" | "degraded"
+		failureReason?: string | null
+	}>
+}
 
 /**
  * Formats milliseconds into a human-readable ETA string.
@@ -26,6 +44,7 @@ export class CodeIndexStateManager {
 	private _totalItems: number = 0
 	private _currentItemUnit: string = "blocks"
 	private _progressEmitter = new vscode.EventEmitter<ReturnType<typeof this.getCurrentStatus>>()
+	private _activityDetail: string = ""
 
 	// Two-phase progress fields
 	private _phase: IndexingPhase | undefined
@@ -39,8 +58,18 @@ export class CodeIndexStateManager {
 	private _embedStartedAt: number = 0
 	private _estimatedTimeRemainingMs: number | null = null
 	private _lastFilesParsedChangeTime: number = 0 // when _filesParsed last changed (for backpressure detection)
+	private _estimationConfidence: EstimationConfidence | undefined
+	private _isBackpressured = false
+	private _embeddingRuntimeKind: "local" | "remote" | "unknown" = "unknown"
+	private _recentChunkDensitySamples: number[] = []
+	private _recentThroughputSamples: number[] = []
+	private _lastThroughputSampleAt: number = 0
+	private _lastThroughputBlocksEmbedded: number = 0
+	private _resilienceStats: IndexingResilienceStats = this.createEmptyResilienceStats()
 	private static readonly MIN_PROGRESS_FOR_ETA = 0.01 // 1% — show ETA early; block-level progress is stable
 	private static readonly BACKPRESSURE_DISPLAY_THRESHOLD_MS = 2_000 // show "waiting" hint after 2s of no file progress
+	private static readonly MAX_RECENT_DENSITY_SAMPLES = 8
+	private static readonly MAX_RECENT_THROUGHPUT_SAMPLES = 8
 
 	// --- Public API ---
 
@@ -68,6 +97,17 @@ export class CodeIndexStateManager {
 			blocksEmbedded: effectiveBlocksEmbedded,
 			estimatedTimeRemainingMs: this._estimatedTimeRemainingMs,
 			isEstimatedTotal: this._isEstimatedTotal,
+			estimationConfidence: this._estimationConfidence,
+			isBackpressured: this._isBackpressured,
+			resumedRetryJobs: this._resilienceStats.resumedRetryJobs,
+			resumedPendingJobs: this._resilienceStats.resumedPendingJobs,
+			retryingParseRevisions: this._resilienceStats.retryingParseRevisions,
+			terminalFailedParseRevisions: this._resilienceStats.terminalFailedParseRevisions,
+			degradedRevisions: this._resilienceStats.degradedRevisions,
+			terminalFailedRevisions: this._resilienceStats.terminalFailedRevisions,
+			terminallyFailedChunks: this._resilienceStats.terminallyFailedChunks,
+			retryingChunks: this._resilienceStats.retryingChunks,
+			warningDetails: this._resilienceStats.warningDetails,
 		}
 	}
 
@@ -88,14 +128,20 @@ export class CodeIndexStateManager {
 				this._processedItems = 0
 				this._totalItems = 0
 				this._currentItemUnit = "blocks" // Reset to default unit
+				this._activityDetail = ""
 				// Optionally clear the message or set a default for non-indexing states
 				if (newState === "Standby" && message === undefined) this._statusMessage = "Ready."
 				if (newState === "Indexed" && message === undefined) this._statusMessage = "Index up-to-date."
 				if (newState === "Error" && message === undefined) this._statusMessage = "An error occurred."
+				if (newState === "Standby" || newState === "Error") {
+					this.resetResilienceStats()
+				}
 				// Reset two-phase fields
 				if (newState !== "Stopping") {
 					this._phase = newState === "Indexed" ? "complete" : undefined
 					this._estimatedTimeRemainingMs = null
+					this._estimationConfidence = undefined
+					this._isBackpressured = false
 				}
 			}
 
@@ -115,6 +161,7 @@ export class CodeIndexStateManager {
 	 */
 	public startIndexingTimer(): void {
 		this._estimatedTimeRemainingMs = null
+		this.resetResilienceStats()
 	}
 
 	/**
@@ -148,6 +195,9 @@ export class CodeIndexStateManager {
 		isEstimate: boolean,
 		changedFiles?: number,
 		startingBlockCount?: number,
+		options?: {
+			runtimeKind?: "local" | "remote" | "unknown"
+		},
 	): void {
 		if (this._systemStatus === "Stopping") return
 
@@ -159,6 +209,14 @@ export class CodeIndexStateManager {
 		this._embedStartedAt = Date.now()
 		this._estimatedTimeRemainingMs = null
 		this._lastFilesParsedChangeTime = Date.now()
+		this._activityDetail = ""
+		this._estimationConfidence = isEstimate ? "low" : "high"
+		this._isBackpressured = false
+		this._embeddingRuntimeKind = options?.runtimeKind ?? "unknown"
+		this._recentChunkDensitySamples = []
+		this._recentThroughputSamples = []
+		this._lastThroughputSampleAt = Date.now()
+		this._lastThroughputBlocksEmbedded = 0
 
 		// Also update legacy fields for backward compat
 		this._processedItems = this._startingBlockCount
@@ -215,6 +273,8 @@ export class CodeIndexStateManager {
 			return
 		}
 
+		const previousFilesParsed = this._filesParsed
+		const previousObservedBlocks = this._totalBlocks
 		this._blocksEmbedded = blocksEmbedded
 		if (revisedTotal !== undefined) {
 			this._totalBlocks = revisedTotal
@@ -227,6 +287,22 @@ export class CodeIndexStateManager {
 				this._lastFilesParsedChangeTime = Date.now()
 			}
 			this._filesParsed = filesParsed
+		}
+		if (
+			this._isEstimatedTotal &&
+			revisedTotal !== undefined &&
+			filesParsed !== undefined &&
+			filesParsed > previousFilesParsed
+		) {
+			const deltaFiles = filesParsed - previousFilesParsed
+			const deltaBlocks = revisedTotal - previousObservedBlocks
+			if (deltaFiles > 0 && deltaBlocks >= 0) {
+				this._pushRecentSample(
+					this._recentChunkDensitySamples,
+					deltaBlocks / deltaFiles,
+					CodeIndexStateManager.MAX_RECENT_DENSITY_SAMPLES,
+				)
+			}
 		}
 
 		// Effective embedded = pre-existing + new this session
@@ -248,6 +324,10 @@ export class CodeIndexStateManager {
 		// Use extrapolated total for progress bar + ETA when parsing is incomplete.
 		// This prevents the progress bar from showing 98% when only 1% of files are parsed.
 		const displayTotal = this._getExtrapolatedTotal()
+		this._isBackpressured =
+			this._filesParsed < this._totalFiles &&
+			this._filesParsed > 0 &&
+			Date.now() - this._lastFilesParsedChangeTime >= CodeIndexStateManager.BACKPRESSURE_DISPLAY_THRESHOLD_MS
 
 		// Use block-level progress for bar + ETA (uniform cost per block)
 		this._processedItems = effectiveEmbedded
@@ -286,16 +366,13 @@ export class CodeIndexStateManager {
 		const blockLine = `Embedded ${effectiveEmbedded.toLocaleString()} of ${prefix}${displayTotal.toLocaleString()} total blocks${throughputPart}${etaSuffix}`
 		// Detect backpressure: file parsing hasn't advanced for a while but embedding is active.
 		// This indicates the parse phase is blocked waiting for embed queue capacity.
-		const parseStalled =
-			this._filesParsed < this._totalFiles &&
-			this._filesParsed > 0 &&
-			Date.now() - this._lastFilesParsedChangeTime >= CodeIndexStateManager.BACKPRESSURE_DISPLAY_THRESHOLD_MS
-		const backpressureHint = parseStalled ? " (waiting for embeddings)" : ""
+		const backpressureHint = this._isBackpressured ? " (waiting for embeddings)" : ""
 		const fileLine =
 			this._totalFiles > 0
 				? `\n${this._filesParsed.toLocaleString()} of ${this._totalFiles.toLocaleString()} files checked${backpressureHint}`
 				: ""
-		this._statusMessage = `${blockLine}${fileLine}`
+		const detailLine = this._activityDetail ? `\n${this._activityDetail}` : ""
+		this._statusMessage = `${blockLine}${fileLine}${detailLine}`
 
 		this._progressEmitter.fire(this.getCurrentStatus())
 		IndexDebugLogger.log("StateManager", "reportEmbedProgress", {
@@ -336,6 +413,90 @@ export class CodeIndexStateManager {
 		IndexDebugLogger.log("StateManager", "reportComplete", { phaseTransition: true, totalBlocks, totalFiles })
 	}
 
+	public setResilienceStats(stats: Partial<IndexingResilienceStats>): void {
+		this.applyResilienceStats(stats)
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "setResilienceStats", {
+			...this._resilienceStats,
+		})
+	}
+
+	/**
+	 * Reports custom progress for non-legacy index engines while still using
+	 * the same progress payload shape the webview already understands.
+	 */
+	public reportCustomProgress(
+		message: string,
+		processedItems: number,
+		totalItems: number,
+		options?: {
+			currentItemUnit?: string
+			phase?: IndexingPhase
+			systemStatus?: IndexingState
+			estimationConfidence?: EstimationConfidence
+			isBackpressured?: boolean
+			resilienceStats?: Partial<IndexingResilienceStats>
+		},
+	): void {
+		if (this._systemStatus === "Stopping") return
+
+		this._systemStatus = options?.systemStatus ?? "Indexing"
+		this._statusMessage = this.composeStatusMessage(message)
+		this._processedItems = processedItems
+		this._totalItems = totalItems
+		this._currentItemUnit = options?.currentItemUnit ?? "items"
+		this._phase = options?.phase
+		this._estimationConfidence = options?.estimationConfidence ?? this._estimationConfidence
+		this._isBackpressured = options?.isBackpressured ?? false
+		this.applyResilienceStats(options?.resilienceStats)
+		if (this._phase === "scanning") {
+			this._processedFiles = processedItems
+			this._totalFiles = totalItems
+		}
+
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "reportCustomProgress", {
+			message: message.substring(0, 120),
+			processedItems,
+			totalItems,
+			currentItemUnit: this._currentItemUnit,
+			phase: this._phase,
+		})
+	}
+
+	/**
+	 * Emits a lightweight heartbeat while preserving the current progress model.
+	 * This keeps the UI feeling alive during long-running phases even when the
+	 * numeric counters have not advanced enough to change the bar meaningfully.
+	 */
+	public reportHeartbeat(message?: string): void {
+		if (this._systemStatus !== "Indexing") return
+		if (message !== undefined) {
+			this._statusMessage = this.composeStatusMessage(message)
+		} else {
+			this._statusMessage = this.composeStatusMessage(this._statusMessage.split("\n")[0] ?? this._statusMessage)
+		}
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "reportHeartbeat", {
+			message: this._statusMessage.substring(0, 120),
+			phase: this._phase,
+			processedItems: this._processedItems,
+			totalItems: this._totalItems,
+		})
+	}
+
+	public setActivityDetail(detail: string): void {
+		this._activityDetail = detail
+		if (this._systemStatus === "Indexing") {
+			this._statusMessage = this.composeStatusMessage(this._statusMessage.split("\n")[0] ?? this._statusMessage)
+			this._progressEmitter.fire(this.getCurrentStatus())
+		}
+		IndexDebugLogger.log("StateManager", "setActivityDetail", {
+			detail: detail.substring(0, 120),
+			phase: this._phase,
+		})
+	}
+
 	/**
 	 * Returns an extrapolated total block count when parsing is incomplete.
 	 *
@@ -356,10 +517,54 @@ export class CodeIndexStateManager {
 			this._totalFiles > 0 &&
 			this._filesParsed < this._totalFiles
 		) {
-			const blocksPerFile = this._totalBlocks / this._filesParsed
+			const globalBlocksPerFile = this._totalBlocks / this._filesParsed
+			const recentBlocksPerFile =
+				this._recentChunkDensitySamples.length >= 3
+					? this._recentChunkDensitySamples.reduce((sum, value, index, samples) => {
+							const weight = index + 1
+							return sum + value * weight
+						}, 0) / this._recentChunkDensitySamples.reduce((sum, _value, index) => sum + index + 1, 0)
+					: globalBlocksPerFile
+			const recentWeight =
+				this._recentChunkDensitySamples.length >= 3
+					? Math.min(0.7, this._recentChunkDensitySamples.length / 8)
+					: 0
+			const blocksPerFile = globalBlocksPerFile * (1 - recentWeight) + recentBlocksPerFile * recentWeight
 			return Math.round(blocksPerFile * this._totalFiles)
 		}
 		return this._totalBlocks
+	}
+
+	private composeStatusMessage(baseMessage: string): string {
+		return this._activityDetail ? `${baseMessage}\n${this._activityDetail}` : baseMessage
+	}
+
+	private createEmptyResilienceStats(): IndexingResilienceStats {
+		return {
+			resumedRetryJobs: 0,
+			resumedPendingJobs: 0,
+			retryingParseRevisions: 0,
+			terminalFailedParseRevisions: 0,
+			degradedRevisions: 0,
+			terminalFailedRevisions: 0,
+			terminallyFailedChunks: 0,
+			retryingChunks: 0,
+			warningDetails: [],
+		}
+	}
+
+	private resetResilienceStats(): void {
+		this._resilienceStats = this.createEmptyResilienceStats()
+	}
+
+	private applyResilienceStats(stats?: Partial<IndexingResilienceStats>): void {
+		if (!stats) {
+			return
+		}
+		this._resilienceStats = {
+			...this._resilienceStats,
+			...stats,
+		}
 	}
 
 	/**
@@ -389,10 +594,119 @@ export class CodeIndexStateManager {
 		}
 
 		// Throughput based on THIS session's work only (not pre-existing blocks)
-		const blocksPerMs = this._blocksEmbedded / elapsed
+		const now = Date.now()
+		const deltaElapsed = Math.max(now - this._lastThroughputSampleAt, 1)
+		const deltaBlocks = Math.max(0, this._blocksEmbedded - this._lastThroughputBlocksEmbedded)
+		if (deltaBlocks > 0) {
+			this._pushRecentSample(
+				this._recentThroughputSamples,
+				deltaBlocks / deltaElapsed,
+				CodeIndexStateManager.MAX_RECENT_THROUGHPUT_SAMPLES,
+			)
+			this._lastThroughputSampleAt = now
+			this._lastThroughputBlocksEmbedded = this._blocksEmbedded
+		}
+		const fallbackBlocksPerMs = this._blocksEmbedded / elapsed
+		const smoothedBlocksPerMs = this._getSmoothedThroughput(fallbackBlocksPerMs)
 		// Remaining blocks to embed this session (using extrapolated total)
 		const remainingBlocks = Math.max(0, extrapolatedTotal - effectiveEmbedded)
-		this._estimatedTimeRemainingMs = blocksPerMs > 0 ? Math.max(0, Math.round(remainingBlocks / blocksPerMs)) : null
+		const rawEtaMs = smoothedBlocksPerMs > 0 ? Math.max(0, Math.round(remainingBlocks / smoothedBlocksPerMs)) : null
+		this._estimatedTimeRemainingMs = rawEtaMs !== null ? this._smoothEta(rawEtaMs) : null
+		this._estimationConfidence = this._getEmbeddingConfidence(progress)
+	}
+
+	private _getSmoothedThroughput(fallbackBlocksPerMs: number): number {
+		if (this._recentThroughputSamples.length === 0) {
+			return fallbackBlocksPerMs
+		}
+
+		const weightedAverage =
+			this._recentThroughputSamples.reduce((sum, sample, index, samples) => {
+				const weight = index + 1
+				return sum + sample * weight
+			}, 0) / this._recentThroughputSamples.reduce((sum, _sample, index) => sum + index + 1, 0)
+
+		return weightedAverage > 0 ? weightedAverage : fallbackBlocksPerMs
+	}
+
+	private _smoothEta(rawEtaMs: number): number {
+		if (this._estimatedTimeRemainingMs == null) {
+			return rawEtaMs
+		}
+
+		const variance = this._getRelativeVariance(this._recentThroughputSamples)
+		let alpha =
+			this._embeddingRuntimeKind === "local" ? 0.45 : this._embeddingRuntimeKind === "remote" ? 0.25 : 0.35
+		if (variance > 0.6) {
+			alpha *= 0.4
+		} else if (variance > 0.35) {
+			alpha *= 0.6
+		}
+		if (this._isBackpressured) {
+			alpha *= 0.5
+		}
+
+		return Math.round(this._estimatedTimeRemainingMs * (1 - alpha) + rawEtaMs * alpha)
+	}
+
+	private _getEmbeddingConfidence(progress: number): EstimationConfidence {
+		const throughputSampleCount = this._recentThroughputSamples.length
+		const variance = this._getRelativeVariance(this._recentThroughputSamples)
+		const parseCoverage = this._totalFiles > 0 ? this._filesParsed / this._totalFiles : progress
+		const estimateCoverage = this._isEstimatedTotal ? Math.max(progress, parseCoverage) : progress
+		const hasStableHighSignal = throughputSampleCount >= 4 && variance < 0.35
+		const hasStableMediumSignal = throughputSampleCount >= 3 && variance < 0.75
+
+		if (!this._isEstimatedTotal && progress >= 0.5) {
+			return "high"
+		}
+
+		// Backpressure means parsing is temporarily waiting on the embed queue, not that the
+		// estimate is inherently bad. Keep the separate "waiting" hint, but allow confidence
+		// to rise to medium once we've seen enough stable throughput and enough of the corpus.
+		if (this._isBackpressured) {
+			if (estimateCoverage >= 0.5 && hasStableHighSignal) {
+				return "medium"
+			}
+			return "low"
+		}
+
+		if (this._isEstimatedTotal) {
+			if (estimateCoverage >= 0.75 && hasStableHighSignal) {
+				return "high"
+			}
+			if (estimateCoverage >= 0.2 && hasStableMediumSignal) {
+				return "medium"
+			}
+			return "low"
+		}
+
+		if (estimateCoverage >= 0.4 && hasStableHighSignal) {
+			return "high"
+		}
+		if (estimateCoverage >= 0.15 && hasStableMediumSignal) {
+			return "medium"
+		}
+		return "low"
+	}
+
+	private _getRelativeVariance(samples: number[]): number {
+		if (samples.length < 2) {
+			return 0
+		}
+		const mean = samples.reduce((sum, sample) => sum + sample, 0) / samples.length
+		if (mean <= 0) {
+			return 0
+		}
+		const variance = samples.reduce((sum, sample) => sum + (sample - mean) ** 2, 0) / samples.length
+		return Math.sqrt(variance) / mean
+	}
+
+	private _pushRecentSample(samples: number[], value: number, maxSize: number): void {
+		samples.push(value)
+		if (samples.length > maxSize) {
+			samples.shift()
+		}
 	}
 
 	// --- Legacy methods (used by file watcher) ---

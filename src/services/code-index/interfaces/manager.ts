@@ -38,6 +38,10 @@ export interface ICodeIndexManager {
 	 * Starts the indexing process
 	 */
 	startIndexing(): Promise<void>
+	retryIndexWarningFiles?(
+		filter: "all" | "parser_failed" | "failed" | "degraded",
+		relativePaths?: string[],
+	): Promise<{ retriedFiles: number }>
 
 	/**
 	 * Stops any in-progress indexing operation and the file watcher

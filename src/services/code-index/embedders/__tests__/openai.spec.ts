@@ -67,26 +67,16 @@ describe("OpenAiEmbedder", () => {
 
 	describe("constructor", () => {
 		it("should initialize with provided options", () => {
-			expect(MockedOpenAI).toHaveBeenCalledWith(
-				expect.objectContaining({
-					apiKey: "test-api-key",
-					fetch: expect.any(Function),
-				}),
-			)
+			expect(MockedOpenAI).toHaveBeenCalledWith({ apiKey: "test-api-key" })
 			expect(embedder.embedderInfo.name).toBe("openai")
 		})
 
 		it("should use 'not-provided' if API key is not provided", () => {
-			new OpenAiEmbedder({
+			const embedderWithoutKey = new OpenAiEmbedder({
 				openAiEmbeddingModelId: "text-embedding-3-small",
 			})
 
-			expect(MockedOpenAI).toHaveBeenLastCalledWith(
-				expect.objectContaining({
-					apiKey: "not-provided",
-					fetch: expect.any(Function),
-				}),
-			)
+			expect(MockedOpenAI).toHaveBeenCalledWith({ apiKey: "not-provided" })
 		})
 
 		it("should use default model if not specified", () => {

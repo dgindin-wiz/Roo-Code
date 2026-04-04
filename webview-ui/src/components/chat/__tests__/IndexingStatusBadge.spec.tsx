@@ -218,6 +218,38 @@ describe("IndexingStatusBadge", () => {
 		})
 	})
 
+	it("includes resumed retry jobs and warning counts in the tooltip text", async () => {
+		renderComponent()
+
+		const event = new MessageEvent("message", {
+			data: {
+				type: "indexingStatusUpdate",
+				values: {
+					systemStatus: "Indexed",
+					processedItems: 100,
+					totalItems: 100,
+					currentItemUnit: "files",
+					resumedRetryJobs: 4,
+					resumedPendingJobs: 4,
+					degradedRevisions: 2,
+					terminalFailedRevisions: 1,
+				},
+			},
+		})
+
+		act(() => {
+			window.dispatchEvent(event)
+		})
+
+		await waitFor(() => {
+			const button = screen.getByRole("button")
+			expect(button).toHaveAttribute(
+				"aria-label",
+				"Indexed — resuming 4 unfinished jobs from the previous run, 2 degraded files, 1 failed file",
+			)
+		})
+	})
+
 	it("cleans up event listener on unmount", () => {
 		const { unmount } = renderComponent()
 		const removeEventListenerSpy = vi.spyOn(window, "removeEventListener")

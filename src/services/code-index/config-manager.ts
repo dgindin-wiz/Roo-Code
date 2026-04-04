@@ -1,9 +1,11 @@
+import * as vscode from "vscode"
 import { ApiHandlerOptions } from "../../shared/api"
 import { ContextProxy } from "../../core/config/ContextProxy"
 import { EmbedderProvider } from "./interfaces/manager"
 import { CodeIndexConfig, PreviousConfigSnapshot } from "./interfaces/config"
 import { DEFAULT_SEARCH_MIN_SCORE, DEFAULT_MAX_SEARCH_RESULTS } from "./constants"
 import { getDefaultModelId, getModelDimension, getModelScoreThreshold } from "../../shared/embeddingModels"
+import { Package } from "../../shared/package"
 
 /**
  * Manages configuration state and validation for the code indexing feature.
@@ -26,6 +28,7 @@ export class CodeIndexConfigManager {
 	private qdrantApiKey?: string
 	private searchMinScore?: number
 	private searchMaxResults?: number
+	private respectGitIgnore: boolean = true
 
 	constructor(private readonly contextProxy: ContextProxy) {
 		// Initialize with current configuration to avoid false restart triggers
@@ -66,6 +69,9 @@ export class CodeIndexConfigManager {
 			codebaseIndexSearchMinScore,
 			codebaseIndexSearchMaxResults,
 		} = codebaseIndexConfig
+		const respectGitIgnoreSetting = vscode.workspace
+			.getConfiguration(Package.name)
+			.get<boolean>("codeIndex.respectGitIgnore", true)
 
 		const openAiKey = this.contextProxy?.getSecret("codeIndexOpenAiKey") ?? ""
 		const qdrantApiKey = this.contextProxy?.getSecret("codeIndexQdrantApiKey") ?? ""
@@ -86,6 +92,7 @@ export class CodeIndexConfigManager {
 		this.qdrantApiKey = qdrantApiKey ?? ""
 		this.searchMinScore = codebaseIndexSearchMinScore
 		this.searchMaxResults = codebaseIndexSearchMaxResults
+		this.respectGitIgnore = respectGitIgnoreSetting
 
 		// Validate and set model dimension
 		const rawDimension = codebaseIndexConfig.codebaseIndexEmbedderModelDimension
@@ -171,6 +178,7 @@ export class CodeIndexConfigManager {
 			qdrantUrl?: string
 			qdrantApiKey?: string
 			searchMinScore?: number
+			respectGitIgnore?: boolean
 		}
 		requiresRestart: boolean
 	}> {
@@ -194,6 +202,7 @@ export class CodeIndexConfigManager {
 			openRouterSpecificProvider: this.openRouterOptions?.specificProvider ?? "",
 			qdrantUrl: this.qdrantUrl ?? "",
 			qdrantApiKey: this.qdrantApiKey ?? "",
+			respectGitIgnore: this.respectGitIgnore,
 		}
 
 		// Refresh secrets from VSCode storage to ensure we have the latest values
@@ -234,6 +243,7 @@ export class CodeIndexConfigManager {
 				qdrantUrl: this.qdrantUrl,
 				qdrantApiKey: this.qdrantApiKey,
 				searchMinScore: this.currentSearchMinScore,
+				respectGitIgnore: this.respectGitIgnore,
 			},
 			requiresRestart,
 		}
@@ -331,6 +341,7 @@ export class CodeIndexConfigManager {
 		const prevOpenRouterSpecificProvider = prev?.openRouterSpecificProvider ?? ""
 		const prevQdrantUrl = prev?.qdrantUrl ?? ""
 		const prevQdrantApiKey = prev?.qdrantApiKey ?? ""
+		const prevRespectGitIgnore = prev?.respectGitIgnore ?? true
 
 		// 1. Transition from disabled/unconfigured to enabled/configured
 		if ((!prevEnabled || !prevConfigured) && this.codebaseIndexEnabled && nowConfigured) {
@@ -373,6 +384,7 @@ export class CodeIndexConfigManager {
 		const currentOpenRouterSpecificProvider = this.openRouterOptions?.specificProvider ?? ""
 		const currentQdrantUrl = this.qdrantUrl ?? ""
 		const currentQdrantApiKey = this.qdrantApiKey ?? ""
+		const currentRespectGitIgnore = this.respectGitIgnore
 
 		// Helper: detect if a secret "disappeared" (was set, now empty).
 		// This pattern indicates a stale secret cache (e.g., macOS keychain
@@ -443,6 +455,10 @@ export class CodeIndexConfigManager {
 			return true
 		}
 
+		if (prevRespectGitIgnore !== currentRespectGitIgnore) {
+			return true
+		}
+
 		// Vector dimension changes (still important for compatibility)
 		if (this._hasVectorDimensionChanged(prevProvider, prev?.modelId)) {
 			return true
@@ -498,6 +514,7 @@ export class CodeIndexConfigManager {
 			qdrantApiKey: this.qdrantApiKey,
 			searchMinScore: this.currentSearchMinScore,
 			searchMaxResults: this.currentSearchMaxResults,
+			respectGitIgnore: this.respectGitIgnore,
 		}
 	}
 
@@ -544,6 +561,10 @@ export class CodeIndexConfigManager {
 	 * Returns the model's built-in dimension if available, otherwise falls back to custom dimension.
 	 */
 	public get currentModelDimension(): number | undefined {
+		if (this.embedderProvider === "openai-compatible" && this.modelDimension && this.modelDimension > 0) {
+			return this.modelDimension
+		}
+
 		// First try to get the model-specific dimension
 		const modelId = this.modelId ?? getDefaultModelId(this.embedderProvider)
 		const modelDimension = getModelDimension(this.embedderProvider, modelId)
@@ -554,6 +575,10 @@ export class CodeIndexConfigManager {
 		}
 
 		return modelDimension
+	}
+
+	public get currentRespectGitIgnore(): boolean {
+		return this.respectGitIgnore
 	}
 
 	/**

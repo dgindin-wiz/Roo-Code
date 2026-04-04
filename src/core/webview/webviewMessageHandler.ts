@@ -2684,6 +2684,97 @@ export const webviewMessageHandler = async (
 			})
 			break
 		}
+		case "requestIndexingWarningDetails": {
+			const manager = provider.getCurrentWorkspaceCodeIndexManager()
+			if (!manager) {
+				provider.postMessageToWebview({
+					type: "indexingWarningDetails",
+					values: {
+						workspacePath: undefined,
+						offset: message.values?.offset ?? 0,
+						limit: message.values?.limit ?? 20,
+						filter: "all",
+						sort: "severity",
+						total: 0,
+						items: [],
+						hasMore: false,
+					},
+				})
+				break
+			}
+
+			const offset = Math.max(0, Number(message.values?.offset ?? 0))
+			const limit = Math.max(1, Math.min(50, Number(message.values?.limit ?? 20)))
+			const filter =
+				message.values?.filter === "parser_failed" ||
+				message.values?.filter === "failed" ||
+				message.values?.filter === "degraded"
+					? message.values.filter
+					: "all"
+			const sort =
+				message.values?.sort === "recent" || message.values?.sort === "path" ? message.values.sort : "severity"
+			const details = await manager.getIndexWarningDetails(offset, limit, filter, sort)
+			provider.postMessageToWebview({
+				type: "indexingWarningDetails",
+				values: {
+					workspacePath: manager.getCurrentStatus().workspacePath,
+					offset,
+					limit,
+					filter,
+					sort,
+					total: details.total,
+					items: details.items,
+					hasMore: offset + details.items.length < details.total,
+				},
+			})
+			break
+		}
+		case "retryIndexingWarnings": {
+			const manager = provider.getCurrentWorkspaceCodeIndexManager()
+			if (!manager) {
+				provider.postMessageToWebview({
+					type: "indexingStatusUpdate",
+					values: {
+						systemStatus: "Error",
+						message: t("embeddings:orchestrator.indexingRequiresWorkspace"),
+						processedItems: 0,
+						totalItems: 0,
+						currentItemUnit: "items",
+					},
+				})
+				break
+			}
+
+			const filter =
+				message.values?.filter === "parser_failed" ||
+				message.values?.filter === "failed" ||
+				message.values?.filter === "degraded"
+					? message.values.filter
+					: "all"
+			const relativePaths = Array.isArray(message.values?.relativePaths)
+				? message.values.relativePaths.filter(
+						(value): value is string => typeof value === "string" && value.length > 0,
+					)
+				: []
+
+			try {
+				await manager.setWorkspaceEnabled(true)
+				if (!manager.isInitialized && manager.isFeatureEnabled && manager.isFeatureConfigured) {
+					await manager.initialize(provider.contextProxy)
+				}
+				await manager.retryIndexWarningFiles(filter, relativePaths)
+			} catch (error) {
+				provider.log(
+					`Error retrying indexing warnings: ${error instanceof Error ? error.message : String(error)}`,
+				)
+			}
+
+			provider.postMessageToWebview({
+				type: "indexingStatusUpdate",
+				values: manager.getCurrentStatus(),
+			})
+			break
+		}
 		case "requestCodeIndexSecretStatus": {
 			// Check if secrets are set using the VSCode context directly for async access
 			const hasOpenAiKey = !!(await provider.context.secrets.get("codeIndexOpenAiKey"))

@@ -19,6 +19,8 @@ import { TelemetryEventName } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 import { Mutex } from "async-mutex"
 import { handleOpenAIError } from "../../../api/providers/utils/openai-error-handler"
+import { IndexDebugLoggerV2 } from "../../code-index-v2/logging/IndexDebugLoggerV2"
+import { EmbedderCreateEmbeddingsOptions } from "../interfaces/embedder"
 
 interface EmbeddingItem {
 	embedding: string | number[]
@@ -129,9 +131,10 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 	async createEmbeddings(
 		texts: string[],
 		model?: string,
-		options?: { isQuery?: boolean },
+		options?: EmbedderCreateEmbeddingsOptions,
 	): Promise<EmbeddingResponse> {
 		const modelToUse = model || this.defaultModelId
+		const requestStartedAt = Date.now()
 
 		// Apply model-specific query prefix only for search queries (asymmetric embedding)
 		// Document embeddings during indexing should NOT get the query prefix
@@ -162,6 +165,23 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 		const allEmbeddings: number[][] = []
 		const usage = { promptTokens: 0, totalTokens: 0 }
 		const remainingTexts = [...processedTexts]
+		let providerRequests = 0
+		let providerRequestLatencyMs = 0
+		let peakProviderRequestLatencyMs = 0
+		let maxProviderRequestBatchSize = 0
+		let maxProviderRequestTokens = 0
+
+		IndexDebugLoggerV2.log("basic", "OpenAICompatibleEmbedder", "embedder-create-start", {
+			component: "OpenAICompatibleEmbedder",
+			runId: options?.debugContext?.runId,
+			jobId: options?.debugContext?.batchId,
+			provider: "openai-compatible",
+			modelId: modelToUse,
+			outerBatchSize: options?.debugContext?.outerBatchSize ?? texts.length,
+			inputTexts: texts.length,
+			processedTexts: processedTexts.length,
+			isQuery: options?.isQuery ?? false,
+		})
 
 		while (remainingTexts.length > 0) {
 			const currentBatch: string[] = []
@@ -199,12 +219,49 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 			}
 
 			if (currentBatch.length > 0) {
-				const batchResult = await this._embedBatchWithRetries(currentBatch, modelToUse)
+				const batchResult = await this._embedBatchWithRetries(currentBatch, modelToUse, options?.debugContext)
 				allEmbeddings.push(...batchResult.embeddings)
 				usage.promptTokens += batchResult.usage.promptTokens
 				usage.totalTokens += batchResult.usage.totalTokens
+				providerRequests++
+				providerRequestLatencyMs += batchResult.requestLatencyMs
+				peakProviderRequestLatencyMs = Math.max(peakProviderRequestLatencyMs, batchResult.requestLatencyMs)
+				maxProviderRequestBatchSize = Math.max(maxProviderRequestBatchSize, currentBatch.length)
+				maxProviderRequestTokens = Math.max(maxProviderRequestTokens, currentBatchTokens)
+
+				IndexDebugLoggerV2.log("basic", "OpenAICompatibleEmbedder", "embedder-provider-batch", {
+					component: "OpenAICompatibleEmbedder",
+					runId: options?.debugContext?.runId,
+					jobId: options?.debugContext?.batchId,
+					provider: "openai-compatible",
+					modelId: modelToUse,
+					providerRequestIndex: providerRequests,
+					providerBatchSize: currentBatch.length,
+					providerBatchTokens: currentBatchTokens,
+					providerRequestLatencyMs: batchResult.requestLatencyMs,
+					providerPromptTokens: batchResult.usage.promptTokens,
+					providerTotalTokens: batchResult.usage.totalTokens,
+				})
 			}
 		}
+
+		IndexDebugLoggerV2.log("basic", "OpenAICompatibleEmbedder", "embedder-create-complete", {
+			component: "OpenAICompatibleEmbedder",
+			runId: options?.debugContext?.runId,
+			jobId: options?.debugContext?.batchId,
+			provider: "openai-compatible",
+			modelId: modelToUse,
+			outerBatchSize: options?.debugContext?.outerBatchSize ?? texts.length,
+			inputTexts: texts.length,
+			outputEmbeddings: allEmbeddings.length,
+			providerRequests,
+			totalProviderLatencyMs: providerRequestLatencyMs,
+			averageProviderLatencyMs: providerRequests > 0 ? providerRequestLatencyMs / providerRequests : undefined,
+			peakProviderLatencyMs: peakProviderRequestLatencyMs > 0 ? peakProviderRequestLatencyMs : undefined,
+			maxProviderRequestBatchSize: maxProviderRequestBatchSize > 0 ? maxProviderRequestBatchSize : undefined,
+			maxProviderRequestTokens: maxProviderRequestTokens > 0 ? maxProviderRequestTokens : undefined,
+			totalElapsedMs: Date.now() - requestStartedAt,
+		})
 
 		return { embeddings: allEmbeddings, usage }
 	}
@@ -306,7 +363,12 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 	private async _embedBatchWithRetries(
 		batchTexts: string[],
 		model: string,
-	): Promise<{ embeddings: number[][]; usage: { promptTokens: number; totalTokens: number } }> {
+		debugContext?: EmbedderCreateEmbeddingsOptions["debugContext"],
+	): Promise<{
+		embeddings: number[][]
+		usage: { promptTokens: number; totalTokens: number }
+		requestLatencyMs: number
+	}> {
 		// Use cached value for performance
 		const isFullUrl = this.isFullUrl
 
@@ -316,6 +378,7 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 
 			try {
 				let response: OpenAIEmbeddingResponse
+				const requestStartedAt = Date.now()
 
 				if (isFullUrl) {
 					// Use direct HTTP request for full endpoint URLs
@@ -331,6 +394,7 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 						encoding_format: "base64",
 					})) as OpenAIEmbeddingResponse
 				}
+				const requestLatencyMs = Date.now() - requestStartedAt
 
 				// Decode base64 embeddings to number[] in a single pass —
 				// no intermediate object spread or second .map() needed.
@@ -349,6 +413,7 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 						promptTokens: response.usage?.prompt_tokens || 0,
 						totalTokens: response.usage?.total_tokens || 0,
 					},
+					requestLatencyMs,
 				}
 			} catch (error) {
 				// Capture telemetry before error is reformatted
@@ -381,6 +446,17 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 								maxRetries: MAX_RETRIES,
 							}),
 						)
+						IndexDebugLoggerV2.log("basic", "OpenAICompatibleEmbedder", "embedder-provider-retry", {
+							component: "OpenAICompatibleEmbedder",
+							runId: debugContext?.runId,
+							jobId: debugContext?.batchId,
+							provider: "openai-compatible",
+							modelId: model,
+							attempt: attempts + 1,
+							delayMs,
+							providerBatchSize: batchTexts.length,
+							errorMessage: error instanceof Error ? error.message : String(error),
+						})
 						await new Promise((resolve) => setTimeout(resolve, delayMs))
 						continue
 					}

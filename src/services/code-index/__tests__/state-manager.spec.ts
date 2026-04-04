@@ -395,6 +395,76 @@ describe("CodeIndexStateManager", () => {
 				vi.restoreAllMocks()
 			})
 		})
+
+		describe("estimation confidence", () => {
+			it("should allow estimated runs to reach medium confidence once parsing coverage and throughput stabilize", () => {
+				const now = Date.now()
+				vi.spyOn(Date, "now").mockReturnValue(now)
+
+				stateManager.reportScanProgress(0, 1000)
+				stateManager.startEmbedPhase(5000, true, undefined, undefined, { runtimeKind: "local" })
+
+				vi.spyOn(Date, "now").mockReturnValue(now + 1000)
+				stateManager.reportEmbedProgress(500, 5000, 250)
+
+				vi.spyOn(Date, "now").mockReturnValue(now + 2000)
+				stateManager.reportEmbedProgress(1000, 5000, 300)
+
+				vi.spyOn(Date, "now").mockReturnValue(now + 3000)
+				stateManager.reportEmbedProgress(1500, 5000, 360)
+
+				const status = stateManager.getCurrentStatus()
+				expect(status.estimationConfidence).toBe("medium")
+				expect(status.isBackpressured).toBe(false)
+
+				vi.restoreAllMocks()
+			})
+
+			it("should keep confidence low when backpressured before the estimate has enough coverage", () => {
+				const now = Date.now()
+				vi.spyOn(Date, "now").mockReturnValue(now)
+
+				stateManager.reportScanProgress(0, 1000)
+				stateManager.startEmbedPhase(5000, true, undefined, undefined, { runtimeKind: "local" })
+				stateManager.reportEmbedProgress(100, 5000, 50)
+
+				vi.spyOn(Date, "now").mockReturnValue(now + 3000)
+				stateManager.reportEmbedProgress(200, 5000, 50)
+
+				const status = stateManager.getCurrentStatus()
+				expect(status.estimationConfidence).toBe("low")
+				expect(status.isBackpressured).toBe(true)
+
+				vi.restoreAllMocks()
+			})
+
+			it("should not force stable estimated runs back to low confidence solely because of backpressure", () => {
+				const now = Date.now()
+				vi.spyOn(Date, "now").mockReturnValue(now)
+
+				stateManager.reportScanProgress(0, 1000)
+				stateManager.startEmbedPhase(5000, true, undefined, undefined, { runtimeKind: "local" })
+
+				vi.spyOn(Date, "now").mockReturnValue(now + 1000)
+				stateManager.reportEmbedProgress(500, 5000, 300)
+
+				vi.spyOn(Date, "now").mockReturnValue(now + 2000)
+				stateManager.reportEmbedProgress(1000, 5000, 450)
+
+				vi.spyOn(Date, "now").mockReturnValue(now + 3000)
+				stateManager.reportEmbedProgress(1500, 5000, 550)
+
+				vi.spyOn(Date, "now").mockReturnValue(now + 6000)
+				stateManager.reportEmbedProgress(2000, 5000, 550)
+
+				const status = stateManager.getCurrentStatus()
+				expect(status.estimationConfidence).toBe("medium")
+				expect(status.isBackpressured).toBe(true)
+				expect(status.message).toContain("waiting for embeddings")
+
+				vi.restoreAllMocks()
+			})
+		})
 	})
 
 	describe("ETA extrapolation (from-scratch index)", () => {

@@ -3,6 +3,26 @@ import { CodeIndexServiceFactory } from "../service-factory"
 import type { MockedClass } from "vitest"
 import * as path from "path"
 
+const { mockCodeIndexEngineV2, MockedCodeIndexEngineV2Class } = vi.hoisted(() => {
+	const engine = {
+		start: vi.fn().mockResolvedValue(undefined),
+		stop: vi.fn().mockResolvedValue(undefined),
+		clear: vi.fn().mockResolvedValue(undefined),
+		search: vi.fn().mockResolvedValue([]),
+		enqueuePathsChanged: vi.fn().mockResolvedValue(undefined),
+		getStatus: vi.fn().mockResolvedValue({
+			engine: "v2",
+			state: "idle",
+			message: "Code Index V2 ready",
+		}),
+	}
+
+	return {
+		mockCodeIndexEngineV2: engine,
+		MockedCodeIndexEngineV2Class: vi.fn(() => engine),
+	}
+})
+
 // Helper: create a mock vscode.Uri from an fsPath
 function mockUri(fsPath: string, scheme = "file") {
 	return {
@@ -89,11 +109,25 @@ vi.mock("ignore", () => ({
 
 vi.mock("../state-manager", () => ({
 	CodeIndexStateManager: vi.fn().mockImplementation(() => ({
+		startIndexingTimer: vi.fn(),
+		reportCustomProgress: vi.fn(),
+		reportScanProgress: vi.fn(),
+		startEmbedPhase: vi.fn(),
+		reportEmbedProgress: vi.fn(),
+		reportComplete: vi.fn(),
 		onProgressUpdate: vi.fn(),
 		getCurrentStatus: vi.fn(),
 		dispose: vi.fn(),
 		setSystemState: vi.fn(),
+		setResilienceStats: vi.fn(),
 	})),
+}))
+
+vi.mock("../../code-index-v2", () => ({
+	CodeIndexEngineV2: MockedCodeIndexEngineV2Class,
+	IndexDebugLoggerV2: {
+		log: vi.fn(),
+	},
 }))
 
 // Mock TelemetryService
@@ -122,6 +156,17 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 	beforeEach(() => {
 		// Clear all instances before each test
 		CodeIndexManager.disposeAll()
+		vi.clearAllMocks()
+		mockCodeIndexEngineV2.start.mockResolvedValue(undefined)
+		mockCodeIndexEngineV2.stop.mockResolvedValue(undefined)
+		mockCodeIndexEngineV2.clear.mockResolvedValue(undefined)
+		mockCodeIndexEngineV2.search.mockResolvedValue([])
+		mockCodeIndexEngineV2.enqueuePathsChanged.mockResolvedValue(undefined)
+		mockCodeIndexEngineV2.getStatus.mockResolvedValue({
+			engine: "v2",
+			state: "idle",
+			message: "Code Index V2 ready",
+		})
 
 		const workspaceStateStore: Record<string, any> = {}
 		const globalStateStore: Record<string, any> = {}
@@ -321,6 +366,144 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 
 			// This should not throw an error
 			await expect(manager.handleSettingsChange()).resolves.not.toThrow()
+		})
+	})
+
+	describe("v2 engine delegation", () => {
+		let mockConfigManager: any
+		let mockStateManager: any
+
+		beforeEach(() => {
+			mockConfigManager = {
+				loadConfiguration: vi.fn().mockResolvedValue({ requiresRestart: false }),
+				isFeatureConfigured: true,
+				isFeatureEnabled: true,
+			}
+			;(manager as any)._configManager = mockConfigManager
+			mockStateManager = (manager as any)._stateManager
+			mockStateManager.setSystemState = vi.fn()
+			vi.spyOn(manager, "selectedEngine", "get").mockReturnValue("v2" as any)
+		})
+
+		it("initializes and starts the v2 engine when selected", async () => {
+			const mockContextProxy = { refreshSecrets: vi.fn() } as any
+
+			const result = await manager.initialize(mockContextProxy)
+
+			expect(result).toEqual({ requiresRestart: false })
+			expect(MockedCodeIndexEngineV2Class).toHaveBeenCalledWith(
+				mockContext,
+				testWorkspacePath,
+				mockConfigManager,
+				expect.any(Object),
+			)
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+			expect(mockCodeIndexEngineV2.getStatus).toHaveBeenCalledTimes(1)
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "Code Index V2 ready")
+		})
+
+		it("delegates start, search, and clear to the v2 engine", async () => {
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+			mockCodeIndexEngineV2.getStatus.mockResolvedValue({
+				engine: "v2",
+				state: "idle",
+				message: "V2 updated",
+			})
+			mockCodeIndexEngineV2.search.mockResolvedValue([
+				{
+					id: "point-1",
+					score: 0.88,
+					payload: {
+						filePath: "src/example.ts",
+						codeChunk: "const value = 1",
+						startLine: 1,
+						endLine: 1,
+					},
+				},
+			])
+
+			await manager.startIndexing()
+			const results = await manager.searchIndex("find value")
+			await manager.clearIndexData()
+
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "V2 updated")
+			expect(mockCodeIndexEngineV2.search).toHaveBeenCalledWith("find value", 50)
+			expect(results).toHaveLength(1)
+			expect(mockCodeIndexEngineV2.clear).toHaveBeenCalledTimes(1)
+		})
+
+		it("delegates stopIndexing to the v2 engine", () => {
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+
+			expect(() => manager.stopIndexing()).not.toThrow()
+			expect(mockCodeIndexEngineV2.stop).toHaveBeenCalledTimes(1)
+		})
+
+		it("preserves structured warning and resume counts in manager status", async () => {
+			await manager.setWorkspaceEnabled(true)
+
+			mockStateManager.getCurrentStatus = vi.fn().mockReturnValue({
+				systemStatus: "Indexed",
+				message: "V2 mapped 66,017 files with warnings",
+				processedItems: 210709,
+				totalItems: 210709,
+				currentItemUnit: "blocks",
+				phase: "complete",
+				totalFiles: 66017,
+				totalBlocks: 210709,
+				resumedRetryJobs: 4,
+				resumedPendingJobs: 0,
+				retryingParseRevisions: 2,
+				terminalFailedParseRevisions: 3,
+				degradedRevisions: 5,
+				terminalFailedRevisions: 1,
+				terminallyFailedChunks: 7,
+				retryingChunks: 2,
+			})
+
+			const status = manager.getCurrentStatus()
+
+			expect(status.workspaceEnabled).toBe(true)
+			expect(status.totalFiles).toBe(66017)
+			expect(status.totalBlocks).toBe(210709)
+			expect(status.resumedRetryJobs).toBe(4)
+			expect(status.resumedPendingJobs).toBe(0)
+			expect(status.retryingParseRevisions).toBe(2)
+			expect(status.terminalFailedParseRevisions).toBe(3)
+			expect(status.degradedRevisions).toBe(5)
+			expect(status.terminalFailedRevisions).toBe(1)
+			expect(status.terminallyFailedChunks).toBe(7)
+			expect(status.retryingChunks).toBe(2)
+		})
+
+		it("surfaces indexed-with-warnings status from a restarted v2 engine", async () => {
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+			mockCodeIndexEngineV2.getStatus.mockResolvedValueOnce({
+				engine: "v2",
+				state: "idle",
+				message:
+					"V2 mapped 66,017 files, refreshed 57,625 changed files, and synced 210,709 chunks with warnings (3 parser-failed files, 5 degraded files, 1 failed file)",
+			})
+
+			await manager.startIndexing()
+
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+			expect(mockCodeIndexEngineV2.getStatus).toHaveBeenCalledTimes(1)
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith(
+				"Standby",
+				"V2 mapped 66,017 files, refreshed 57,625 changed files, and synced 210,709 chunks with warnings (3 parser-failed files, 5 degraded files, 1 failed file)",
+			)
+		})
+
+		it("moves a restarted v2 engine into error state when startup fails", async () => {
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+			mockCodeIndexEngineV2.start.mockRejectedValueOnce(new Error("resume adoption failed"))
+
+			await expect(manager.startIndexing()).rejects.toThrow("resume adoption failed")
+
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Indexing", "Code Index V2 is running...")
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Error", "resume adoption failed")
 		})
 	})
 

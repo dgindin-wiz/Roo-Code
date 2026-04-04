@@ -439,7 +439,7 @@ describe("CodeIndexServiceFactory", () => {
 			)
 		})
 
-		it("should prioritize getModelDimension over manual modelDimension for OpenAI Compatible provider", () => {
+		it("should prioritize manual modelDimension over catalog dimension for OpenAI Compatible provider", () => {
 			// Arrange
 			const testModelId = "custom-model"
 			const manualDimension = 1024
@@ -447,7 +447,7 @@ describe("CodeIndexServiceFactory", () => {
 			const testConfig = {
 				embedderProvider: "openai-compatible",
 				modelId: testModelId,
-				modelDimension: manualDimension, // This should be ignored when model has built-in dimension
+				modelDimension: manualDimension,
 				openAiCompatibleOptions: {
 					baseUrl: "https://api.example.com/v1",
 					apiKey: "test-api-key",
@@ -462,11 +462,11 @@ describe("CodeIndexServiceFactory", () => {
 			factory.createVectorStore()
 
 			// Assert
-			expect(mockGetModelDimension).toHaveBeenCalledWith("openai-compatible", testModelId)
+			expect(mockGetModelDimension).not.toHaveBeenCalled()
 			expect(MockedQdrantVectorStore).toHaveBeenCalledWith(
 				"/test/workspace",
 				"http://localhost:6333",
-				modelDimension, // Should use model's built-in dimension, not manual
+				manualDimension,
 				"test-key",
 			)
 		})
@@ -493,7 +493,7 @@ describe("CodeIndexServiceFactory", () => {
 			factory.createVectorStore()
 
 			// Assert
-			expect(mockGetModelDimension).toHaveBeenCalledWith("openai-compatible", testModelId)
+			expect(mockGetModelDimension).not.toHaveBeenCalled()
 			expect(MockedQdrantVectorStore).toHaveBeenCalledWith(
 				"/test/workspace",
 				"http://localhost:6333",

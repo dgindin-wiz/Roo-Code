@@ -607,6 +607,235 @@ describe("webviewMessageHandler - requestOpenAiCodexRateLimits", () => {
 	})
 })
 
+describe("webviewMessageHandler - indexing flows", () => {
+	beforeEach(() => {
+		vi.clearAllMocks()
+	})
+
+	it("returns the current indexing status, including warning counts and details", async () => {
+		const mockManager = {
+			getCurrentStatus: vi.fn().mockReturnValue({
+				systemStatus: "Indexed",
+				message: "V2 mapped 66,017 files with warnings",
+				processedItems: 210709,
+				totalItems: 210709,
+				currentItemUnit: "blocks",
+				resumedRetryJobs: 4,
+				resumedPendingJobs: 0,
+				degradedRevisions: 5,
+				terminalFailedRevisions: 1,
+				warningDetails: [
+					{
+						relativePath: "src/problematic/parser.ts",
+						state: "terminal_failed",
+						failureReason: "Maximum call stack size exceeded",
+					},
+					{
+						relativePath: "src/problematic/embed.ts",
+						state: "degraded",
+						failureReason: "One chunk permanently failed to embed",
+					},
+				],
+			}),
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "requestIndexingStatus",
+		} as any)
+
+		expect(mockManager.getCurrentStatus).toHaveBeenCalledTimes(1)
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "indexingStatusUpdate",
+			values: expect.objectContaining({
+				systemStatus: "Indexed",
+				resumedRetryJobs: 4,
+				resumedPendingJobs: 0,
+				degradedRevisions: 5,
+				terminalFailedRevisions: 1,
+				warningDetails: [
+					expect.objectContaining({
+						relativePath: "src/problematic/parser.ts",
+						state: "terminal_failed",
+					}),
+					expect.objectContaining({
+						relativePath: "src/problematic/embed.ts",
+						state: "degraded",
+					}),
+				],
+			}),
+		})
+	})
+
+	it("starts indexing, enables the workspace, and posts the updated status", async () => {
+		const mockManager = {
+			setWorkspaceEnabled: vi.fn().mockResolvedValue(undefined),
+			initialize: vi.fn().mockResolvedValue(undefined),
+			startIndexing: vi.fn(),
+			getCurrentStatus: vi.fn().mockReturnValue({
+				systemStatus: "Indexed",
+				message:
+					"V2 mapped 66,017 files, refreshed 57,625 changed files, and synced 210,709 chunks with warnings",
+				processedItems: 210709,
+				totalItems: 210709,
+				currentItemUnit: "blocks",
+				resumedRetryJobs: 4,
+				resumedPendingJobs: 0,
+				terminalFailedParseRevisions: 3,
+				degradedRevisions: 5,
+				terminalFailedRevisions: 1,
+			}),
+			isFeatureEnabled: true,
+			isFeatureConfigured: true,
+			isInitialized: true,
+			state: "Standby",
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "startIndexing",
+		} as any)
+
+		expect(mockManager.setWorkspaceEnabled).toHaveBeenCalledWith(true)
+		expect(mockManager.initialize).toHaveBeenCalledWith(mockClineProvider.contextProxy)
+		expect(mockManager.startIndexing).toHaveBeenCalledTimes(1)
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "indexingStatusUpdate",
+			values: expect.objectContaining({
+				systemStatus: "Indexed",
+				resumedRetryJobs: 4,
+				resumedPendingJobs: 0,
+				terminalFailedParseRevisions: 3,
+				degradedRevisions: 5,
+				terminalFailedRevisions: 1,
+			}),
+		})
+	})
+
+	it("returns paginated indexing warning details on demand", async () => {
+		const mockManager = {
+			getIndexWarningDetails: vi.fn().mockResolvedValue({
+				total: 27,
+				items: [
+					{
+						relativePath: "src/problematic/parser.ts",
+						state: "terminal_failed",
+						failureReason: "Maximum call stack size exceeded",
+					},
+					{
+						relativePath: "src/problematic/embed.ts",
+						state: "degraded",
+						failureReason: "One chunk permanently failed to embed",
+					},
+				],
+			}),
+			getCurrentStatus: vi.fn().mockReturnValue({
+				workspacePath: "/mock/workspace",
+			}),
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "requestIndexingWarningDetails",
+			values: {
+				offset: 20,
+				limit: 10,
+				filter: "failed",
+				sort: "path",
+			},
+		} as any)
+
+		expect(mockManager.getIndexWarningDetails).toHaveBeenCalledWith(20, 10, "failed", "path")
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "indexingWarningDetails",
+			values: {
+				workspacePath: "/mock/workspace",
+				offset: 20,
+				limit: 10,
+				filter: "failed",
+				sort: "path",
+				total: 27,
+				items: [
+					expect.objectContaining({
+						relativePath: "src/problematic/parser.ts",
+						state: "terminal_failed",
+					}),
+					expect.objectContaining({
+						relativePath: "src/problematic/embed.ts",
+						state: "degraded",
+					}),
+				],
+				hasMore: true,
+			},
+		})
+	})
+
+	it("retries only warning-state files for the selected filter", async () => {
+		const mockManager = {
+			setWorkspaceEnabled: vi.fn().mockResolvedValue(undefined),
+			initialize: vi.fn().mockResolvedValue(undefined),
+			retryIndexWarningFiles: vi.fn().mockResolvedValue({ retriedFiles: 5 }),
+			getCurrentStatus: vi.fn().mockReturnValue({
+				systemStatus: "Indexed",
+				message: "Scoped warning retry completed",
+				processedItems: 210709,
+				totalItems: 210709,
+				currentItemUnit: "blocks",
+			}),
+			isFeatureEnabled: true,
+			isFeatureConfigured: true,
+			isInitialized: true,
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "retryIndexingWarnings",
+			values: {
+				filter: "parser_failed",
+			},
+		} as any)
+
+		expect(mockManager.setWorkspaceEnabled).toHaveBeenCalledWith(true)
+		expect(mockManager.retryIndexWarningFiles).toHaveBeenCalledWith("parser_failed", [])
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "indexingStatusUpdate",
+			values: expect.objectContaining({
+				systemStatus: "Indexed",
+				message: "Scoped warning retry completed",
+			}),
+		})
+	})
+
+	it("retries a single warning file when relative paths are provided", async () => {
+		const mockManager = {
+			setWorkspaceEnabled: vi.fn().mockResolvedValue(undefined),
+			initialize: vi.fn().mockResolvedValue(undefined),
+			retryIndexWarningFiles: vi.fn().mockResolvedValue({ retriedFiles: 1 }),
+			getCurrentStatus: vi.fn().mockReturnValue({
+				systemStatus: "Indexed",
+				message: "Single-file warning retry completed",
+				processedItems: 210709,
+				totalItems: 210709,
+				currentItemUnit: "blocks",
+			}),
+			isFeatureEnabled: true,
+			isFeatureConfigured: true,
+			isInitialized: true,
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "retryIndexingWarnings",
+			values: {
+				filter: "failed",
+				relativePaths: ["src/problematic/embed.ts"],
+			},
+		} as any)
+
+		expect(mockManager.retryIndexWarningFiles).toHaveBeenCalledWith("failed", ["src/problematic/embed.ts"])
+	})
+})
+
 describe("webviewMessageHandler - deleteCustomMode", () => {
 	beforeEach(() => {
 		vi.clearAllMocks()

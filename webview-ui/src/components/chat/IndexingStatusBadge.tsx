@@ -31,6 +31,10 @@ function formatEtaForDisplay(ms: number): string {
 	return `~${hours}h ${remainingMinutes}m remaining`
 }
 
+function formatCountLabel(count: number, singular: string, plural: string): string {
+	return `${count.toLocaleString()} ${count === 1 ? singular : plural}`
+}
+
 export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ className }) => {
 	const { t } = useAppTranslation()
 	const { cwd } = useExtensionState()
@@ -63,35 +67,116 @@ export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ classN
 		}
 	}, [cwd])
 
-	const progressPercentage =
+	const progressPercentage = useMemo(() => {
 		// Use block-level progress during embedding (uniform cost per block → accurate ETA)
-		indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0
-			? Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100)
-			: indexingStatus.totalItems > 0
-				? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
-				: 0
+		if (indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0) {
+			return Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100)
+		}
+		// Fall back to legacy fields
+		return indexingStatus.totalItems > 0
+			? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
+			: 0
+	}, [
+		indexingStatus.phase,
+		indexingStatus.blocksEmbedded,
+		indexingStatus.totalBlocks,
+		indexingStatus.processedItems,
+		indexingStatus.totalItems,
+	])
+	const isCurrentStandby = useMemo(
+		() =>
+			(indexingStatus.systemStatus === "Standby" &&
+				/^(?:V2 is current(?: across| after a partial scan of)|V2 mapped )/.test(
+					indexingStatus.message ?? "",
+				)) ||
+			(indexingStatus.systemStatus === "Indexed" &&
+				/^Index up-to-date(?:\.| —|$)/.test(indexingStatus.message ?? "")),
+		[indexingStatus.message, indexingStatus.systemStatus],
+	)
 
 	const tooltipText = useMemo(() => {
+		const extraParts: string[] = []
+		if ((indexingStatus.resumedPendingJobs ?? 0) > 0) {
+			extraParts.push(
+				`resuming ${formatCountLabel(indexingStatus.resumedPendingJobs ?? 0, "unfinished job", "unfinished jobs")} from the previous run`,
+			)
+		}
+		if ((indexingStatus.terminalFailedParseRevisions ?? 0) > 0) {
+			extraParts.push(
+				formatCountLabel(
+					indexingStatus.terminalFailedParseRevisions ?? 0,
+					"parser-failed file",
+					"parser-failed files",
+				),
+			)
+		}
+		if ((indexingStatus.degradedRevisions ?? 0) > 0) {
+			extraParts.push(formatCountLabel(indexingStatus.degradedRevisions ?? 0, "degraded file", "degraded files"))
+		}
+		if ((indexingStatus.terminalFailedRevisions ?? 0) > 0) {
+			extraParts.push(
+				formatCountLabel(indexingStatus.terminalFailedRevisions ?? 0, "failed file", "failed files"),
+			)
+		}
+		const extraText = extraParts.length > 0 ? ` — ${extraParts.join(", ")}` : ""
+
 		switch (indexingStatus.systemStatus) {
 			case "Standby":
-				return t("chat:indexingStatus.ready")
+				return isCurrentStandby
+					? `Index ready — watching for changes${extraText}`
+					: `${t("chat:indexingStatus.ready")}${extraText}`
 			case "Indexing": {
 				const etaText =
 					indexingStatus.estimatedTimeRemainingMs != null
 						? ` — ${formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}`
 						: ""
-				return `${t("chat:indexingStatus.indexing", { percentage: progressPercentage })}${etaText}`
+				const confidenceText = indexingStatus.estimationConfidence
+					? ` (${indexingStatus.estimationConfidence} confidence)`
+					: ""
+				const backpressureText = indexingStatus.isBackpressured ? " — waiting on embedding throughput" : ""
+				if (indexingStatus.phase === "scanning") {
+					const processed = indexingStatus.processedItems ?? indexingStatus.processedFiles ?? 0
+					const total = indexingStatus.totalItems ?? indexingStatus.totalFiles ?? processed
+					return `Scanning workspace — ${processed.toLocaleString()} of ${total.toLocaleString()} files${etaText}${confidenceText}${extraText}`
+				}
+				if (indexingStatus.phase === "embedding") {
+					const embedded = indexingStatus.blocksEmbedded ?? 0
+					const totalBlocks = indexingStatus.totalBlocks ?? embedded
+					return `Embedding vectors — ${embedded.toLocaleString()} of ${totalBlocks.toLocaleString()} blocks${etaText}${confidenceText}${backpressureText}${extraText}`
+				}
+				return `${t("chat:indexingStatus.indexing", { percentage: progressPercentage })}${etaText}${confidenceText}${extraText}`
 			}
 			case "Indexed":
-				return t("chat:indexingStatus.indexed")
+				return isCurrentStandby
+					? `Index ready — watching for changes${extraText}`
+					: `${t("chat:indexingStatus.indexed")}${extraText}`
 			case "Stopping":
 				return t("chat:indexingStatus.stopping")
 			case "Error":
-				return t("chat:indexingStatus.error")
+				return `${t("chat:indexingStatus.error")}${extraText}`
 			default:
-				return t("chat:indexingStatus.status")
+				return `${t("chat:indexingStatus.status")}${extraText}`
 		}
-	}, [indexingStatus.systemStatus, indexingStatus.estimatedTimeRemainingMs, progressPercentage, t])
+	}, [
+		indexingStatus.degradedRevisions,
+		indexingStatus.blocksEmbedded,
+		indexingStatus.estimationConfidence,
+		indexingStatus.estimatedTimeRemainingMs,
+		indexingStatus.isBackpressured,
+		indexingStatus.phase,
+		indexingStatus.processedFiles,
+		indexingStatus.processedItems,
+		indexingStatus.resumedPendingJobs,
+		indexingStatus.systemStatus,
+		indexingStatus.terminalFailedParseRevisions,
+		indexingStatus.terminalFailedRevisions,
+		indexingStatus.totalBlocks,
+		indexingStatus.totalFiles,
+		indexingStatus.totalItems,
+		isCurrentStandby,
+		progressPercentage,
+		t,
+	])
 
 	const statusColorClass = useMemo(() => {
 		const statusColors = {
@@ -102,8 +187,11 @@ export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ classN
 			Error: "bg-red-500",
 		}
 
+		if (isCurrentStandby) {
+			return statusColors.Indexed
+		}
 		return statusColors[indexingStatus.systemStatus as keyof typeof statusColors] || statusColors.Standby
-	}, [indexingStatus.systemStatus])
+	}, [indexingStatus.systemStatus, isCurrentStandby])
 
 	return (
 		<CodeIndexPopover indexingStatus={indexingStatus}>

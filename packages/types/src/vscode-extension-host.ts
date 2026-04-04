@@ -74,6 +74,7 @@ export interface ExtensionMessage {
 		| "singleRouterModelFetchResponse"
 		| "rooCreditBalance"
 		| "indexingStatusUpdate"
+		| "indexingWarningDetails"
 		| "indexCleared"
 		| "codebaseIndexConfig"
 		| "marketplaceInstallResult"
@@ -510,10 +511,13 @@ export interface WebviewMessage {
 		| "switchOrganization"
 		| "condenseTaskContextRequest"
 		| "requestIndexingStatus"
+		| "requestIndexingWarningDetails"
+		| "retryIndexingWarnings"
 		| "startIndexing"
 		| "stopIndexing"
 		| "clearIndexData"
 		| "indexingStatusUpdate"
+		| "indexingWarningDetails"
 		| "indexCleared"
 		| "toggleWorkspaceIndexing"
 		| "setAutoEnableDefault"
@@ -758,11 +762,41 @@ export interface IndexingStatus {
 	blocksEmbedded?: number
 	estimatedTimeRemainingMs?: number | null
 	isEstimatedTotal?: boolean
+	estimationConfidence?: "low" | "medium" | "high"
+	isBackpressured?: boolean
+	resumedRetryJobs?: number
+	resumedPendingJobs?: number
+	retryingParseRevisions?: number
+	terminalFailedParseRevisions?: number
+	degradedRevisions?: number
+	terminalFailedRevisions?: number
+	terminallyFailedChunks?: number
+	retryingChunks?: number
+	warningDetails?: Array<{
+		relativePath: string
+		state: "degraded" | "terminal_failed" | "failed"
+		category?: "parser_failed" | "failed" | "degraded"
+		failureReason?: string | null
+	}>
 }
 
 export interface IndexingStatusUpdateMessage {
 	type: "indexingStatusUpdate"
 	values: IndexingStatus
+}
+
+export interface IndexingWarningDetailsMessage {
+	type: "indexingWarningDetails"
+	values: {
+		workspacePath?: string
+		offset: number
+		limit: number
+		filter: "all" | "parser_failed" | "failed" | "degraded"
+		sort: "severity" | "recent" | "path"
+		total: number
+		items: NonNullable<IndexingStatus["warningDetails"]>
+		hasMore: boolean
+	}
 }
 
 export interface LanguageModelChatSelector {

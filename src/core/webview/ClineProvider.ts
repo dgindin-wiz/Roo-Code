@@ -2328,6 +2328,21 @@ export class ClineProvider
 				codebaseIndexEmbedderBaseUrl: codebaseIndexConfig?.codebaseIndexEmbedderBaseUrl ?? "",
 				codebaseIndexEmbedderModelId: codebaseIndexConfig?.codebaseIndexEmbedderModelId ?? "",
 				codebaseIndexEmbedderModelDimension: codebaseIndexConfig?.codebaseIndexEmbedderModelDimension ?? 1536,
+				codebaseIndexMaxFiles: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<number>("codeIndex.maxFiles", 100000),
+				codebaseIndexEmbeddingBatchSize: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<number>("codeIndex.embeddingBatchSize", 60),
+				codebaseIndexDebugLogging: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<boolean>("codeIndex.debugLogging", false),
+				maximumIndexedFilesForFileSearch: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<number>("maximumIndexedFilesForFileSearch", 10000),
+				codebaseIndexRespectGitIgnore: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<boolean>("codeIndex.respectGitIgnore", true),
 				codebaseIndexOpenAiCompatibleBaseUrl: codebaseIndexConfig?.codebaseIndexOpenAiCompatibleBaseUrl,
 				codebaseIndexSearchMaxResults: codebaseIndexConfig?.codebaseIndexSearchMaxResults,
 				codebaseIndexSearchMinScore: codebaseIndexConfig?.codebaseIndexSearchMinScore,
@@ -2552,6 +2567,21 @@ export class ClineProvider
 				codebaseIndexEmbedderModelId: stateValues.codebaseIndexConfig?.codebaseIndexEmbedderModelId ?? "",
 				codebaseIndexEmbedderModelDimension:
 					stateValues.codebaseIndexConfig?.codebaseIndexEmbedderModelDimension,
+				codebaseIndexMaxFiles: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<number>("codeIndex.maxFiles", 100000),
+				codebaseIndexEmbeddingBatchSize: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<number>("codeIndex.embeddingBatchSize", 60),
+				codebaseIndexDebugLogging: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<boolean>("codeIndex.debugLogging", false),
+				maximumIndexedFilesForFileSearch: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<number>("maximumIndexedFilesForFileSearch", 10000),
+				codebaseIndexRespectGitIgnore: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<boolean>("codeIndex.respectGitIgnore", true),
 				codebaseIndexOpenAiCompatibleBaseUrl:
 					stateValues.codebaseIndexConfig?.codebaseIndexOpenAiCompatibleBaseUrl,
 				codebaseIndexSearchMaxResults: stateValues.codebaseIndexConfig?.codebaseIndexSearchMaxResults,

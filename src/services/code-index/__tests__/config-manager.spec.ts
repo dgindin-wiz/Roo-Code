@@ -3,8 +3,19 @@
 import { CodeIndexConfigManager } from "../config-manager"
 import { PreviousConfigSnapshot } from "../interfaces/config"
 
+const { mockGetRespectGitIgnore } = vi.hoisted(() => ({
+	mockGetRespectGitIgnore: vi.fn().mockReturnValue(true),
+}))
+
 // Mock ContextProxy
 vi.mock("../../../core/config/ContextProxy")
+vi.mock("vscode", () => ({
+	workspace: {
+		getConfiguration: vi.fn().mockReturnValue({
+			get: mockGetRespectGitIgnore,
+		}),
+	},
+}))
 
 // Mock embeddingModels module
 vi.mock("../../../shared/embeddingModels")
@@ -32,6 +43,7 @@ describe("CodeIndexConfigManager", () => {
 			refreshSecrets: vi.fn().mockResolvedValue(undefined),
 			updateGlobalState: vi.fn(),
 		}
+		mockGetRespectGitIgnore.mockReturnValue(true)
 
 		configManager = new CodeIndexConfigManager(mockContextProxy)
 	})
@@ -108,6 +120,7 @@ describe("CodeIndexConfigManager", () => {
 				qdrantUrl: "http://localhost:6333",
 				qdrantApiKey: "",
 				searchMinScore: 0.4,
+				respectGitIgnore: true,
 			})
 			expect(result.requiresRestart).toBe(false)
 		})
@@ -139,7 +152,39 @@ describe("CodeIndexConfigManager", () => {
 				qdrantUrl: "http://qdrant.local",
 				qdrantApiKey: "test-qdrant-key",
 				searchMinScore: 0.4,
+				respectGitIgnore: true,
 			})
+		})
+
+		it("should load respectGitIgnore from VS Code configuration", async () => {
+			mockContextProxy.getGlobalState.mockReturnValue(undefined)
+			mockGetRespectGitIgnore.mockReturnValue(false)
+
+			const result = await configManager.loadConfiguration()
+
+			expect(result.currentConfig.respectGitIgnore).toBe(false)
+			expect(configManager.currentRespectGitIgnore).toBe(false)
+		})
+
+		it("should require restart when respectGitIgnore changes", async () => {
+			mockContextProxy.getGlobalState.mockReturnValue({
+				codebaseIndexEnabled: true,
+				codebaseIndexQdrantUrl: "http://qdrant.local",
+				codebaseIndexEmbedderProvider: "openai",
+				codebaseIndexEmbedderModelId: "text-embedding-3-small",
+			})
+			setupSecretMocks({
+				codeIndexOpenAiKey: "test-openai-key",
+				codeIndexQdrantApiKey: "test-qdrant-key",
+			})
+
+			mockGetRespectGitIgnore.mockReturnValue(true)
+			await configManager.loadConfiguration()
+
+			mockGetRespectGitIgnore.mockReturnValue(false)
+			const result = await configManager.loadConfiguration()
+
+			expect(result.requiresRestart).toBe(true)
 		})
 
 		it("should load OpenAI Compatible configuration from globalState and secrets", async () => {
@@ -1734,7 +1779,29 @@ describe("CodeIndexConfigManager", () => {
 
 				// Should use custom dimension as fallback
 				expect(configManager.currentModelDimension).toBe(2048)
-				expect(mockedGetModelDimension).toHaveBeenCalledWith("openai-compatible", "custom-model")
+				expect(mockedGetModelDimension).not.toHaveBeenCalled()
+			})
+
+			it("should prioritize custom dimension for openai-compatible even when a catalog dimension exists", async () => {
+				mockedGetModelDimension.mockReturnValue(3584)
+
+				mockContextProxy.getGlobalState.mockReturnValue({
+					codebaseIndexEnabled: true,
+					codebaseIndexEmbedderProvider: "openai-compatible",
+					codebaseIndexEmbedderModelId: "nomic-embed-code",
+					codebaseIndexEmbedderModelDimension: 768,
+					codebaseIndexQdrantUrl: "http://localhost:6333",
+				})
+				mockContextProxy.getSecret.mockImplementation((key: string) => {
+					if (key === "codebaseIndexOpenAiCompatibleApiKey") return "test-key"
+					return undefined
+				})
+
+				configManager = new CodeIndexConfigManager(mockContextProxy)
+				await configManager.loadConfiguration()
+
+				expect(configManager.currentModelDimension).toBe(768)
+				expect(mockedGetModelDimension).not.toHaveBeenCalled()
 			})
 
 			it("should return undefined when neither model dimension nor custom dimension is available", async () => {

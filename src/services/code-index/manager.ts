@@ -16,6 +16,9 @@ import path from "path"
 import { t } from "../../i18n"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
+import { getConfiguredCodeIndexEngine } from "../code-index-v2/settings"
+import { CODE_INDEX_V2_ENGINE_ID, CodeIndexEngineKind } from "../code-index-v2/shared/constants"
+import { CodeIndexEngineV2, ICodeIndexEngine, IndexDebugLoggerV2 } from "../code-index-v2"
 
 export class CodeIndexManager {
 	// --- Singleton Implementation ---
@@ -28,6 +31,7 @@ export class CodeIndexManager {
 	private _orchestrator: CodeIndexOrchestrator | undefined
 	private _searchService: CodeIndexSearchService | undefined
 	private _cacheManager: CacheManager | undefined
+	private _engineV2: ICodeIndexEngine | undefined
 
 	// Flag to prevent race conditions during error recovery
 	private _isRecoveringFromError = false
@@ -171,6 +175,13 @@ export class CodeIndexManager {
 	}
 
 	private assertInitialized() {
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			if (!this._configManager || !this._engineV2) {
+				throw new Error("CodeIndexManager not initialized. Call initialize() first.")
+			}
+			return
+		}
+
 		if (!this._configManager || !this._orchestrator || !this._searchService || !this._cacheManager) {
 			throw new Error("CodeIndexManager not initialized. Call initialize() first.")
 		}
@@ -180,12 +191,21 @@ export class CodeIndexManager {
 		if (!this.isFeatureEnabled) {
 			return "Standby"
 		}
+
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			return this._stateManager.state
+		}
+
 		this.assertInitialized()
 		return this._orchestrator!.state
 	}
 
 	public get isFeatureEnabled(): boolean {
 		return this._configManager?.isFeatureEnabled ?? false
+	}
+
+	public get selectedEngine(): CodeIndexEngineKind {
+		return getConfiguredCodeIndexEngine()
 	}
 
 	public get isFeatureConfigured(): boolean {
@@ -236,6 +256,36 @@ export class CodeIndexManager {
 		if (!this.isWorkspaceEnabled) {
 			this._stateManager.setSystemState("Standby", "Indexing not enabled for this workspace")
 			return { requiresRestart }
+		}
+
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			if (!this._engineV2) {
+				this._engineV2 = new CodeIndexEngineV2(
+					this.context,
+					this.workspacePath,
+					this._configManager,
+					this._stateManager,
+				)
+			}
+
+			IndexDebugLoggerV2.log("basic", "CodeIndexManager", "initialize-v2-selected", {
+				engine: this.selectedEngine,
+				workspacePath: this.workspacePath,
+			})
+
+			this._stateManager.setSystemState("Indexing", "Initializing Code Index V2...")
+			try {
+				await this._engineV2.start()
+				const status = await this._engineV2.getStatus()
+				this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
+			} catch (error) {
+				this._stateManager.setSystemState(
+					"Error",
+					error instanceof Error ? error.message : "Code Index V2 failed to initialize",
+				)
+				throw error
+			}
+			return { requiresRestart: false }
 		}
 
 		// 5. CacheManager Initialization
@@ -291,6 +341,23 @@ export class CodeIndexManager {
 			return
 		}
 
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			this.assertInitialized()
+			this._stateManager.setSystemState("Indexing", "Code Index V2 is running...")
+			try {
+				await this._engineV2!.start()
+				const status = await this._engineV2!.getStatus()
+				this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
+			} catch (error) {
+				this._stateManager.setSystemState(
+					"Error",
+					error instanceof Error ? error.message : "Code Index V2 failed to start",
+				)
+				throw error
+			}
+			return
+		}
+
 		// Check if we're in error state and recover if needed
 		const currentStatus = this.getCurrentStatus()
 		if (currentStatus.systemStatus === "Error") {
@@ -311,6 +378,13 @@ export class CodeIndexManager {
 	 * Stops any in-progress indexing operation and the file watcher.
 	 */
 	public stopIndexing(): void {
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			if (this._engineV2) {
+				void this._engineV2.stop()
+			}
+			return
+		}
+
 		if (this._orchestrator) {
 			this._orchestrator.stopIndexing()
 		}
@@ -321,6 +395,9 @@ export class CodeIndexManager {
 	 */
 	public stopWatcher(): void {
 		if (!this.isFeatureEnabled) {
+			return
+		}
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
 			return
 		}
 		if (this._orchestrator) {
@@ -367,6 +444,7 @@ export class CodeIndexManager {
 			this._serviceFactory = undefined
 			this._orchestrator = undefined
 			this._searchService = undefined
+			this._engineV2 = undefined
 
 			// Reset the flag after recovery is complete
 			this._isRecoveringFromError = false
@@ -379,6 +457,9 @@ export class CodeIndexManager {
 	 */
 	public dispose(): void {
 		this.stopIndexing()
+		if (this._engineV2) {
+			void this._engineV2.stop()
+		}
 		// Flush pending debounced cache writes so they aren't lost on exit.
 		// Fire-and-forget since dispose() is synchronous but flush() is async.
 		if (this._cacheManager && typeof this._cacheManager.flush === "function") {
@@ -398,6 +479,12 @@ export class CodeIndexManager {
 			return
 		}
 		this.assertInitialized()
+
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			await this._engineV2!.clear()
+			return
+		}
+
 		// Stop any in-progress scan before clearing data to prevent
 		// the running scan from writing to the collection while we delete it.
 		this.stopIndexing()
@@ -417,11 +504,51 @@ export class CodeIndexManager {
 		}
 	}
 
+	public async getIndexWarningDetails(
+		offset: number,
+		limit: number,
+		filter: "all" | "parser_failed" | "failed" | "degraded",
+		sort: "severity" | "recent" | "path",
+	): Promise<{
+		total: number
+		items: Array<{
+			relativePath: string
+			state: "degraded" | "terminal_failed" | "failed"
+			category?: "parser_failed" | "failed" | "degraded"
+			failureReason?: string | null
+		}>
+	}> {
+		if (this.selectedEngine !== CODE_INDEX_V2_ENGINE_ID || !this._engineV2) {
+			return {
+				total: 0,
+				items: [],
+			}
+		}
+
+		return this._engineV2.getWarningDetails(offset, limit, filter, sort)
+	}
+
+	public async retryIndexWarningFiles(
+		filter: "all" | "parser_failed" | "failed" | "degraded",
+		relativePaths?: string[],
+	): Promise<{ retriedFiles: number }> {
+		if (this.selectedEngine !== CODE_INDEX_V2_ENGINE_ID || !this._engineV2) {
+			return { retriedFiles: 0 }
+		}
+
+		return this._engineV2.retryWarningFiles(filter, relativePaths)
+	}
+
 	public async searchIndex(query: string, directoryPrefix?: string): Promise<VectorStoreSearchResult[]> {
 		if (!this.isFeatureEnabled) {
 			return []
 		}
 		this.assertInitialized()
+
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			return this._engineV2!.search(query, 50)
+		}
+
 		return this._searchService!.searchIndex(query, directoryPrefix)
 	}
 
@@ -453,20 +580,22 @@ export class CodeIndexManager {
 			return
 		}
 
-		// Create .gitignore instance
-		const ignorePath = path.join(workspacePath, ".gitignore")
-		try {
-			const content = await fs.readFile(ignorePath, "utf8")
-			ignoreInstance.add(content)
-			ignoreInstance.add(".gitignore")
-		} catch (error) {
-			// Should never happen: reading file failed even though it exists
-			console.error("Unexpected error loading .gitignore:", error)
-			TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
-				error: error instanceof Error ? error.message : String(error),
-				stack: error instanceof Error ? error.stack : undefined,
-				location: "_recreateServices",
-			})
+		if (this._configManager?.currentRespectGitIgnore !== false) {
+			// Create .gitignore instance
+			const ignorePath = path.join(workspacePath, ".gitignore")
+			try {
+				const content = await fs.readFile(ignorePath, "utf8")
+				ignoreInstance.add(content)
+				ignoreInstance.add(".gitignore")
+			} catch (error) {
+				// Should never happen: reading file failed even though it exists
+				console.error("Unexpected error loading .gitignore:", error)
+				TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+					location: "_recreateServices",
+				})
+			}
 		}
 
 		// Create RooIgnoreController instance

@@ -1,3 +1,14 @@
+export interface EmbedderDebugContext {
+	runId?: string
+	batchId?: string
+	outerBatchSize?: number
+}
+
+export interface EmbedderCreateEmbeddingsOptions {
+	isQuery?: boolean
+	debugContext?: EmbedderDebugContext
+}
+
 /**
  * Interface for code index embedders.
  * This interface is implemented by both OpenAI and Ollama embedders.
@@ -13,7 +24,11 @@ export interface IEmbedder {
 	 *   but no prefix for documents). Defaults to false (document embedding).
 	 * @returns Promise resolving to an EmbeddingResponse
 	 */
-	createEmbeddings(texts: string[], model?: string, options?: { isQuery?: boolean }): Promise<EmbeddingResponse>
+	createEmbeddings(
+		texts: string[],
+		model?: string,
+		options?: EmbedderCreateEmbeddingsOptions,
+	): Promise<EmbeddingResponse>
 
 	/**
 	 * Validates the embedder configuration by testing connectivity and credentials.

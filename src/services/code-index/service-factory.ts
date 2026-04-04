@@ -147,8 +147,14 @@ export class CodeIndexServiceFactory {
 
 		let vectorSize: number | undefined
 
+		if (provider === "openai-compatible" && config.modelDimension && config.modelDimension > 0) {
+			vectorSize = config.modelDimension
+		}
+
 		// First try to get the model-specific dimension from profiles
-		vectorSize = getModelDimension(provider, modelId)
+		if (!vectorSize) {
+			vectorSize = getModelDimension(provider, modelId)
+		}
 
 		// Only use manual dimension if model doesn't have a built-in dimension
 		if (!vectorSize && config.modelDimension && config.modelDimension > 0) {
