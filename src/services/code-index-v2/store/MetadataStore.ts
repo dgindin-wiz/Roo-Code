@@ -181,13 +181,58 @@ export class MetadataStore {
 			.run("failed", Date.now(), errorMessage, runId)
 	}
 
+	async markRunStopped(runId: string, errorMessage = "Stopped by user."): Promise<void> {
+		const now = Date.now()
+		this.db()
+			.prepare(`UPDATE index_runs SET state = ?, completed_at = ?, error_message = ? WHERE run_id = ?`)
+			.run("stopped", now, errorMessage, runId)
+
+		this.db()
+			.prepare(
+				`UPDATE jobs
+				 SET state = 'abandoned', last_error = ?, updated_at = ?
+				 WHERE workspace_id = ?
+					AND run_id = ?
+					AND state IN ('queued', 'running')`,
+			)
+			.run(errorMessage, now, this.workspaceHash, runId)
+
+		this.db()
+			.prepare(
+				`UPDATE file_revisions
+				 SET state = 'failed', failure_reason = ?
+				 WHERE run_id = ?
+					AND state NOT IN ('hashed', 'parsed', 'planned', 'committed', 'superseded', 'failed')`,
+			)
+			.run(errorMessage, runId)
+
+		this.db()
+			.prepare(
+				`UPDATE chunks
+				 SET state = 'abandoned', updated_at = ?
+				 WHERE revision_id IN (
+					SELECT revision_id
+					FROM file_revisions
+					WHERE run_id = ?
+				)
+					AND revision_id NOT IN (
+						SELECT revision_id
+						FROM file_revisions
+						WHERE run_id = ?
+							AND state IN ('hashed', 'parsed', 'planned')
+					)
+					AND state NOT IN ('upserted', 'deleted', 'abandoned')`,
+			)
+			.run(now, runId, runId)
+	}
+
 	async cleanupStaleRuns(): Promise<StaleRunCleanupSummary> {
 		const staleRuns = this.db()
 			.prepare(
 				`SELECT run_id AS runId
 				FROM index_runs
 				WHERE workspace_id = ?
-					AND state NOT IN ('complete', 'failed')`,
+					AND state NOT IN ('complete', 'failed', 'stopped')`,
 			)
 			.all(this.workspaceHash) as Array<{ runId: string }>
 
@@ -226,7 +271,7 @@ export class MetadataStore {
 			`UPDATE index_runs
 			 SET state = 'failed', completed_at = ?, error_message = ?
 			 WHERE workspace_id = ?
-				AND state NOT IN ('complete', 'failed')`,
+				AND state NOT IN ('complete', 'failed', 'stopped')`,
 		)
 		updateRuns.run(now, errorMessage, this.workspaceHash)
 
@@ -381,7 +426,7 @@ export class MetadataStore {
 				`SELECT run_id AS runId
 				FROM index_runs
 				WHERE workspace_id = ?
-					AND state = 'failed'
+					AND state IN ('failed', 'stopped')
 					AND completed_at IS NOT NULL
 					AND completed_at < ?`,
 			)
@@ -566,7 +611,7 @@ export class MetadataStore {
 					active_fr.state AS latestRevisionState
 				FROM files f
 				LEFT JOIN file_revisions active_fr ON active_fr.revision_id = f.active_revision_id
-				WHERE f.workspace_id = ? AND f.ignore_state = 'included'
+				WHERE f.workspace_id = ? AND f.ignore_state = 'included' AND f.tombstoned = 0
 				ORDER BY f.relative_path ASC`,
 			)
 			.all(workspaceId) as Array<Omit<FileRecordWithRevision, "tombstoned"> & { tombstoned: number }>
@@ -604,7 +649,7 @@ export class MetadataStore {
 					active_fr.state AS latestRevisionState
 				FROM files f
 				LEFT JOIN file_revisions active_fr ON active_fr.revision_id = f.active_revision_id
-				WHERE f.workspace_id = ? AND f.relative_path IN (${placeholders})
+				WHERE f.workspace_id = ? AND f.ignore_state = 'included' AND f.tombstoned = 0 AND f.relative_path IN (${placeholders})
 				ORDER BY f.relative_path ASC`,
 			)
 			.all(workspaceId, ...relativePaths) as Array<
@@ -979,6 +1024,18 @@ export class MetadataStore {
 			.get(fileId, excludingRevisionId) as FileRevisionRecord | undefined
 	}
 
+	async getDiffBaselineRevision(
+		fileId: string,
+		excludingRevisionId: string,
+	): Promise<FileRevisionRecord | undefined> {
+		const activeRevision = await this.getActiveRevisionForFile(fileId)
+		if (activeRevision && activeRevision.revisionId !== excludingRevisionId) {
+			return activeRevision
+		}
+
+		return this.getPreviousCommittedRevision(fileId, excludingRevisionId)
+	}
+
 	async getActiveRevisionForFile(fileId: string): Promise<FileRevisionRecord | undefined> {
 		return this.db()
 			.prepare(
@@ -1026,7 +1083,7 @@ export class MetadataStore {
 				WHERE file_id = ?
 					AND content_hash = ?
 					AND COALESCE(fast_fingerprint, '') = COALESCE(?, '')
-					AND state IN ('hashed', 'parsed', 'planned')
+					AND state IN ('hashed', 'parsed')
 				ORDER BY discovered_at DESC
 				LIMIT 1`,
 			)
@@ -1154,6 +1211,49 @@ export class MetadataStore {
 			)
 	}
 
+	async markChunkStates(
+		updates: Array<{
+			chunkId: string
+			state: ChunkRecord["state"]
+			embeddingModel?: string | null
+			vectorPointId?: string | null
+			clearContent?: boolean
+		}>,
+	): Promise<void> {
+		if (updates.length === 0) {
+			return
+		}
+
+		const now = Date.now()
+		const statement = this.db().prepare(
+			`UPDATE chunks
+			 SET state = ?,
+				 embedding_model = COALESCE(?, embedding_model),
+				 vector_point_id = COALESCE(?, vector_point_id),
+				 content = CASE WHEN ? THEN '' ELSE content END,
+				 updated_at = ?
+			 WHERE chunk_id = ?`,
+		)
+
+		this.db().exec("BEGIN")
+		try {
+			for (const update of updates) {
+				statement.run(
+					update.state,
+					update.embeddingModel ?? null,
+					update.vectorPointId ?? null,
+					update.clearContent ? 1 : 0,
+					now,
+					update.chunkId,
+				)
+			}
+			this.db().exec("COMMIT")
+		} catch (error) {
+			this.db().exec("ROLLBACK")
+			throw error
+		}
+	}
+
 	async enqueueJobs(jobs: JobInput[]): Promise<void> {
 		const now = Date.now()
 		const statement = this.db().prepare(
@@ -1225,6 +1325,25 @@ export class MetadataStore {
 
 	async completeJob(jobId: string): Promise<void> {
 		this.db().prepare(`UPDATE jobs SET state = 'done', updated_at = ? WHERE job_id = ?`).run(Date.now(), jobId)
+	}
+
+	async completeJobs(jobIds: string[]): Promise<void> {
+		if (jobIds.length === 0) {
+			return
+		}
+
+		const now = Date.now()
+		const statement = this.db().prepare(`UPDATE jobs SET state = 'done', updated_at = ? WHERE job_id = ?`)
+		this.db().exec("BEGIN")
+		try {
+			for (const jobId of jobIds) {
+				statement.run(now, jobId)
+			}
+			this.db().exec("COMMIT")
+		} catch (error) {
+			this.db().exec("ROLLBACK")
+			throw error
+		}
 	}
 
 	async markJobTerminalFailed(jobId: string, errorMessage: string): Promise<void> {

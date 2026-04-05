@@ -87,6 +87,64 @@ describe("CodeIndexStateManager", () => {
 		})
 	})
 
+	describe("resetIndexingState", () => {
+		it("fully clears progress, detailed state, and warning stats", () => {
+			stateManager.reportScanProgress(10, 100)
+			stateManager.startEmbedPhase(5000, true, 100, 250)
+			stateManager.reportEmbedProgress(400, 5200, 25, false, {
+				detailedStage: "embedding",
+				hasKnownVectorWork: true,
+				hasStartedVectorSync: true,
+				isBackgroundReconcile: true,
+			})
+			stateManager.setResilienceStats({
+				resumedRetryJobs: 4,
+				resumedPendingJobs: 2,
+				retryingParseRevisions: 1,
+				terminalFailedParseRevisions: 3,
+				degradedRevisions: 2,
+				terminalFailedRevisions: 1,
+				terminallyFailedChunks: 6,
+				retryingChunks: 5,
+				warningDetails: [
+					{
+						relativePath: "src/example.ts",
+						state: "failed",
+						category: "failed",
+						failureReason: "boom",
+					},
+				],
+			})
+
+			stateManager.resetIndexingState("Index data cleared successfully.")
+			const status = stateManager.getCurrentStatus()
+
+			expect(status.systemStatus).toBe("Standby")
+			expect(status.message).toBe("Index data cleared successfully.")
+			expect(status.phase).toBeUndefined()
+			expect(status.detailedStage).toBeUndefined()
+			expect(status.processedItems).toBe(0)
+			expect(status.totalItems).toBe(0)
+			expect(status.totalFiles).toBe(0)
+			expect(status.processedFiles).toBe(0)
+			expect(status.totalBlocks).toBe(0)
+			expect(status.blocksEmbedded).toBe(0)
+			expect(status.estimatedTimeRemainingMs).toBeNull()
+			expect(status.hasKnownVectorWork).toBe(false)
+			expect(status.hasStartedVectorSync).toBe(false)
+			expect(status.isBackgroundReconcile).toBe(false)
+			expect(status.resumedRetryJobs).toBe(0)
+			expect(status.resumedPendingJobs).toBe(0)
+			expect(status.retryingParseRevisions).toBe(0)
+			expect(status.terminalFailedParseRevisions).toBe(0)
+			expect(status.degradedRevisions).toBe(0)
+			expect(status.terminalFailedRevisions).toBe(0)
+			expect(status.terminallyFailedChunks).toBe(0)
+			expect(status.retryingChunks).toBe(0)
+			expect(status.warningDetails).toEqual([])
+		})
+	})
+
 	describe("startIndexingTimer", () => {
 		it("should reset rate samples and ETA", () => {
 			stateManager.startIndexingTimer()
@@ -101,6 +159,7 @@ describe("CodeIndexStateManager", () => {
 			const status = stateManager.getCurrentStatus()
 
 			expect(status.phase).toBe("scanning")
+			expect(status.detailedStage).toBe("discovering")
 			expect(status.totalFiles).toBe(1000)
 			expect(status.processedFiles).toBe(50)
 			expect(status.processedItems).toBe(50)
@@ -122,6 +181,7 @@ describe("CodeIndexStateManager", () => {
 			const status = stateManager.getCurrentStatus()
 
 			expect(status.phase).toBe("embedding")
+			expect(status.detailedStage).toBe("embedding")
 			expect(status.totalBlocks).toBe(5000)
 			expect(status.blocksEmbedded).toBe(0)
 			expect(status.isEstimatedTotal).toBe(true)
@@ -165,6 +225,22 @@ describe("CodeIndexStateManager", () => {
 			const status = stateManager.getCurrentStatus()
 			expect(status.blocksEmbedded).toBe(0)
 			expect(status.processedItems).toBe(0)
+		})
+
+		it("should track vector planning separately from active vector sync", () => {
+			stateManager.startEmbedPhase(42, true, 3, 0, {
+				detailedStage: "planning_vectors",
+				hasKnownVectorWork: true,
+				hasStartedVectorSync: false,
+				isBackgroundReconcile: true,
+			})
+
+			const status = stateManager.getCurrentStatus()
+			expect(status.phase).toBe("embedding")
+			expect(status.detailedStage).toBe("planning_vectors")
+			expect(status.hasKnownVectorWork).toBe(true)
+			expect(status.hasStartedVectorSync).toBe(false)
+			expect(status.isBackgroundReconcile).toBe(true)
 		})
 	})
 
@@ -277,6 +353,26 @@ describe("CodeIndexStateManager", () => {
 			expect(status.blocksEmbedded).toBe(1100) // 800 + 300
 			// processedItems should never exceed totalItems
 			expect(status.processedItems).toBeLessThanOrEqual(status.totalItems)
+		})
+
+		it("should expose explicit sync metadata when embedding really begins", () => {
+			stateManager.startEmbedPhase(100, true, undefined, 0, {
+				detailedStage: "planning_vectors",
+				hasKnownVectorWork: true,
+				hasStartedVectorSync: false,
+			})
+			stateManager.reportEmbedProgress(5, 100, 2, false, {
+				detailedStage: "embedding",
+				hasKnownVectorWork: true,
+				hasStartedVectorSync: true,
+				isBackgroundReconcile: false,
+			})
+
+			const status = stateManager.getCurrentStatus()
+			expect(status.detailedStage).toBe("embedding")
+			expect(status.hasKnownVectorWork).toBe(true)
+			expect(status.hasStartedVectorSync).toBe(true)
+			expect(status.isBackgroundReconcile).toBe(false)
 		})
 
 		it("should not revise totalBlocks when effectiveEmbedded is within estimate", () => {
@@ -464,6 +560,26 @@ describe("CodeIndexStateManager", () => {
 
 				vi.restoreAllMocks()
 			})
+		})
+	})
+
+	describe("reportCustomProgress", () => {
+		it("should preserve truth-first stage metadata for reconcile status", () => {
+			stateManager.reportCustomProgress("Reconciling", 0, 1, {
+				currentItemUnit: "phases",
+				phase: "scanning",
+				detailedStage: "reconciling",
+				isBackgroundReconcile: true,
+				hasKnownVectorWork: false,
+				hasStartedVectorSync: false,
+			})
+
+			const status = stateManager.getCurrentStatus()
+			expect(status.phase).toBe("scanning")
+			expect(status.detailedStage).toBe("reconciling")
+			expect(status.isBackgroundReconcile).toBe(true)
+			expect(status.hasKnownVectorWork).toBe(false)
+			expect(status.hasStartedVectorSync).toBe(false)
 		})
 	})
 

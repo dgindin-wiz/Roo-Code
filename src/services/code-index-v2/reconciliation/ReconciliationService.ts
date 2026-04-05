@@ -1,4 +1,5 @@
 import { generateRelativeFilePath } from "../../code-index/shared/get-relative-path"
+import { MAX_FILE_SIZE_BYTES } from "../../code-index/constants"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { MetadataStore } from "../store/MetadataStore"
 import { WorkspaceAdapter } from "../adapters/WorkspaceAdapter"
@@ -41,6 +42,10 @@ export class ReconciliationService {
 				// Retire tracked files that are now excluded by current ignore rules,
 				// even if they were indexed before those rules were enforced correctly.
 				if (!this.workspaceAdapter.isCandidateFile(file.normalizedPath)) {
+					return true
+				}
+
+				if ((file.lastSeenSize ?? 0) > MAX_FILE_SIZE_BYTES) {
 					return true
 				}
 

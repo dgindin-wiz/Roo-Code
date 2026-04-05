@@ -2334,6 +2334,9 @@ export class ClineProvider
 				codebaseIndexEmbeddingBatchSize: vscode.workspace
 					.getConfiguration(Package.name)
 					.get<number>("codeIndex.embeddingBatchSize", 60),
+				codebaseIndexEmbeddingLaneConcurrency: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<number>("codeIndex.embeddingLaneConcurrency", 2),
 				codebaseIndexDebugLogging: vscode.workspace
 					.getConfiguration(Package.name)
 					.get<boolean>("codeIndex.debugLogging", false),
@@ -2573,6 +2576,9 @@ export class ClineProvider
 				codebaseIndexEmbeddingBatchSize: vscode.workspace
 					.getConfiguration(Package.name)
 					.get<number>("codeIndex.embeddingBatchSize", 60),
+				codebaseIndexEmbeddingLaneConcurrency: vscode.workspace
+					.getConfiguration(Package.name)
+					.get<number>("codeIndex.embeddingLaneConcurrency", 2),
 				codebaseIndexDebugLogging: vscode.workspace
 					.getConfiguration(Package.name)
 					.get<boolean>("codeIndex.debugLogging", false),

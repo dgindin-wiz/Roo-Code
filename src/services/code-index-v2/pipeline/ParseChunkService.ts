@@ -58,6 +58,9 @@ export class ParseChunkService {
 				terminalFailedRevisions++
 				continue
 			}
+			if (result.status === "missing") {
+				continue
+			}
 
 			parsedRevisions++
 			parsedChunks += result.parsedChunks
@@ -103,6 +106,11 @@ export class ParseChunkService {
 				retriesScheduled: number
 		  }
 		| {
+				status: "missing"
+				parsedChunks: 0
+				retriesScheduled: 0
+		  }
+		| {
 				status: "terminal_failed"
 				parsedChunks: 0
 				retriesScheduled: number
@@ -142,6 +150,20 @@ export class ParseChunkService {
 					retriesScheduled,
 				}
 			} catch (error) {
+				if (this.isMissingFileError(error)) {
+					await this.metadataStore.markRevisionState(revision.revisionId, "superseded")
+					IndexDebugLoggerV2.log("basic", "ParseChunkService", "parse-chunk-missing-file", {
+						component: "ParseChunkService",
+						workspacePath: this.workspaceAdapter.getWorkspacePath(),
+						runId: revision.runId,
+						jobId: revision.normalizedPath,
+					})
+					return {
+						status: "missing",
+						parsedChunks: 0,
+						retriesScheduled: 0,
+					}
+				}
 				lastError = error
 				if (attempt >= ParseChunkService.MAX_PARSE_ATTEMPTS) {
 					await this.metadataStore.markRevisionTerminalFailure(
@@ -169,6 +191,13 @@ export class ParseChunkService {
 			parsedChunks: 0,
 			retriesScheduled,
 		}
+	}
+
+	private isMissingFileError(error: unknown): boolean {
+		const errorCode =
+			typeof error === "object" && error && "code" in error ? (error as { code?: string }).code : undefined
+		const message = error instanceof Error ? error.message : String(error)
+		return errorCode === "ENOENT" || /no such file or directory/i.test(message)
 	}
 
 	private async waitForRetry(attempt: number, signal?: AbortSignal): Promise<void> {

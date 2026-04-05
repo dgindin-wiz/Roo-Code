@@ -1059,6 +1059,16 @@ This content verifies that processing continues after multiple oversized lines.`
 			expect(result.length).toBeGreaterThan(0)
 		})
 
+		it("should still skip oversized files when content is provided via options", async () => {
+			const content = "a".repeat(MAX_PARSEABLE_FILE_SIZE_BYTES + 1)
+
+			const result = await parser.parseFile("too-big.js", { content })
+
+			expect(vi.mocked(stat)).not.toHaveBeenCalled()
+			expect(vi.mocked(readFile)).not.toHaveBeenCalled()
+			expect(result).toEqual([])
+		})
+
 		it("should handle stat errors gracefully (e.g. file deleted between discover and parse)", async () => {
 			vi.mocked(stat).mockRejectedValue(new Error("ENOENT: no such file or directory"))
 

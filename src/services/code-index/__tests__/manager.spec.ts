@@ -433,10 +433,10 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			expect(mockCodeIndexEngineV2.clear).toHaveBeenCalledTimes(1)
 		})
 
-		it("delegates stopIndexing to the v2 engine", () => {
+		it("delegates stopIndexing to the v2 engine", async () => {
 			;(manager as any)._engineV2 = mockCodeIndexEngineV2
 
-			expect(() => manager.stopIndexing()).not.toThrow()
+			await expect(manager.stopIndexing()).resolves.toBeUndefined()
 			expect(mockCodeIndexEngineV2.stop).toHaveBeenCalledTimes(1)
 		})
 
@@ -504,6 +504,38 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 
 			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Indexing", "Code Index V2 is running...")
 			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Error", "resume adoption failed")
+		})
+
+		it("treats a user stop abort as standby instead of error", async () => {
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+			mockCodeIndexEngineV2.start.mockRejectedValueOnce(new Error("Stopped by user."))
+
+			await expect(manager.startIndexing()).resolves.toBeUndefined()
+
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Indexing", "Code Index V2 is running...")
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "Indexing stopped.")
+			expect(mockStateManager.setSystemState).not.toHaveBeenCalledWith("Error", expect.any(String))
+		})
+
+		it("awaits v2 shutdown during error recovery before clearing the engine reference", async () => {
+			let releaseStop: (() => void) | undefined
+			mockCodeIndexEngineV2.stop.mockImplementationOnce(
+				() =>
+					new Promise<void>((resolve) => {
+						releaseStop = resolve
+					}),
+			)
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+
+			const recoveryPromise = manager.recoverFromError()
+
+			expect(mockCodeIndexEngineV2.stop).toHaveBeenCalledTimes(1)
+			expect((manager as any)._engineV2).toBe(mockCodeIndexEngineV2)
+
+			releaseStop?.()
+			await recoveryPromise
+
+			expect((manager as any)._engineV2).toBeUndefined()
 		})
 	})
 
@@ -943,7 +975,7 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 	})
 
 	describe("stopIndexing", () => {
-		it("should delegate to orchestrator.stopIndexing()", () => {
+		it("should delegate to orchestrator.stopIndexing()", async () => {
 			const mockOrchestrator = {
 				stopIndexing: vi.fn(),
 				stopWatcher: vi.fn(),
@@ -951,15 +983,15 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			}
 			;(manager as any)._orchestrator = mockOrchestrator
 
-			manager.stopIndexing()
+			await manager.stopIndexing()
 
 			expect(mockOrchestrator.stopIndexing).toHaveBeenCalled()
 		})
 
-		it("should be safe to call when orchestrator is not set", () => {
+		it("should be safe to call when orchestrator is not set", async () => {
 			;(manager as any)._orchestrator = undefined
 
-			expect(() => manager.stopIndexing()).not.toThrow()
+			await expect(manager.stopIndexing()).resolves.toBeUndefined()
 		})
 	})
 

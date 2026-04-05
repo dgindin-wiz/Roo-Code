@@ -70,6 +70,7 @@ export class IndexDebugLoggerV2 {
 				heapUsedMB: Math.round(usage.heapUsed / 1024 / 1024),
 				heapTotalMB: Math.round(usage.heapTotal / 1024 / 1024),
 				externalMB: Math.round(usage.external / 1024 / 1024),
+				arrayBuffersMB: Math.round(usage.arrayBuffers / 1024 / 1024),
 			}
 		} catch {
 			return {
@@ -77,6 +78,7 @@ export class IndexDebugLoggerV2 {
 				heapUsedMB: 0,
 				heapTotalMB: 0,
 				externalMB: 0,
+				arrayBuffersMB: 0,
 			}
 		}
 	}

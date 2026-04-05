@@ -4,7 +4,9 @@ import { CodeIndexConfigManager } from "../config-manager"
 import { PreviousConfigSnapshot } from "../interfaces/config"
 
 const { mockGetRespectGitIgnore } = vi.hoisted(() => ({
-	mockGetRespectGitIgnore: vi.fn().mockReturnValue(true),
+	mockGetRespectGitIgnore: vi.fn((key: string, defaultValue: unknown) =>
+		key === "codeIndex.respectGitIgnore" ? true : defaultValue,
+	),
 }))
 
 // Mock ContextProxy
@@ -43,7 +45,9 @@ describe("CodeIndexConfigManager", () => {
 			refreshSecrets: vi.fn().mockResolvedValue(undefined),
 			updateGlobalState: vi.fn(),
 		}
-		mockGetRespectGitIgnore.mockReturnValue(true)
+		mockGetRespectGitIgnore.mockImplementation((key: string, defaultValue: unknown) =>
+			key === "codeIndex.respectGitIgnore" ? true : defaultValue,
+		)
 
 		configManager = new CodeIndexConfigManager(mockContextProxy)
 	})
@@ -121,6 +125,7 @@ describe("CodeIndexConfigManager", () => {
 				qdrantApiKey: "",
 				searchMinScore: 0.4,
 				respectGitIgnore: true,
+				embeddingLaneConcurrency: 2,
 			})
 			expect(result.requiresRestart).toBe(false)
 		})

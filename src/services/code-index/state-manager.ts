@@ -4,7 +4,20 @@ import { IndexDebugLogger } from "./debug-logger"
 export type IndexingState = "Standby" | "Indexing" | "Indexed" | "Error" | "Stopping"
 
 export type IndexingPhase = "scanning" | "embedding" | "complete"
+export type IndexingDetailedStage =
+	| "preparing"
+	| "discovering"
+	| "hashing_initial"
+	| "comparing_signatures"
+	| "parsing"
+	| "planning_vectors"
+	| "embedding"
+	| "deleting_vectors"
+	| "reconciling"
+	| "complete"
 export type EstimationConfidence = "low" | "medium" | "high"
+export type IndexingInterruptionKind = "none" | "user_stop" | "stale_recovery"
+export type IndexingResumeContext = "none" | "stale_jobs" | "reusable_revisions"
 
 interface IndexingResilienceStats {
 	resumedRetryJobs: number
@@ -48,11 +61,16 @@ export class CodeIndexStateManager {
 
 	// Two-phase progress fields
 	private _phase: IndexingPhase | undefined
+	private _detailedStage: IndexingDetailedStage | undefined
 	private _totalFiles: number = 0
 	private _processedFiles: number = 0
 	private _filesParsed: number = 0 // files actually parsed (not skipped), for ETA during estimated totals
 	private _totalBlocks: number = 0
 	private _blocksEmbedded: number = 0
+	private _changedFiles: number = 0
+	private _unchangedFiles: number = 0
+	private _oversizedFiles: number = 0
+	private _missingFiles: number = 0
 	private _startingBlockCount: number = 0 // pre-existing blocks in Qdrant from a previous session
 	private _isEstimatedTotal: boolean = false
 	private _embedStartedAt: number = 0
@@ -60,6 +78,11 @@ export class CodeIndexStateManager {
 	private _lastFilesParsedChangeTime: number = 0 // when _filesParsed last changed (for backpressure detection)
 	private _estimationConfidence: EstimationConfidence | undefined
 	private _isBackpressured = false
+	private _hasKnownVectorWork = false
+	private _hasStartedVectorSync = false
+	private _isBackgroundReconcile = false
+	private _interruptionKind: IndexingInterruptionKind = "none"
+	private _resumeContext: IndexingResumeContext = "none"
 	private _embeddingRuntimeKind: "local" | "remote" | "unknown" = "unknown"
 	private _recentChunkDensitySamples: number[] = []
 	private _recentThroughputSamples: number[] = []
@@ -91,14 +114,24 @@ export class CodeIndexStateManager {
 			currentItemUnit: this._currentItemUnit,
 			// Two-phase fields
 			phase: this._phase,
+			detailedStage: this._detailedStage,
 			totalFiles: this._totalFiles,
 			processedFiles: this._processedFiles,
 			totalBlocks: this._getExtrapolatedTotal(),
 			blocksEmbedded: effectiveBlocksEmbedded,
+			changedFiles: this._changedFiles,
+			unchangedFiles: this._unchangedFiles,
+			oversizedFiles: this._oversizedFiles,
+			missingFiles: this._missingFiles,
 			estimatedTimeRemainingMs: this._estimatedTimeRemainingMs,
 			isEstimatedTotal: this._isEstimatedTotal,
 			estimationConfidence: this._estimationConfidence,
 			isBackpressured: this._isBackpressured,
+			hasKnownVectorWork: this._hasKnownVectorWork,
+			hasStartedVectorSync: this._hasStartedVectorSync,
+			isBackgroundReconcile: this._isBackgroundReconcile,
+			interruptionKind: this._interruptionKind,
+			resumeContext: this._resumeContext,
 			resumedRetryJobs: this._resilienceStats.resumedRetryJobs,
 			resumedPendingJobs: this._resilienceStats.resumedPendingJobs,
 			retryingParseRevisions: this._resilienceStats.retryingParseRevisions,
@@ -138,10 +171,10 @@ export class CodeIndexStateManager {
 				}
 				// Reset two-phase fields
 				if (newState !== "Stopping") {
-					this._phase = newState === "Indexed" ? "complete" : undefined
-					this._estimatedTimeRemainingMs = null
-					this._estimationConfidence = undefined
-					this._isBackpressured = false
+					this.resetDetailedProgressFields({
+						phase: newState === "Indexed" ? "complete" : undefined,
+						detailedStage: newState === "Indexed" ? "complete" : undefined,
+					})
 				}
 			}
 
@@ -154,6 +187,23 @@ export class CodeIndexStateManager {
 		}
 	}
 
+	public resetIndexingState(message = "Ready."): void {
+		this._systemStatus = "Standby"
+		this._statusMessage = message
+		this._processedItems = 0
+		this._totalItems = 0
+		this._currentItemUnit = "blocks"
+		this._activityDetail = ""
+		this.resetDetailedProgressFields()
+		this.resetResilienceStats()
+
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "resetIndexingState", {
+			phaseTransition: true,
+			message: message.substring(0, 120),
+		})
+	}
+
 	// --- Two-Phase Progress ---
 
 	/**
@@ -161,7 +211,22 @@ export class CodeIndexStateManager {
 	 */
 	public startIndexingTimer(): void {
 		this._estimatedTimeRemainingMs = null
+		this._interruptionKind = "none"
+		this._resumeContext = "none"
 		this.resetResilienceStats()
+	}
+
+	public setRecoveryContext(
+		interruptionKind: IndexingInterruptionKind = "none",
+		resumeContext: IndexingResumeContext = "none",
+	): void {
+		this._interruptionKind = interruptionKind
+		this._resumeContext = resumeContext
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "setRecoveryContext", {
+			interruptionKind,
+			resumeContext,
+		})
 	}
 
 	/**
@@ -171,6 +236,7 @@ export class CodeIndexStateManager {
 		if (this._systemStatus === "Stopping") return
 
 		this._phase = "scanning"
+		this._detailedStage = "discovering"
 		this._totalFiles = totalFiles
 		this._processedFiles = scannedFiles
 		this._processedItems = scannedFiles
@@ -197,11 +263,18 @@ export class CodeIndexStateManager {
 		startingBlockCount?: number,
 		options?: {
 			runtimeKind?: "local" | "remote" | "unknown"
+			detailedStage?: IndexingDetailedStage
+			hasKnownVectorWork?: boolean
+			hasStartedVectorSync?: boolean
+			isBackgroundReconcile?: boolean
+			interruptionKind?: IndexingInterruptionKind
+			resumeContext?: IndexingResumeContext
 		},
 	): void {
 		if (this._systemStatus === "Stopping") return
 
 		this._phase = "embedding"
+		this._detailedStage = options?.detailedStage ?? "embedding"
 		this._totalBlocks = totalBlocks
 		this._blocksEmbedded = 0
 		this._startingBlockCount = startingBlockCount ?? 0
@@ -212,6 +285,11 @@ export class CodeIndexStateManager {
 		this._activityDetail = ""
 		this._estimationConfidence = isEstimate ? "low" : "high"
 		this._isBackpressured = false
+		this._hasKnownVectorWork = options?.hasKnownVectorWork ?? totalBlocks > 0
+		this._hasStartedVectorSync = options?.hasStartedVectorSync ?? false
+		this._isBackgroundReconcile = options?.isBackgroundReconcile ?? false
+		this._interruptionKind = options?.interruptionKind ?? this._interruptionKind
+		this._resumeContext = options?.resumeContext ?? this._resumeContext
 		this._embeddingRuntimeKind = options?.runtimeKind ?? "unknown"
 		this._recentChunkDensitySamples = []
 		this._recentThroughputSamples = []
@@ -254,6 +332,14 @@ export class CodeIndexStateManager {
 		revisedTotal?: number,
 		filesParsed?: number,
 		isExact?: boolean,
+		options?: {
+			detailedStage?: IndexingDetailedStage
+			hasKnownVectorWork?: boolean
+			hasStartedVectorSync?: boolean
+			isBackgroundReconcile?: boolean
+			interruptionKind?: IndexingInterruptionKind
+			resumeContext?: IndexingResumeContext
+		},
 	): void {
 		if (this._systemStatus === "Stopping") return
 
@@ -335,7 +421,13 @@ export class CodeIndexStateManager {
 		this._processedFiles = this._filesParsed
 		this._currentItemUnit = "blocks"
 		this._phase = "embedding"
+		this._detailedStage = options?.detailedStage ?? "embedding"
 		this._systemStatus = "Indexing"
+		this._hasKnownVectorWork = options?.hasKnownVectorWork ?? true
+		this._hasStartedVectorSync = options?.hasStartedVectorSync ?? blocksEmbedded > 0
+		this._isBackgroundReconcile = options?.isBackgroundReconcile ?? this._isBackgroundReconcile
+		this._interruptionKind = options?.interruptionKind ?? this._interruptionKind
+		this._resumeContext = options?.resumeContext ?? this._resumeContext
 
 		// Calculate ETA from block throughput (this session only)
 		this._updateEta()
@@ -392,12 +484,16 @@ export class CodeIndexStateManager {
 	 */
 	public reportComplete(totalBlocks: number, totalFiles: number): void {
 		this._phase = "complete"
+		this._detailedStage = "complete"
 		this._totalBlocks = totalBlocks
 		this._blocksEmbedded = totalBlocks
 		this._startingBlockCount = 0 // Reset — total already includes everything
 		this._totalFiles = totalFiles
 		this._isEstimatedTotal = false
 		this._estimatedTimeRemainingMs = null
+		this._hasKnownVectorWork = totalBlocks > 0
+		this._hasStartedVectorSync = totalBlocks > 0
+		this._isBackgroundReconcile = false
 		this._processedItems = totalBlocks
 		this._totalItems = totalBlocks
 		this._systemStatus = "Indexed"
@@ -432,9 +528,19 @@ export class CodeIndexStateManager {
 		options?: {
 			currentItemUnit?: string
 			phase?: IndexingPhase
+			detailedStage?: IndexingDetailedStage
+			changedFiles?: number
+			unchangedFiles?: number
+			oversizedFiles?: number
+			missingFiles?: number
 			systemStatus?: IndexingState
 			estimationConfidence?: EstimationConfidence
 			isBackpressured?: boolean
+			hasKnownVectorWork?: boolean
+			hasStartedVectorSync?: boolean
+			isBackgroundReconcile?: boolean
+			interruptionKind?: IndexingInterruptionKind
+			resumeContext?: IndexingResumeContext
 			resilienceStats?: Partial<IndexingResilienceStats>
 		},
 	): void {
@@ -446,8 +552,18 @@ export class CodeIndexStateManager {
 		this._totalItems = totalItems
 		this._currentItemUnit = options?.currentItemUnit ?? "items"
 		this._phase = options?.phase
+		this._detailedStage = options?.detailedStage ?? this.inferDetailedStage(options?.phase)
 		this._estimationConfidence = options?.estimationConfidence ?? this._estimationConfidence
 		this._isBackpressured = options?.isBackpressured ?? false
+		this._hasKnownVectorWork = options?.hasKnownVectorWork ?? this._hasKnownVectorWork
+		this._hasStartedVectorSync = options?.hasStartedVectorSync ?? this._hasStartedVectorSync
+		this._isBackgroundReconcile = options?.isBackgroundReconcile ?? this._isBackgroundReconcile
+		this._interruptionKind = options?.interruptionKind ?? this._interruptionKind
+		this._resumeContext = options?.resumeContext ?? this._resumeContext
+		this._changedFiles = options?.changedFiles ?? this._changedFiles
+		this._unchangedFiles = options?.unchangedFiles ?? this._unchangedFiles
+		this._oversizedFiles = options?.oversizedFiles ?? this._oversizedFiles
+		this._missingFiles = options?.missingFiles ?? this._missingFiles
 		this.applyResilienceStats(options?.resilienceStats)
 		if (this._phase === "scanning") {
 			this._processedFiles = processedItems
@@ -461,6 +577,7 @@ export class CodeIndexStateManager {
 			totalItems,
 			currentItemUnit: this._currentItemUnit,
 			phase: this._phase,
+			detailedStage: this._detailedStage,
 		})
 	}
 
@@ -480,6 +597,7 @@ export class CodeIndexStateManager {
 		IndexDebugLogger.log("StateManager", "reportHeartbeat", {
 			message: this._statusMessage.substring(0, 120),
 			phase: this._phase,
+			detailedStage: this._detailedStage,
 			processedItems: this._processedItems,
 			totalItems: this._totalItems,
 		})
@@ -494,7 +612,21 @@ export class CodeIndexStateManager {
 		IndexDebugLogger.log("StateManager", "setActivityDetail", {
 			detail: detail.substring(0, 120),
 			phase: this._phase,
+			detailedStage: this._detailedStage,
 		})
+	}
+
+	private inferDetailedStage(phase?: IndexingPhase): IndexingDetailedStage | undefined {
+		switch (phase) {
+			case "scanning":
+				return "discovering"
+			case "embedding":
+				return "embedding"
+			case "complete":
+				return "complete"
+			default:
+				return undefined
+		}
 	}
 
 	/**
@@ -555,6 +687,40 @@ export class CodeIndexStateManager {
 
 	private resetResilienceStats(): void {
 		this._resilienceStats = this.createEmptyResilienceStats()
+	}
+
+	private resetDetailedProgressFields(options?: {
+		phase?: IndexingPhase
+		detailedStage?: IndexingDetailedStage
+	}): void {
+		this._phase = options?.phase
+		this._detailedStage = options?.detailedStage
+		this._totalFiles = 0
+		this._processedFiles = 0
+		this._filesParsed = 0
+		this._totalBlocks = 0
+		this._blocksEmbedded = 0
+		this._changedFiles = 0
+		this._unchangedFiles = 0
+		this._oversizedFiles = 0
+		this._missingFiles = 0
+		this._startingBlockCount = 0
+		this._isEstimatedTotal = false
+		this._embedStartedAt = 0
+		this._estimatedTimeRemainingMs = null
+		this._lastFilesParsedChangeTime = 0
+		this._estimationConfidence = undefined
+		this._isBackpressured = false
+		this._hasKnownVectorWork = false
+		this._hasStartedVectorSync = false
+		this._isBackgroundReconcile = false
+		this._interruptionKind = "none"
+		this._resumeContext = "none"
+		this._embeddingRuntimeKind = "unknown"
+		this._recentChunkDensitySamples = []
+		this._recentThroughputSamples = []
+		this._lastThroughputSampleAt = 0
+		this._lastThroughputBlocksEmbedded = 0
 	}
 
 	private applyResilienceStats(stats?: Partial<IndexingResilienceStats>): void {

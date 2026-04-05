@@ -279,6 +279,10 @@ export class CodeIndexManager {
 				const status = await this._engineV2.getStatus()
 				this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
 			} catch (error) {
+				if (this.isUserStopAbort(error)) {
+					this._stateManager.setSystemState("Standby", "Indexing stopped.")
+					return { requiresRestart: false }
+				}
 				this._stateManager.setSystemState(
 					"Error",
 					error instanceof Error ? error.message : "Code Index V2 failed to initialize",
@@ -349,6 +353,10 @@ export class CodeIndexManager {
 				const status = await this._engineV2!.getStatus()
 				this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
 			} catch (error) {
+				if (this.isUserStopAbort(error)) {
+					this._stateManager.setSystemState("Standby", "Indexing stopped.")
+					return
+				}
 				this._stateManager.setSystemState(
 					"Error",
 					error instanceof Error ? error.message : "Code Index V2 failed to start",
@@ -377,10 +385,10 @@ export class CodeIndexManager {
 	/**
 	 * Stops any in-progress indexing operation and the file watcher.
 	 */
-	public stopIndexing(): void {
+	public async stopIndexing(): Promise<void> {
 		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
 			if (this._engineV2) {
-				void this._engineV2.stop()
+				await this.stopV2Engine()
 			}
 			return
 		}
@@ -432,6 +440,9 @@ export class CodeIndexManager {
 		try {
 			// Clear error state
 			this._stateManager.setSystemState("Standby", "")
+			if (this._engineV2) {
+				await this.stopV2Engine({ clearReference: true })
+			}
 		} catch (error) {
 			// Log error but continue with recovery - clearing service instances is more important
 			console.error("Failed to clear error state during recovery:", error)
@@ -456,10 +467,7 @@ export class CodeIndexManager {
 	 * Flushes any pending cache writes to prevent data loss on extension deactivation.
 	 */
 	public dispose(): void {
-		this.stopIndexing()
-		if (this._engineV2) {
-			void this._engineV2.stop()
-		}
+		void this.stopIndexing()
 		// Flush pending debounced cache writes so they aren't lost on exit.
 		// Fire-and-forget since dispose() is synchronous but flush() is async.
 		if (this._cacheManager && typeof this._cacheManager.flush === "function") {
@@ -487,7 +495,7 @@ export class CodeIndexManager {
 
 		// Stop any in-progress scan before clearing data to prevent
 		// the running scan from writing to the collection while we delete it.
-		this.stopIndexing()
+		await this.stopIndexing()
 		await this._orchestrator!.clearIndexData()
 		await this._cacheManager!.clearCacheFile()
 	}
@@ -656,7 +664,11 @@ export class CodeIndexManager {
 
 			// If feature is disabled, stop the service (including any active scan)
 			if (!isFeatureEnabled) {
-				this.stopIndexing()
+				if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+					await this.stopV2Engine()
+				} else {
+					await this.stopIndexing()
+				}
 				this._stateManager.setSystemState("Standby", "Code indexing is disabled")
 				return
 			}
@@ -684,5 +696,25 @@ export class CodeIndexManager {
 				}
 			}
 		}
+	}
+
+	private async stopV2Engine(options?: { clearReference?: boolean }): Promise<void> {
+		if (!this._engineV2) {
+			return
+		}
+
+		const engine = this._engineV2
+		await engine.stop()
+
+		if (options?.clearReference) {
+			if (this._engineV2 === engine) {
+				this._engineV2 = undefined
+			}
+		}
+	}
+
+	private isUserStopAbort(error: unknown): boolean {
+		const message = error instanceof Error ? error.message : String(error)
+		return /stopped by user|aborted/i.test(message)
 	}
 }

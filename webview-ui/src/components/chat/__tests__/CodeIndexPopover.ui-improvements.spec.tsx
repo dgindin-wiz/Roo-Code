@@ -8,6 +8,8 @@
  * - formatEtaForDisplay helper
  */
 
+import { getIndexingHeadline, getProgressStageLabel } from "../CodeIndexPopover"
+
 // --- Unit test: formatEtaForDisplay ---
 // We test the function in isolation by extracting the same logic
 
@@ -76,6 +78,59 @@ describe("CodeIndexPopover - Status dot color mapping", () => {
 })
 
 describe("CodeIndexPopover - Phase label rendering logic", () => {
+	test("uses truth-first parsing headline before vector sync starts", () => {
+		expect(
+			getIndexingHeadline(
+				{
+					systemStatus: "Indexing",
+					processedItems: 12,
+					totalItems: 20,
+					detailedStage: "parsing",
+					hasKnownVectorWork: false,
+					hasStartedVectorSync: false,
+				},
+				false,
+				(key: string) => key,
+			),
+		).toBe("Preparing changed files for indexing")
+	})
+
+	test("uses calm reconcile headline for background freshness checks", () => {
+		expect(
+			getIndexingHeadline(
+				{
+					systemStatus: "Indexing",
+					processedItems: 0,
+					totalItems: 1,
+					detailedStage: "reconciling",
+					isBackgroundReconcile: true,
+				},
+				false,
+				(key: string) => key,
+			),
+		).toBe("Checking for workspace changes")
+	})
+
+	test("uses a fresh-start hashing headline before any baseline compare exists", () => {
+		expect(
+			getIndexingHeadline(
+				{
+					systemStatus: "Indexing",
+					processedItems: 12,
+					totalItems: 40,
+					detailedStage: "hashing_initial",
+				},
+				false,
+				(key: string) => key,
+			),
+		).toBe("Preparing files for indexing")
+	})
+
+	test("progress stage label stays on workspace pass until real embedding work begins", () => {
+		expect(getProgressStageLabel("parsing", "scanning")).toBe("Workspace pass")
+		expect(getProgressStageLabel("planning_vectors", "embedding")).toBe("Embedding pass")
+	})
+
 	test("generates scanning phase label with counts", () => {
 		const phase = "scanning"
 		const processedFiles = 120
@@ -201,14 +256,26 @@ describe("CodeIndexPopover - Progress percentage clamping", () => {
 	// Mirrors the progressPercentage useMemo logic in CodeIndexPopover.tsx
 
 	function calcProgressPercentage(indexingStatus: {
+		detailedStage?: string
+		hasStartedVectorSync?: boolean
 		phase?: string
 		blocksEmbedded?: number
 		totalBlocks?: number
 		processedItems: number
 		totalItems: number
 	}): number {
-		if (indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0) {
+		if (
+			indexingStatus.detailedStage === "embedding" &&
+			indexingStatus.hasStartedVectorSync &&
+			indexingStatus.totalBlocks &&
+			indexingStatus.totalBlocks > 0
+		) {
 			return Math.min(100, Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100))
+		}
+		if (indexingStatus.detailedStage === "discovering") {
+			const processed = indexingStatus.processedItems ?? 0
+			const total = Math.max(indexingStatus.totalItems ?? 0, processed, 1)
+			return Math.min(99, Math.round((processed / total) * 100))
 		}
 		return indexingStatus.totalItems > 0
 			? Math.min(100, Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100))
@@ -218,6 +285,8 @@ describe("CodeIndexPopover - Progress percentage clamping", () => {
 	test("clamps embedding progress to 100% when blocksEmbedded exceeds totalBlocks", () => {
 		// Reproduces the 102% bug scenario from the screenshot
 		const result = calcProgressPercentage({
+			detailedStage: "embedding",
+			hasStartedVectorSync: true,
 			phase: "embedding",
 			blocksEmbedded: 111_397,
 			totalBlocks: 108_906,
@@ -237,6 +306,8 @@ describe("CodeIndexPopover - Progress percentage clamping", () => {
 
 	test("returns correct percentage when within bounds", () => {
 		const result = calcProgressPercentage({
+			detailedStage: "embedding",
+			hasStartedVectorSync: true,
 			phase: "embedding",
 			blocksEmbedded: 500,
 			totalBlocks: 1000,
@@ -248,8 +319,23 @@ describe("CodeIndexPopover - Progress percentage clamping", () => {
 
 	test("returns 0 when totalItems is 0", () => {
 		const result = calcProgressPercentage({
+			detailedStage: "planning_vectors",
+			hasStartedVectorSync: false,
 			processedItems: 0,
 			totalItems: 0,
+		})
+		expect(result).toBe(0)
+	})
+
+	test("keeps pre-sync embedding placeholder indeterminate instead of showing fake progress", () => {
+		const result = calcProgressPercentage({
+			detailedStage: "embedding",
+			hasStartedVectorSync: false,
+			phase: "embedding",
+			blocksEmbedded: 0,
+			totalBlocks: 1,
+			processedItems: 0,
+			totalItems: 1,
 		})
 		expect(result).toBe(0)
 	})
@@ -267,5 +353,43 @@ describe("CodeIndexPopover - ETA display rendering logic", () => {
 		const estimatedTimeRemainingMs: number | null = null
 		const shouldShowEta = estimatedTimeRemainingMs != null
 		expect(shouldShowEta).toBe(false)
+	})
+})
+
+describe("CodeIndexPopover - warning details state sync", () => {
+	test("does not clobber fetched warning items after warning details bootstrap", () => {
+		const previousState = {
+			items: [
+				{
+					relativePath: "src/problem.ts",
+					state: "failed" as const,
+					category: "parser_failed" as const,
+					failureReason: "parser exploded",
+				},
+			],
+			total: 1,
+			loading: false,
+			hasMore: false,
+			filter: "all" as const,
+			sort: "severity" as const,
+		}
+		const externalIndexingStatus = {
+			warningDetails: [],
+		}
+		const warningDetailsBootstrapped = true
+
+		const nextState = {
+			...previousState,
+			...(warningDetailsBootstrapped
+				? {}
+				: {
+						items: externalIndexingStatus.warningDetails ?? [],
+						total: externalIndexingStatus.warningDetails?.length ?? 0,
+						hasMore: (externalIndexingStatus.warningDetails?.length ?? 0) >= 8,
+					}),
+		}
+
+		expect(nextState.items).toHaveLength(1)
+		expect(nextState.total).toBe(1)
 	})
 })

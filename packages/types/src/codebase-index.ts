@@ -44,6 +44,7 @@ export const codebaseIndexConfigSchema = z.object({
 		.optional(),
 	codebaseIndexMaxFiles: z.number().optional(),
 	codebaseIndexEmbeddingBatchSize: z.number().optional(),
+	codebaseIndexEmbeddingLaneConcurrency: z.number().optional(),
 	codebaseIndexDebugLogging: z.boolean().optional(),
 	maximumIndexedFilesForFileSearch: z.number().optional(),
 	codebaseIndexRespectGitIgnore: z.boolean().optional(),

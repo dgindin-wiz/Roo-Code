@@ -46,7 +46,7 @@ export interface ICodeIndexManager {
 	/**
 	 * Stops any in-progress indexing operation and the file watcher
 	 */
-	stopIndexing(): void
+	stopIndexing(): Promise<void>
 
 	/**
 	 * Stops the file watcher

@@ -22,6 +22,7 @@ export interface CodeIndexConfig {
 	searchMinScore?: number
 	searchMaxResults?: number
 	respectGitIgnore?: boolean
+	embeddingLaneConcurrency?: number
 }
 
 /**
@@ -47,4 +48,5 @@ export type PreviousConfigSnapshot = {
 	qdrantUrl?: string
 	qdrantApiKey?: string
 	respectGitIgnore?: boolean
+	embeddingLaneConcurrency?: number
 }

@@ -232,6 +232,70 @@ describe("MetadataStore integration", () => {
 		await store.dispose()
 	})
 
+	it("does not treat intentionally stopped runs as stale recovery candidates", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-stopped") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-stopped")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const stoppedRunId = await store.beginRun("initial-discovery")
+		const file = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/stopped.ts",
+			normalizedPath: path.join(workspacePath, "src/stopped.ts"),
+			lastSeenMtimeMs: 10,
+			lastSeenSize: 20,
+			ignoreState: "included",
+		})
+		const revision = await store.createFileRevision({
+			fileId: file.fileId,
+			runId: stoppedRunId,
+			contentHash: "stopped-content-hash",
+			fastFingerprint: "20:10",
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+			state: "parsed",
+		})
+		await store.upsertChunks([
+			{
+				revisionId: revision.revisionId,
+				chunkFingerprint: "stopped-fp",
+				startLine: 1,
+				endLine: 2,
+				content: "export const stopped = true",
+				contentHash: "stopped-chunk-hash",
+				state: "parsed",
+			},
+		])
+		const [chunk] = await store.getChunksForRevision(revision.revisionId)
+		await store.enqueueJobs([
+			{
+				workspaceId,
+				runId: stoppedRunId,
+				jobType: "upsert",
+				entityId: chunk.chunkId,
+				state: "queued",
+			},
+		])
+
+		await store.markRunStopped(stoppedRunId)
+
+		const cleanup = await store.cleanupStaleRuns()
+		expect(cleanup.staleRunIds).toEqual([])
+
+		const reusableRevision = await store.findReusableRevision(file.fileId, "stopped-content-hash", "20:10")
+		expect(reusableRevision?.revisionId).toBe(revision.revisionId)
+
+		const resumedRunId = await store.beginRun("initial-discovery")
+		const adoptedJobs = await store.adoptRetryableJobsFromStaleRuns(resumedRunId, [])
+		expect(adoptedJobs).toBe(0)
+
+		await store.dispose()
+	})
+
 	it("garbage-collects expired failed runs with preserved pending revisions and retry jobs", async () => {
 		const context = {
 			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-4") },

@@ -18,4 +18,5 @@ export interface CodeIndexV2MemorySnapshot {
 	heapUsedMB: number
 	heapTotalMB: number
 	externalMB: number
+	arrayBuffersMB?: number
 }

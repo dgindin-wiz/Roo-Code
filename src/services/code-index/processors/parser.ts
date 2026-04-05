@@ -80,6 +80,14 @@ export class CodeParser implements ICodeParser {
 			}
 		}
 
+		const contentBytes = Buffer.byteLength(content, "utf8")
+		if (contentBytes > MAX_PARSEABLE_FILE_SIZE_BYTES) {
+			console.warn(
+				`[CodeParser] Skipping file too large for parsing: ${filePath} (${contentBytes} bytes, limit ${MAX_PARSEABLE_FILE_SIZE_BYTES})`,
+			)
+			return []
+		}
+
 		// Parse the file
 		return this.parseContent(filePath, content, fileHash)
 	}

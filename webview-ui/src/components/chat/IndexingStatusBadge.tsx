@@ -35,6 +35,114 @@ function formatCountLabel(count: number, singular: string, plural: string): stri
 	return `${count.toLocaleString()} ${count === 1 ? singular : plural}`
 }
 
+export function getIndexingBadgeTooltipText(
+	indexingStatus: IndexingStatus,
+	isCurrentStandby: boolean,
+	t: (key: string, params?: any) => string,
+	progressPercentage: number,
+): string {
+	const extraParts: string[] = []
+	if ((indexingStatus.resumedPendingJobs ?? 0) > 0) {
+		extraParts.push(
+			`resuming ${formatCountLabel(indexingStatus.resumedPendingJobs ?? 0, "unfinished job", "unfinished jobs")} from the previous run`,
+		)
+	}
+	if ((indexingStatus.terminalFailedParseRevisions ?? 0) > 0) {
+		extraParts.push(
+			formatCountLabel(
+				indexingStatus.terminalFailedParseRevisions ?? 0,
+				"parser-failed file",
+				"parser-failed files",
+			),
+		)
+	}
+	if ((indexingStatus.degradedRevisions ?? 0) > 0) {
+		extraParts.push(formatCountLabel(indexingStatus.degradedRevisions ?? 0, "degraded file", "degraded files"))
+	}
+	if ((indexingStatus.terminalFailedRevisions ?? 0) > 0) {
+		extraParts.push(formatCountLabel(indexingStatus.terminalFailedRevisions ?? 0, "failed file", "failed files"))
+	}
+	const extraText = extraParts.length > 0 ? ` — ${extraParts.join(", ")}` : ""
+
+	switch (indexingStatus.systemStatus) {
+		case "Standby":
+			return isCurrentStandby
+				? `Index ready — watching for changes${extraText}`
+				: `${t("chat:indexingStatus.ready")}${extraText}`
+		case "Indexing": {
+			const etaText =
+				indexingStatus.estimatedTimeRemainingMs != null
+					? ` — ${formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}`
+					: ""
+			const confidenceText = indexingStatus.estimationConfidence
+				? ` (${indexingStatus.estimationConfidence} confidence)`
+				: ""
+			const backpressureText = indexingStatus.isBackpressured ? " — waiting on embedding throughput" : ""
+
+			switch (indexingStatus.detailedStage) {
+				case "preparing":
+					return `Preparing workspace index${etaText}${extraText}`
+				case "discovering": {
+					const processed = indexingStatus.processedItems ?? indexingStatus.processedFiles ?? 0
+					const total = indexingStatus.totalItems ?? indexingStatus.totalFiles ?? processed
+					return `Discovering workspace files — ${processed.toLocaleString()} found, ~${Math.max(total, processed).toLocaleString()} estimated${etaText}${confidenceText}${extraText}`
+				}
+				case "hashing_initial": {
+					const processed = indexingStatus.processedItems ?? 0
+					const total = Math.max(indexingStatus.totalItems ?? 0, processed)
+					return `Preparing files for indexing — ${processed.toLocaleString()} of ${total.toLocaleString()} checked${etaText}${extraText}`
+				}
+				case "comparing_signatures": {
+					const processed = indexingStatus.processedItems ?? 0
+					const total = Math.max(indexingStatus.totalItems ?? 0, processed)
+					return `Checking for changed files — ${processed.toLocaleString()} of ${total.toLocaleString()} checked${etaText}${extraText}`
+				}
+				case "parsing": {
+					const processed = indexingStatus.processedItems ?? 0
+					const total = Math.max(indexingStatus.totalItems ?? 0, processed)
+					return `Preparing changed files for indexing — ${processed.toLocaleString()} of ${total.toLocaleString()} files${etaText}${extraText}`
+				}
+				case "planning_vectors":
+					return `${indexingStatus.hasKnownVectorWork ? "Preparing vector workload" : "Checking for vector work"}${etaText}${extraText}`
+				case "embedding": {
+					if (!indexingStatus.hasStartedVectorSync) {
+						return `Preparing vector workload${etaText}${extraText}`
+					}
+					const embedded = indexingStatus.blocksEmbedded ?? 0
+					const totalBlocks = indexingStatus.totalBlocks ?? embedded
+					return `Building embeddings and syncing vectors — ${embedded.toLocaleString()} of ${totalBlocks.toLocaleString()} blocks${etaText}${confidenceText}${backpressureText}${extraText}`
+				}
+				case "deleting_vectors":
+					return `Removing stale vectors${etaText}${extraText}`
+				case "reconciling":
+					return `${indexingStatus.isBackgroundReconcile ? "Checking for workspace changes" : "Reconciling workspace state"}${etaText}${extraText}`
+				default:
+					if (indexingStatus.phase === "embedding") {
+						const embedded = indexingStatus.blocksEmbedded ?? 0
+						const totalBlocks = indexingStatus.totalBlocks ?? embedded
+						return `Embedding vectors — ${embedded.toLocaleString()} of ${totalBlocks.toLocaleString()} blocks${etaText}${confidenceText}${backpressureText}${extraText}`
+					}
+					if (indexingStatus.phase === "scanning") {
+						const processed = indexingStatus.processedItems ?? indexingStatus.processedFiles ?? 0
+						const total = indexingStatus.totalItems ?? indexingStatus.totalFiles ?? processed
+						return `Scanning workspace — ${processed.toLocaleString()} of ${total.toLocaleString()} files${etaText}${confidenceText}${extraText}`
+					}
+					return `${t("chat:indexingStatus.indexing", { percentage: progressPercentage })}${etaText}${confidenceText}${extraText}`
+			}
+		}
+		case "Indexed":
+			return isCurrentStandby
+				? `Index ready — watching for changes${extraText}`
+				: `${t("chat:indexingStatus.indexed")}${extraText}`
+		case "Stopping":
+			return t("chat:indexingStatus.stopping")
+		case "Error":
+			return `${t("chat:indexingStatus.error")}${extraText}`
+		default:
+			return `${t("chat:indexingStatus.status")}${extraText}`
+	}
+}
+
 export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ className }) => {
 	const { t } = useAppTranslation()
 	const { cwd } = useExtensionState()
@@ -68,16 +176,26 @@ export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ classN
 	}, [cwd])
 
 	const progressPercentage = useMemo(() => {
-		// Use block-level progress during embedding (uniform cost per block → accurate ETA)
-		if (indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0) {
+		if (
+			indexingStatus.detailedStage === "embedding" &&
+			indexingStatus.hasStartedVectorSync &&
+			indexingStatus.totalBlocks &&
+			indexingStatus.totalBlocks > 0
+		) {
 			return Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100)
+		}
+		if (indexingStatus.detailedStage === "discovering") {
+			const processed = indexingStatus.processedItems ?? 0
+			const total = Math.max(indexingStatus.totalItems ?? 0, processed, 1)
+			return Math.min(99, Math.round((processed / total) * 100))
 		}
 		// Fall back to legacy fields
 		return indexingStatus.totalItems > 0
 			? Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100)
 			: 0
 	}, [
-		indexingStatus.phase,
+		indexingStatus.detailedStage,
+		indexingStatus.hasStartedVectorSync,
 		indexingStatus.blocksEmbedded,
 		indexingStatus.totalBlocks,
 		indexingStatus.processedItems,
@@ -95,88 +213,8 @@ export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ classN
 	)
 
 	const tooltipText = useMemo(() => {
-		const extraParts: string[] = []
-		if ((indexingStatus.resumedPendingJobs ?? 0) > 0) {
-			extraParts.push(
-				`resuming ${formatCountLabel(indexingStatus.resumedPendingJobs ?? 0, "unfinished job", "unfinished jobs")} from the previous run`,
-			)
-		}
-		if ((indexingStatus.terminalFailedParseRevisions ?? 0) > 0) {
-			extraParts.push(
-				formatCountLabel(
-					indexingStatus.terminalFailedParseRevisions ?? 0,
-					"parser-failed file",
-					"parser-failed files",
-				),
-			)
-		}
-		if ((indexingStatus.degradedRevisions ?? 0) > 0) {
-			extraParts.push(formatCountLabel(indexingStatus.degradedRevisions ?? 0, "degraded file", "degraded files"))
-		}
-		if ((indexingStatus.terminalFailedRevisions ?? 0) > 0) {
-			extraParts.push(
-				formatCountLabel(indexingStatus.terminalFailedRevisions ?? 0, "failed file", "failed files"),
-			)
-		}
-		const extraText = extraParts.length > 0 ? ` — ${extraParts.join(", ")}` : ""
-
-		switch (indexingStatus.systemStatus) {
-			case "Standby":
-				return isCurrentStandby
-					? `Index ready — watching for changes${extraText}`
-					: `${t("chat:indexingStatus.ready")}${extraText}`
-			case "Indexing": {
-				const etaText =
-					indexingStatus.estimatedTimeRemainingMs != null
-						? ` — ${formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}`
-						: ""
-				const confidenceText = indexingStatus.estimationConfidence
-					? ` (${indexingStatus.estimationConfidence} confidence)`
-					: ""
-				const backpressureText = indexingStatus.isBackpressured ? " — waiting on embedding throughput" : ""
-				if (indexingStatus.phase === "scanning") {
-					const processed = indexingStatus.processedItems ?? indexingStatus.processedFiles ?? 0
-					const total = indexingStatus.totalItems ?? indexingStatus.totalFiles ?? processed
-					return `Scanning workspace — ${processed.toLocaleString()} of ${total.toLocaleString()} files${etaText}${confidenceText}${extraText}`
-				}
-				if (indexingStatus.phase === "embedding") {
-					const embedded = indexingStatus.blocksEmbedded ?? 0
-					const totalBlocks = indexingStatus.totalBlocks ?? embedded
-					return `Embedding vectors — ${embedded.toLocaleString()} of ${totalBlocks.toLocaleString()} blocks${etaText}${confidenceText}${backpressureText}${extraText}`
-				}
-				return `${t("chat:indexingStatus.indexing", { percentage: progressPercentage })}${etaText}${confidenceText}${extraText}`
-			}
-			case "Indexed":
-				return isCurrentStandby
-					? `Index ready — watching for changes${extraText}`
-					: `${t("chat:indexingStatus.indexed")}${extraText}`
-			case "Stopping":
-				return t("chat:indexingStatus.stopping")
-			case "Error":
-				return `${t("chat:indexingStatus.error")}${extraText}`
-			default:
-				return `${t("chat:indexingStatus.status")}${extraText}`
-		}
-	}, [
-		indexingStatus.degradedRevisions,
-		indexingStatus.blocksEmbedded,
-		indexingStatus.estimationConfidence,
-		indexingStatus.estimatedTimeRemainingMs,
-		indexingStatus.isBackpressured,
-		indexingStatus.phase,
-		indexingStatus.processedFiles,
-		indexingStatus.processedItems,
-		indexingStatus.resumedPendingJobs,
-		indexingStatus.systemStatus,
-		indexingStatus.terminalFailedParseRevisions,
-		indexingStatus.terminalFailedRevisions,
-		indexingStatus.totalBlocks,
-		indexingStatus.totalFiles,
-		indexingStatus.totalItems,
-		isCurrentStandby,
-		progressPercentage,
-		t,
-	])
+		return getIndexingBadgeTooltipText(indexingStatus, isCurrentStandby, t, progressPercentage)
+	}, [indexingStatus, isCurrentStandby, progressPercentage, t])
 
 	const statusColorClass = useMemo(() => {
 		const statusColors = {

@@ -30,12 +30,14 @@ export class DiffPlanner {
 			}
 
 			const currentChunks = await this.metadataStore.getChunksForRevision(revision.revisionId)
-			const previousRevision = await this.metadataStore.getPreviousCommittedRevision(
+			const previousRevision = await this.metadataStore.getDiffBaselineRevision(
 				revision.fileId,
 				revision.revisionId,
 			)
 			const previousChunks = previousRevision
-				? await this.metadataStore.getChunksForRevision(previousRevision.revisionId)
+				? (await this.metadataStore.getChunksForRevision(previousRevision.revisionId)).filter(
+						(chunk) => chunk.state === "upserted" && Boolean(chunk.vectorPointId),
+					)
 				: []
 
 			const currentFingerprints = new Set(currentChunks.map((chunk) => chunk.chunkFingerprint))

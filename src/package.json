@@ -407,6 +407,13 @@
 					"maximum": 200,
 					"description": "%settings.codeIndex.embeddingBatchSize.description%"
 				},
+				"roo-cline.codeIndex.embeddingLaneConcurrency": {
+					"type": "number",
+					"default": 2,
+					"minimum": 1,
+					"maximum": 3,
+					"description": "%settings.codeIndex.embeddingLaneConcurrency.description%"
+				},
 				"roo-cline.codeIndex.maxFiles": {
 					"type": "number",
 					"default": 100000,
@@ -451,10 +458,11 @@
 		"pretest": "turbo run bundle --cwd ..",
 		"test": "vitest run",
 		"format": "prettier --write .",
+		"build:webview": "pnpm --dir ../webview-ui build",
 		"bundle": "node esbuild.mjs",
-		"vscode:prepublish": "pnpm bundle --production",
-		"vsix": "mkdirp ../bin && vsce package --no-dependencies --out ../bin",
-		"publish:marketplace": "vsce publish --no-dependencies && ovsx publish --no-dependencies",
+		"vscode:prepublish": "pnpm build:webview && pnpm bundle --production",
+		"vsix": "pnpm build:webview && mkdirp ../bin && vsce package --no-dependencies --out ../bin",
+		"publish:marketplace": "pnpm build:webview && vsce publish --no-dependencies && ovsx publish --no-dependencies",
 		"watch:bundle": "pnpm bundle --watch",
 		"watch:tsc": "cd .. && tsc --noEmit --watch --project src/tsconfig.json",
 		"clean": "rimraf README.md CHANGELOG.md LICENSE dist logs mock .turbo"

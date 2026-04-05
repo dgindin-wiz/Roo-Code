@@ -1,10 +1,10 @@
-import * as vscode from "vscode"
 import { createHash } from "crypto"
-import { BATCH_SEGMENT_THRESHOLD } from "../../code-index/constants"
+import { CLIENT_RECYCLE_INTERVAL } from "../../code-index/constants"
 import { EmbeddingAdapter } from "../adapters/EmbeddingAdapter"
 import { VectorPoint, VectorStoreAdapter } from "../adapters/VectorStoreAdapter"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { MetadataStore } from "../store/MetadataStore"
+import { getConfiguredEmbeddingBatchSize, getConfiguredEmbeddingLaneConcurrency } from "../settings"
 
 export interface EmbedUpsertSummary {
 	runId: string
@@ -16,6 +16,10 @@ export interface EmbedUpsertSummary {
 	terminallyFailedChunks: number
 	retryingChunks: number
 	batchesCompleted: number
+	laneConcurrency: number
+	activeLaneCount: number
+	inFlightChunkCount: number
+	peakInFlightChunkCount: number
 	chunksPerSecond?: number
 	averageBatchLatencyMs?: number
 	averageEmbedLatencyMs?: number
@@ -38,6 +42,10 @@ export interface EmbedUpsertProgress {
 	terminallyFailedChunks: number
 	retryingChunks: number
 	batchesCompleted: number
+	laneConcurrency: number
+	activeLaneCount: number
+	inFlightChunkCount: number
+	peakInFlightChunkCount: number
 	lastBatchSize?: number
 	lastEmbeddingCount?: number
 	lastEmbedLatencyMs?: number
@@ -62,6 +70,7 @@ interface BatchTelemetry {
 	batchKind: "upsert" | "delete"
 	batchSize: number
 	embeddingCount: number
+	laneId: number
 	idleGapMs?: number
 	embedLatencyMs?: number
 	upsertLatencyMs?: number
@@ -73,15 +82,26 @@ export class EmbedUpsertWorker {
 	private static readonly MAX_JOB_ATTEMPTS = 3
 	private static readonly RETRY_DELAY_BASE_MS = 1_000
 	private static readonly RETRY_DELAY_MAX_MS = 30_000
+	private static readonly MAX_LANE_CONCURRENCY = 3
+	private static readonly RECYCLE_DRAIN_TIMEOUT_MS = 15_000
 	private readonly batchSize: number
+	private readonly laneConcurrency: number
 	private lastBatchCompletedAt = 0
+	private activeLaneCount = 0
+	private inFlightChunkCount = 0
+	private peakInFlightChunkCount = 0
+	private completedBatchCount = 0
 
 	constructor(
 		private readonly metadataStore: MetadataStore,
 		private readonly embeddingAdapter: EmbeddingAdapter,
 		private readonly vectorStore: VectorStoreAdapter,
 	) {
-		this.batchSize = this.getBatchSize()
+		this.batchSize = getConfiguredEmbeddingBatchSize()
+		this.laneConcurrency = Math.max(
+			1,
+			Math.min(EmbedUpsertWorker.MAX_LANE_CONCURRENCY, getConfiguredEmbeddingLaneConcurrency()),
+		)
 	}
 
 	async run(
@@ -109,8 +129,14 @@ export class EmbedUpsertWorker {
 		let peakIdleGapMs = 0
 		let peakBatchSize = 0
 		let peakEmbeddingCount = 0
+		let effectiveLaneConcurrency = this.laneConcurrency
 		const workerStartedAt = Date.now()
 		this.lastBatchCompletedAt = workerStartedAt
+		this.activeLaneCount = 0
+		this.inFlightChunkCount = 0
+		this.peakInFlightChunkCount = 0
+		this.completedBatchCount = 0
+
 		const emitProgress = (batchTelemetry?: BatchTelemetry) => {
 			if (batchTelemetry && batchTelemetry.batchSize > 0) {
 				batchesCompleted++
@@ -141,6 +167,10 @@ export class EmbedUpsertWorker {
 				terminallyFailedChunks,
 				retryingChunks,
 				batchesCompleted,
+				laneConcurrency: effectiveLaneConcurrency,
+				activeLaneCount: this.activeLaneCount,
+				inFlightChunkCount: this.inFlightChunkCount,
+				peakInFlightChunkCount: this.peakInFlightChunkCount,
 				lastBatchSize: batchTelemetry?.batchSize,
 				lastEmbeddingCount: batchTelemetry?.embeddingCount,
 				lastEmbedLatencyMs: batchTelemetry?.embedLatencyMs,
@@ -169,6 +199,11 @@ export class EmbedUpsertWorker {
 					provider: this.embeddingAdapter.provider,
 					modelId: this.embeddingAdapter.modelId,
 					batchKind: batchTelemetry.batchKind,
+					laneId: batchTelemetry.laneId,
+					laneConcurrency: effectiveLaneConcurrency,
+					activeLaneCount: this.activeLaneCount,
+					inFlightChunkCount: this.inFlightChunkCount,
+					peakInFlightChunkCount: this.peakInFlightChunkCount,
 					batchSize: batchTelemetry.batchSize,
 					effectiveProviderBatchSize: batchTelemetry.embeddingCount,
 					chunksPerSecond,
@@ -183,35 +218,38 @@ export class EmbedUpsertWorker {
 			}
 		}
 
-		for (;;) {
-			if (signal?.aborted) {
-				throw new Error("Embed/upsert worker aborted")
+		const clampConcurrency = (error: unknown) => {
+			if (effectiveLaneConcurrency <= 1 || !this.isConcurrencyPressureError(error)) {
+				return
 			}
 
-			const upsertJobs = await this.metadataStore.claimJobs("upsert", this.batchSize, runId)
-			if (upsertJobs.length === 0) {
-				const nextRetryAt = await this.metadataStore.getNextRetryAt("upsert", runId)
-				if (nextRetryAt === undefined) {
-					break
-				}
-				await this.waitForNextRetry(nextRetryAt, signal)
-				continue
-			}
-
-			await this.processUpsertJobs(upsertJobs, signal, (batchTelemetry) => emitProgress(batchTelemetry), {
-				onRetryScheduled: () => {
-					retryingChunks++
-					emitProgress()
-				},
-				onChunkTerminalFailure: () => {
-					terminallyFailedChunks++
-					emitProgress()
-				},
-				onChunksUpserted: (count) => {
-					upsertedChunks += count
-				},
+			effectiveLaneConcurrency = Math.max(1, effectiveLaneConcurrency - 1)
+			IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-lane-clamped", {
+				component: "EmbedUpsertWorker",
+				runId,
+				provider: this.embeddingAdapter.provider,
+				modelId: this.embeddingAdapter.modelId,
+				laneConcurrency: effectiveLaneConcurrency,
+				errorMessage: error instanceof Error ? error.message : String(error),
 			})
+			emitProgress()
 		}
+
+		await this.processUpsertStage(runId, signal, emitProgress, {
+			onRetryScheduled: () => {
+				retryingChunks++
+				emitProgress()
+			},
+			onChunkTerminalFailure: () => {
+				terminallyFailedChunks++
+				emitProgress()
+			},
+			onChunksUpserted: (count) => {
+				upsertedChunks += count
+			},
+			onConcurrencyPressure: clampConcurrency,
+			getLaneConcurrency: () => effectiveLaneConcurrency,
+		})
 
 		for (;;) {
 			if (signal?.aborted) {
@@ -228,14 +266,22 @@ export class EmbedUpsertWorker {
 				continue
 			}
 
-			await this.processDeleteJobs(deleteJobs, signal, (batchTelemetry) => emitProgress(batchTelemetry), {
-				onRetryScheduled: () => {
-					emitProgress()
-				},
-				onChunksDeleted: (count) => {
-					deletedChunks += count
-				},
-			})
+			this.activeLaneCount = 1
+			this.inFlightChunkCount = deleteJobs.length
+			this.peakInFlightChunkCount = Math.max(this.peakInFlightChunkCount, this.inFlightChunkCount)
+			try {
+				await this.processDeleteJobs(deleteJobs, signal, 1, emitProgress, {
+					onRetryScheduled: () => {
+						emitProgress()
+					},
+					onChunksDeleted: (count) => {
+						deletedChunks += count
+					},
+				})
+			} finally {
+				this.activeLaneCount = 0
+				this.inFlightChunkCount = 0
+			}
 		}
 
 		const plannedRevisions = await this.metadataStore.getRevisionsByState(
@@ -248,7 +294,7 @@ export class EmbedUpsertWorker {
 			}
 
 			const resolution = await this.metadataStore.getRevisionJobResolution(revision.revisionId, runId, "upsert")
-			const previousRevision = await this.metadataStore.getPreviousCommittedRevision(
+			const previousRevision = await this.metadataStore.getDiffBaselineRevision(
 				revision.fileId,
 				revision.revisionId,
 			)
@@ -296,6 +342,10 @@ export class EmbedUpsertWorker {
 			terminallyFailedChunks,
 			retryingChunks,
 			batchesCompleted,
+			laneConcurrency: effectiveLaneConcurrency,
+			activeLaneCount: this.activeLaneCount,
+			inFlightChunkCount: this.inFlightChunkCount,
+			peakInFlightChunkCount: this.peakInFlightChunkCount,
 			chunksPerSecond:
 				upsertedChunks + deletedChunks > 0
 					? (upsertedChunks + deletedChunks) / (Math.max(Date.now() - workerStartedAt, 1) / 1000)
@@ -323,6 +373,10 @@ export class EmbedUpsertWorker {
 			terminallyFailedChunks,
 			retryingChunks,
 			batchesCompleted,
+			laneConcurrency: effectiveLaneConcurrency,
+			activeLaneCount: this.activeLaneCount,
+			inFlightChunkCount: this.inFlightChunkCount,
+			peakInFlightChunkCount: this.peakInFlightChunkCount,
 			chunksPerSecond:
 				upsertedChunks + deletedChunks > 0
 					? (upsertedChunks + deletedChunks) / (Math.max(Date.now() - workerStartedAt, 1) / 1000)
@@ -341,14 +395,90 @@ export class EmbedUpsertWorker {
 		}
 	}
 
-	private async processUpsertJobs(
-		jobs: Awaited<ReturnType<MetadataStore["claimJobs"]>>,
+	private async processUpsertStage(
+		runId: string,
 		signal: AbortSignal | undefined,
 		emitBatchProgress: (batchTelemetry?: BatchTelemetry) => void,
 		callbacks: {
 			onRetryScheduled: () => void
 			onChunkTerminalFailure: () => void
 			onChunksUpserted: (count: number) => void
+			onConcurrencyPressure: (error: unknown) => void
+			getLaneConcurrency: () => number
+		},
+	): Promise<void> {
+		const activeTasks = new Set<Promise<void>>()
+		let nextLaneId = 1
+		let nextRecycleAtBatch = CLIENT_RECYCLE_INTERVAL
+
+		const launchNextBatch = async (): Promise<boolean> => {
+			if (signal?.aborted) {
+				throw new Error("Embed/upsert worker aborted")
+			}
+
+			const upsertJobs = await this.metadataStore.claimJobs("upsert", this.batchSize, runId)
+			if (upsertJobs.length === 0) {
+				return false
+			}
+
+			const laneId = nextLaneId++
+			this.activeLaneCount++
+			this.inFlightChunkCount += upsertJobs.length
+			this.peakInFlightChunkCount = Math.max(this.peakInFlightChunkCount, this.inFlightChunkCount)
+
+			const task = (async () => {
+				try {
+					await this.processUpsertJobs(upsertJobs, signal, laneId, emitBatchProgress, callbacks)
+				} finally {
+					this.activeLaneCount = Math.max(0, this.activeLaneCount - 1)
+					this.inFlightChunkCount = Math.max(0, this.inFlightChunkCount - upsertJobs.length)
+				}
+			})()
+
+			activeTasks.add(task)
+			task.finally(() => activeTasks.delete(task)).catch(() => undefined)
+			return true
+		}
+
+		for (;;) {
+			const recyclePending = CLIENT_RECYCLE_INTERVAL > 0 && this.completedBatchCount >= nextRecycleAtBatch
+
+			while (!recyclePending && activeTasks.size < callbacks.getLaneConcurrency()) {
+				const launched = await launchNextBatch()
+				if (!launched) {
+					break
+				}
+			}
+
+			if (recyclePending) {
+				await this.maybeRecycleClients(runId, activeTasks, signal)
+				nextRecycleAtBatch += CLIENT_RECYCLE_INTERVAL
+				continue
+			}
+
+			if (activeTasks.size === 0) {
+				const nextRetryAt = await this.metadataStore.getNextRetryAt("upsert", runId)
+				if (nextRetryAt === undefined) {
+					break
+				}
+				await this.waitForNextRetry(nextRetryAt, signal)
+				continue
+			}
+
+			await Promise.race(Array.from(activeTasks))
+		}
+	}
+
+	private async processUpsertJobs(
+		jobs: Awaited<ReturnType<MetadataStore["claimJobs"]>>,
+		signal: AbortSignal | undefined,
+		laneId: number,
+		emitBatchProgress: (batchTelemetry?: BatchTelemetry) => void,
+		callbacks: {
+			onRetryScheduled: () => void
+			onChunkTerminalFailure: () => void
+			onChunksUpserted: (count: number) => void
+			onConcurrencyPressure: (error: unknown) => void
 		},
 	): Promise<void> {
 		const chunks = await this.metadataStore.getChunksByIds(jobs.map((job) => job.entityId))
@@ -361,13 +491,112 @@ export class EmbedUpsertWorker {
 			.filter((pair): pair is { job: (typeof jobs)[number]; chunk: (typeof chunks)[number] } => Boolean(pair))
 
 		if (orderedPairs.length === 0) {
-			for (const job of jobs) {
-				await this.metadataStore.completeJob(job.jobId)
-			}
+			await this.metadataStore.completeJobs(jobs.map((job) => job.jobId))
 			return
 		}
 
-		await this.processUpsertJobPairs(orderedPairs, signal, emitBatchProgress, callbacks)
+		await this.processUpsertJobPairs(orderedPairs, signal, laneId, emitBatchProgress, callbacks)
+	}
+
+	private async maybeRecycleClients(
+		runId: string,
+		activeTasks: Set<Promise<void>>,
+		signal: AbortSignal | undefined,
+	): Promise<void> {
+		const recycleStartedAt = Date.now()
+		IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-recycle-pending", {
+			component: "EmbedUpsertWorker",
+			runId,
+			provider: this.embeddingAdapter.provider,
+			modelId: this.embeddingAdapter.modelId,
+			laneConcurrency: this.laneConcurrency,
+			activeLaneCount: activeTasks.size,
+			inFlightChunkCount: this.inFlightChunkCount,
+			peakInFlightChunkCount: this.peakInFlightChunkCount,
+			recycleIntervalBatches: CLIENT_RECYCLE_INTERVAL,
+			completedBatches: this.completedBatchCount,
+		})
+
+		const drained = await this.waitForActiveTasksToDrain(activeTasks, signal)
+		if (!drained) {
+			IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-recycle-skipped", {
+				component: "EmbedUpsertWorker",
+				runId,
+				provider: this.embeddingAdapter.provider,
+				modelId: this.embeddingAdapter.modelId,
+				laneConcurrency: this.laneConcurrency,
+				activeLaneCount: activeTasks.size,
+				inFlightChunkCount: this.inFlightChunkCount,
+				peakInFlightChunkCount: this.peakInFlightChunkCount,
+				recycleIntervalBatches: CLIENT_RECYCLE_INTERVAL,
+				timeoutMs: EmbedUpsertWorker.RECYCLE_DRAIN_TIMEOUT_MS,
+				elapsedMs: Date.now() - recycleStartedAt,
+				reason: "active-lanes-did-not-drain",
+			})
+			return
+		}
+
+		const memoryBefore = IndexDebugLoggerV2.getMemorySnapshot()
+		await this.embeddingAdapter.recycleClient?.()
+		await this.vectorStore.recycleClient?.()
+		const memoryAfter = IndexDebugLoggerV2.getMemorySnapshot()
+
+		IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-recycled-clients", {
+			component: "EmbedUpsertWorker",
+			runId,
+			provider: this.embeddingAdapter.provider,
+			modelId: this.embeddingAdapter.modelId,
+			laneConcurrency: this.laneConcurrency,
+			activeLaneCount: activeTasks.size,
+			inFlightChunkCount: this.inFlightChunkCount,
+			peakInFlightChunkCount: this.peakInFlightChunkCount,
+			recycleIntervalBatches: CLIENT_RECYCLE_INTERVAL,
+			completedBatches: this.completedBatchCount,
+			elapsedMs: Date.now() - recycleStartedAt,
+			memoryBefore,
+			memoryAfter,
+			externalDeltaMB: memoryAfter.externalMB - memoryBefore.externalMB,
+			rssDeltaMB: memoryAfter.rssMB - memoryBefore.rssMB,
+			arrayBuffersDeltaMB: (memoryAfter.arrayBuffersMB ?? 0) - (memoryBefore.arrayBuffersMB ?? 0),
+		})
+	}
+
+	private async waitForActiveTasksToDrain(
+		activeTasks: Set<Promise<void>>,
+		signal: AbortSignal | undefined,
+	): Promise<boolean> {
+		if (activeTasks.size === 0) {
+			return true
+		}
+
+		let abortListener: (() => void) | undefined
+		try {
+			return await Promise.race([
+				Promise.allSettled(Array.from(activeTasks)).then(() => true),
+				new Promise<boolean>((resolve, reject) => {
+					const timer = setTimeout(() => {
+						if (abortListener) {
+							signal?.removeEventListener("abort", abortListener)
+						}
+						resolve(false)
+					}, EmbedUpsertWorker.RECYCLE_DRAIN_TIMEOUT_MS)
+
+					abortListener = () => {
+						clearTimeout(timer)
+						if (abortListener) {
+							signal?.removeEventListener("abort", abortListener)
+						}
+						reject(new Error("Embed/upsert worker aborted"))
+					}
+
+					signal?.addEventListener("abort", abortListener, { once: true })
+				}),
+			])
+		} finally {
+			if (abortListener) {
+				signal?.removeEventListener("abort", abortListener)
+			}
+		}
 	}
 
 	private async processUpsertJobPairs(
@@ -376,11 +605,13 @@ export class EmbedUpsertWorker {
 			chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number]
 		}>,
 		signal: AbortSignal | undefined,
+		laneId: number,
 		emitBatchProgress: (batchTelemetry?: BatchTelemetry) => void,
 		callbacks: {
 			onRetryScheduled: () => void
 			onChunkTerminalFailure: () => void
 			onChunksUpserted: (count: number) => void
+			onConcurrencyPressure: (error: unknown) => void
 		},
 	): Promise<void> {
 		if (jobPairs.length === 0) {
@@ -416,26 +647,26 @@ export class EmbedUpsertWorker {
 			const upsertLatencyMs = Date.now() - upsertStartedAt
 
 			const metadataCommitStartedAt = Date.now()
-			for (const { chunk } of jobPairs) {
-				const pointId = this.createPointId(chunk)
-				await this.metadataStore.markChunkState(chunk.chunkId, "upserted", {
+			await this.metadataStore.markChunkStates(
+				jobPairs.map(({ chunk }) => ({
+					chunkId: chunk.chunkId,
+					state: "upserted" as const,
 					embeddingModel: this.embeddingAdapter.modelId,
-					vectorPointId: pointId,
+					vectorPointId: this.createPointId(chunk),
 					clearContent: true,
-				})
-			}
-
-			for (const { job } of jobPairs) {
-				await this.metadataStore.completeJob(job.jobId)
-			}
+				})),
+			)
+			await this.metadataStore.completeJobs(jobPairs.map(({ job }) => job.jobId))
 			const metadataCommitLatencyMs = Date.now() - metadataCommitStartedAt
 			this.lastBatchCompletedAt = Date.now()
+			this.completedBatchCount++
 
 			callbacks.onChunksUpserted(jobPairs.length)
 			emitBatchProgress({
 				batchKind: "upsert",
 				batchSize: jobPairs.length,
 				embeddingCount: embeddingResponse.embeddings.length,
+				laneId,
 				idleGapMs,
 				embedLatencyMs,
 				upsertLatencyMs,
@@ -443,14 +674,18 @@ export class EmbedUpsertWorker {
 				totalLatencyMs: Date.now() - batchStartedAt,
 			})
 		} catch (error) {
+			if (this.isConcurrencyPressureError(error)) {
+				callbacks.onConcurrencyPressure(error)
+			}
+
 			if (jobPairs.length === 1) {
 				await this.handleSingleUpsertFailure(jobPairs[0], error, callbacks)
 				return
 			}
 
 			const midpoint = Math.ceil(jobPairs.length / 2)
-			await this.processUpsertJobPairs(jobPairs.slice(0, midpoint), signal, emitBatchProgress, callbacks)
-			await this.processUpsertJobPairs(jobPairs.slice(midpoint), signal, emitBatchProgress, callbacks)
+			await this.processUpsertJobPairs(jobPairs.slice(0, midpoint), signal, laneId, emitBatchProgress, callbacks)
+			await this.processUpsertJobPairs(jobPairs.slice(midpoint), signal, laneId, emitBatchProgress, callbacks)
 		}
 	}
 
@@ -484,6 +719,7 @@ export class EmbedUpsertWorker {
 	private async processDeleteJobs(
 		jobs: Awaited<ReturnType<MetadataStore["claimJobs"]>>,
 		signal: AbortSignal | undefined,
+		laneId: number,
 		emitBatchProgress: (batchTelemetry?: BatchTelemetry) => void,
 		callbacks: {
 			onRetryScheduled: () => void
@@ -500,13 +736,11 @@ export class EmbedUpsertWorker {
 			.filter((pair): pair is { job: (typeof jobs)[number]; chunk: (typeof chunks)[number] } => Boolean(pair))
 
 		if (orderedPairs.length === 0) {
-			for (const job of jobs) {
-				await this.metadataStore.completeJob(job.jobId)
-			}
+			await this.metadataStore.completeJobs(jobs.map((job) => job.jobId))
 			return
 		}
 
-		await this.processDeleteJobPairs(orderedPairs, signal, emitBatchProgress, callbacks)
+		await this.processDeleteJobPairs(orderedPairs, signal, laneId, emitBatchProgress, callbacks)
 	}
 
 	private async processDeleteJobPairs(
@@ -515,6 +749,7 @@ export class EmbedUpsertWorker {
 			chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number]
 		}>,
 		signal: AbortSignal | undefined,
+		laneId: number,
 		emitBatchProgress: (batchTelemetry?: BatchTelemetry) => void,
 		callbacks: {
 			onRetryScheduled: () => void
@@ -541,21 +776,24 @@ export class EmbedUpsertWorker {
 			const upsertLatencyMs = Date.now() - upsertStartedAt
 
 			const metadataCommitStartedAt = Date.now()
-			for (const { chunk } of jobPairs) {
-				await this.metadataStore.markChunkState(chunk.chunkId, "deleted", { clearContent: true })
-			}
-
-			for (const { job } of jobPairs) {
-				await this.metadataStore.completeJob(job.jobId)
-			}
+			await this.metadataStore.markChunkStates(
+				jobPairs.map(({ chunk }) => ({
+					chunkId: chunk.chunkId,
+					state: "deleted" as const,
+					clearContent: true,
+				})),
+			)
+			await this.metadataStore.completeJobs(jobPairs.map(({ job }) => job.jobId))
 			const metadataCommitLatencyMs = Date.now() - metadataCommitStartedAt
 			this.lastBatchCompletedAt = Date.now()
+			this.completedBatchCount++
 
 			callbacks.onChunksDeleted(pointIds.length)
 			emitBatchProgress({
 				batchKind: "delete",
 				batchSize: jobPairs.length,
 				embeddingCount: 0,
+				laneId,
 				idleGapMs,
 				upsertLatencyMs,
 				metadataCommitLatencyMs,
@@ -579,8 +817,8 @@ export class EmbedUpsertWorker {
 			}
 
 			const midpoint = Math.ceil(jobPairs.length / 2)
-			await this.processDeleteJobPairs(jobPairs.slice(0, midpoint), signal, emitBatchProgress, callbacks)
-			await this.processDeleteJobPairs(jobPairs.slice(midpoint), signal, emitBatchProgress, callbacks)
+			await this.processDeleteJobPairs(jobPairs.slice(0, midpoint), signal, laneId, emitBatchProgress, callbacks)
+			await this.processDeleteJobPairs(jobPairs.slice(midpoint), signal, laneId, emitBatchProgress, callbacks)
 		}
 	}
 
@@ -594,6 +832,18 @@ export class EmbedUpsertWorker {
 			EmbedUpsertWorker.RETRY_DELAY_BASE_MS * 2 ** Math.max(0, attemptCount - 1),
 		)
 		return Date.now() + delayMs
+	}
+
+	private isConcurrencyPressureError(error: unknown): boolean {
+		const message = (error instanceof Error ? error.message : String(error)).toLowerCase()
+		return (
+			message.includes("rate limit") ||
+			message.includes("429") ||
+			message.includes("timeout") ||
+			message.includes("timed out") ||
+			message.includes("deadline exceeded") ||
+			message.includes("too many requests")
+		)
 	}
 
 	private async waitForNextRetry(nextRetryAt: number, signal?: AbortSignal): Promise<void> {
@@ -662,15 +912,5 @@ export class EmbedUpsertWorker {
 		hex[16] = ((parseInt(hex[16] ?? "0", 16) & 0x3) | 0x8).toString(16)
 		const uuid = hex.join("")
 		return `${uuid.slice(0, 8)}-${uuid.slice(8, 12)}-${uuid.slice(12, 16)}-${uuid.slice(16, 20)}-${uuid.slice(20, 32)}`
-	}
-
-	private getBatchSize(): number {
-		try {
-			return vscode.workspace
-				.getConfiguration("roo-cline")
-				.get<number>("codeIndex.embeddingBatchSize", BATCH_SEGMENT_THRESHOLD)
-		} catch {
-			return BATCH_SEGMENT_THRESHOLD
-		}
 	}
 }

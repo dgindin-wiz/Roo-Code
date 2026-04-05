@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => {
 		markFileTombstoned: vi.fn().mockResolvedValue(undefined),
 		markRunComplete: vi.fn().mockResolvedValue(undefined),
 		markRunFailed: vi.fn().mockResolvedValue(undefined),
+		markRunStopped: vi.fn().mockResolvedValue(undefined),
 		clearStorage: vi.fn().mockResolvedValue(undefined),
 	}
 
@@ -42,6 +43,11 @@ const mocks = vi.hoisted(() => {
 		initialize: vi.fn().mockResolvedValue(undefined),
 		getWorkspacePath: vi.fn().mockReturnValue("/workspace"),
 		isCandidateFile: vi.fn().mockReturnValue(true),
+		statFile: vi.fn().mockResolvedValue({
+			path: "/workspace/src/example.ts",
+			mtimeMs: 1,
+			size: 128,
+		}),
 	}
 
 	const discoveryService = {
@@ -76,6 +82,10 @@ const mocks = vi.hoisted(() => {
 			checkedFiles: 2,
 			skippedFiles: 1,
 			changedFiles: 1,
+			unchangedFiles: 1,
+			oversizedFiles: 0,
+			missingFiles: 0,
+			reusedParsedRevisionIds: [],
 		}),
 	}
 
@@ -165,7 +175,9 @@ const mocks = vi.hoisted(() => {
 		reportHeartbeat: vi.fn(),
 		setActivityDetail: vi.fn(),
 		setResilienceStats: vi.fn(),
+		setRecoveryContext: vi.fn(),
 		setSystemState: vi.fn(),
+		resetIndexingState: vi.fn(),
 		reportScanProgress: vi.fn(),
 		startEmbedPhase: vi.fn(),
 		reportEmbedProgress: vi.fn(),
@@ -320,12 +332,21 @@ describe("CodeIndexEngineV2 smoke", () => {
 			checkedFiles: 2,
 			skippedFiles: 1,
 			changedFiles: 1,
+			unchangedFiles: 1,
+			oversizedFiles: 0,
+			missingFiles: 0,
+			reusedParsedRevisionIds: [],
 		})
 		mocks.reconciliationService.findMissingFiles.mockResolvedValue({
 			runId: "run-reconcile",
 			discoveredFiles: 2,
 			isPartial: false,
 			missingFiles: [],
+		})
+		mocks.workspaceAdapter.statFile.mockResolvedValue({
+			path: "/workspace/src/example.ts",
+			mtimeMs: 1,
+			size: 128,
 		})
 		mocks.parseChunkService.run
 			.mockResolvedValueOnce({
@@ -385,16 +406,40 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.metadataStore.cleanupStaleRuns).toHaveBeenCalledTimes(1)
 		expect(mocks.metadataStore.adoptRetryableJobsFromStaleRuns).toHaveBeenCalledWith("run-1", [])
 		expect(mocks.workspaceAdapter.initialize).toHaveBeenCalledTimes(1)
+		expect(mocks.vectorStore.initialize).toHaveBeenCalled()
+		expect(mocks.embeddingAdapter.createEmbeddings).toHaveBeenCalledWith(["preflight"], {
+			isQuery: true,
+			signal: expect.any(Object),
+		})
 		expect(mocks.discoveryService.runWorkspaceDiscoveryWithProgress).toHaveBeenCalledTimes(1)
-		expect(mocks.statHashService.run).toHaveBeenCalledWith("run-1", undefined, undefined, expect.any(Object))
-		expect(mocks.parseChunkService.run).toHaveBeenNthCalledWith(1, "run-1", undefined, expect.any(Function), {
-			limit: 20,
+		expect(mocks.statHashService.run).toHaveBeenCalledWith(
+			"run-1",
+			expect.any(Object),
+			undefined,
+			expect.any(Object),
+		)
+		expect(mocks.parseChunkService.run).toHaveBeenNthCalledWith(
+			1,
+			"run-1",
+			expect.any(Object),
+			expect.any(Function),
+			{
+				limit: 20,
+			},
+		)
+		expect(mocks.parseChunkService.run).toHaveBeenNthCalledWith(
+			2,
+			"run-1",
+			expect.any(Object),
+			expect.any(Function),
+			{
+				limit: 20,
+			},
+		)
+		expect(mocks.diffPlanner.run).toHaveBeenCalledWith("run-1", expect.any(Object), {
+			revisionIds: ["revision-1"],
 		})
-		expect(mocks.parseChunkService.run).toHaveBeenNthCalledWith(2, "run-1", undefined, expect.any(Function), {
-			limit: 20,
-		})
-		expect(mocks.diffPlanner.run).toHaveBeenCalledWith("run-1", undefined, { revisionIds: ["revision-1"] })
-		expect(mocks.embedUpsertWorker.run).toHaveBeenCalledWith("run-1", undefined, expect.any(Function))
+		expect(mocks.embedUpsertWorker.run).toHaveBeenCalledWith("run-1", expect.any(Object), expect.any(Function))
 		expect(mocks.watcherCoordinator.initialize).toHaveBeenCalledTimes(1)
 		expect(mocks.stateManager.startIndexingTimer).toHaveBeenCalledTimes(1)
 		expect(mocks.stateManager.reportCustomProgress).toHaveBeenCalled()
@@ -415,7 +460,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.reconciliationService.findMissingFiles).toHaveBeenCalledTimes(1)
 		expect(mocks.statHashService.run).toHaveBeenCalledWith(
 			"run-reconcile",
-			undefined,
+			expect.any(Object),
 			undefined,
 			expect.any(Object),
 		)
@@ -427,24 +472,184 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.metadataStore.dispose).toHaveBeenCalledTimes(1)
 	})
 
+	it("fails fast on Qdrant preflight before workspace discovery begins", async () => {
+		mocks.vectorStore.initialize.mockRejectedValueOnce(new Error("Qdrant unavailable"))
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+
+		await expect(engine.start()).rejects.toThrow("Qdrant unavailable")
+
+		expect(mocks.discoveryService.runWorkspaceDiscoveryWithProgress).not.toHaveBeenCalled()
+		expect(mocks.embeddingAdapter.createEmbeddings).not.toHaveBeenCalled()
+	})
+
+	it("fails fast on embedder preflight before workspace discovery begins", async () => {
+		mocks.embeddingAdapter.createEmbeddings.mockRejectedValueOnce(new Error("Embedder unavailable"))
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+
+		await expect(engine.start()).rejects.toThrow("Embedder unavailable")
+
+		expect(mocks.vectorStore.initialize).toHaveBeenCalled()
+		expect(mocks.discoveryService.runWorkspaceDiscoveryWithProgress).not.toHaveBeenCalled()
+	})
+
 	it("returns watcher-driven targeted updates to standby after the pipeline completes", async () => {
 		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
 
 		await engine.start()
 
-		mocks.metadataStore.countActiveIndexedFilesForWorkspace.mockResolvedValueOnce(2_335)
+		mocks.metadataStore.countActiveIndexedFilesForWorkspace.mockResolvedValue(2_335)
 
 		await (engine as any).runTargetedUpdate(["/workspace/src/example.ts"], "watcher")
 
 		expect(mocks.discoveryService.runTargetedDiscovery).toHaveBeenCalledWith(
 			["/workspace/src/example.ts"],
 			"watcher",
+			undefined,
 		)
 		expect(mocks.stateManager.setSystemState).toHaveBeenCalledWith("Standby", "V2 is current across 2,335 files")
 
 		const status = await engine.getStatus()
 		expect(status.state).toBe("idle")
 		expect(status.message).toBe("V2 is current across 2,335 files")
+	})
+
+	it("uses hashing_initial and explicit oversized counts on a fresh run without a baseline", async () => {
+		mocks.metadataStore.countActiveIndexedFilesForWorkspace.mockResolvedValue(0)
+		mocks.statHashService.run.mockReset()
+		mocks.statHashService.run.mockImplementation(async (_runId, _signal, _relativePaths, options) => {
+			options?.onProgress?.({
+				checkedFiles: 12,
+				changedFiles: 12,
+				skippedFiles: 2,
+				unchangedFiles: 0,
+				oversizedFiles: 2,
+				missingFiles: 0,
+			})
+			return {
+				runId: "run-1",
+				checkedFiles: 12,
+				changedFiles: 12,
+				skippedFiles: 2,
+				unchangedFiles: 0,
+				oversizedFiles: 2,
+				missingFiles: 0,
+			}
+		})
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		expect(mocks.stateManager.reportCustomProgress).toHaveBeenCalledWith(
+			"Preparing files for indexing",
+			0,
+			2,
+			expect.objectContaining({
+				detailedStage: "hashing_initial",
+			}),
+		)
+		expect(mocks.stateManager.reportCustomProgress).toHaveBeenCalledWith(
+			expect.stringContaining("Preparing files for indexing... 12 checked, 12 changed, 2 oversized"),
+			12,
+			12,
+			expect.objectContaining({
+				detailedStage: "hashing_initial",
+				changedFiles: 12,
+				unchangedFiles: 0,
+				oversizedFiles: 2,
+				missingFiles: 0,
+			}),
+		)
+	})
+
+	it("uses comparing_signatures only when a comparable baseline exists", async () => {
+		mocks.metadataStore.countActiveIndexedFilesForWorkspace.mockResolvedValue(3)
+		mocks.statHashService.run.mockReset()
+		mocks.statHashService.run.mockImplementation(async (_runId, _signal, _relativePaths, options) => {
+			options?.onProgress?.({
+				checkedFiles: 15,
+				changedFiles: 12,
+				skippedFiles: 3,
+				unchangedFiles: 3,
+				oversizedFiles: 0,
+				missingFiles: 0,
+			})
+			return {
+				runId: "run-1",
+				checkedFiles: 15,
+				changedFiles: 12,
+				skippedFiles: 3,
+				unchangedFiles: 3,
+				oversizedFiles: 0,
+				missingFiles: 0,
+			}
+		})
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		expect(mocks.stateManager.reportCustomProgress).toHaveBeenCalledWith(
+			"Comparing file signatures",
+			0,
+			2,
+			expect.objectContaining({
+				detailedStage: "comparing_signatures",
+			}),
+		)
+		expect(mocks.stateManager.reportCustomProgress).toHaveBeenCalledWith(
+			expect.stringContaining("Comparing file signatures... 15 checked, 12 changed, 3 unchanged"),
+			15,
+			15,
+			expect.objectContaining({
+				detailedStage: "comparing_signatures",
+				changedFiles: 12,
+				unchangedFiles: 3,
+				oversizedFiles: 0,
+				missingFiles: 0,
+			}),
+		)
+	})
+
+	it("retires newly oversized files immediately during targeted updates", async () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+
+		await engine.start()
+		mocks.discoveryService.runTargetedDiscovery.mockClear()
+		mocks.metadataStore.beginRun.mockResolvedValueOnce("oversized-run")
+		mocks.metadataStore.getFileRecordByWorkspacePathOptional.mockResolvedValueOnce({
+			fileId: "file-oversized",
+			relativePath: "src/huge.pb.go",
+		})
+		mocks.metadataStore.getActiveRevisionForFile.mockResolvedValueOnce({
+			revisionId: "active-revision",
+		})
+		mocks.metadataStore.getChunksForRevision.mockResolvedValueOnce([{ chunkId: "chunk-1" }, { chunkId: "chunk-2" }])
+		mocks.workspaceAdapter.statFile.mockResolvedValueOnce({
+			path: "/workspace/src/huge.pb.go",
+			mtimeMs: 2,
+			size: 1_048_577,
+		})
+
+		await (engine as any).runTargetedUpdate(["/workspace/src/huge.pb.go"], "watcher")
+
+		expect(mocks.discoveryService.runTargetedDiscovery).not.toHaveBeenCalled()
+		expect(mocks.metadataStore.beginRun).toHaveBeenCalledWith("oversized-watcher")
+		expect(mocks.metadataStore.enqueueJobs).toHaveBeenCalledWith([
+			{
+				workspaceId: "workspace-1",
+				runId: "oversized-run",
+				jobType: "delete",
+				entityId: "chunk-1",
+			},
+			{
+				workspaceId: "workspace-1",
+				runId: "oversized-run",
+				jobType: "delete",
+				entityId: "chunk-2",
+			},
+		])
+		expect(mocks.metadataStore.markFileTombstoned).toHaveBeenCalledWith("file-oversized", true)
 	})
 
 	it("clears live V2 state instead of leaving watcher status behind", async () => {
@@ -463,11 +668,96 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.vectorStore.recycleClient).toHaveBeenCalled()
 		expect(mocks.embeddingAdapter.recycleClient).toHaveBeenCalled()
 		expect(mocks.metadataStore.clearStorage).toHaveBeenCalledTimes(1)
-		expect(mocks.stateManager.setSystemState).toHaveBeenCalledWith("Standby", "Index data cleared successfully.")
+		expect(mocks.stateManager.resetIndexingState).toHaveBeenCalledWith("Index data cleared successfully.")
 		expect((engine as any)._started).toBe(false)
 		expect((engine as any)._watcherCoordinator).toBeUndefined()
 		expect((engine as any)._embeddingAdapter).toBeUndefined()
 		expect((engine as any)._vectorStore).toBeUndefined()
+		expect((engine as any)._staleRunIdsToResume).toEqual([])
+		expect((engine as any)._resumedRetryJobsCount).toBe(0)
+		expect((engine as any)._resumedPendingJobsCount).toBe(0)
+		expect((engine as any)._lastCpuSample).toBeUndefined()
+	})
+
+	it("aborts an active run on stop and settles in standby instead of error", async () => {
+		mocks.discoveryService.runWorkspaceDiscoveryWithProgress.mockResolvedValueOnce({
+			runId: "run-1",
+			discoveredFiles: 2,
+			isPartial: false,
+		})
+		mocks.statHashService.run.mockReset()
+		mocks.statHashService.run.mockImplementation(
+			async (_runId, signal) =>
+				new Promise((resolve, reject) => {
+					if (signal?.aborted) {
+						reject(new Error("Stat/hash stage aborted"))
+						return
+					}
+					signal?.addEventListener("abort", () => reject(new Error("Stat/hash stage aborted")), {
+						once: true,
+					})
+				}),
+		)
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		const startPromise = engine.start()
+		for (let i = 0; i < 10; i++) {
+			await Promise.resolve()
+		}
+		expect(mocks.statHashService.run).toHaveBeenCalledTimes(1)
+
+		await expect(engine.stop()).resolves.toBeUndefined()
+		await expect(startPromise).resolves.toBeUndefined()
+
+		expect(mocks.stateManager.setSystemState).toHaveBeenCalledWith("Stopping", "Stopping indexing...")
+		expect(mocks.stateManager.setSystemState).toHaveBeenCalledWith("Standby", "Indexing stopped.")
+		expect(mocks.metadataStore.markRunStopped).toHaveBeenCalledWith("run-1", "Stopped by user.")
+		expect(mocks.metadataStore.dispose).toHaveBeenCalled()
+		const status = await engine.getStatus()
+		expect(status.state).toBe("idle")
+		expect(status.message).toBe("Indexing stopped.")
+	})
+
+	it("plans and syncs preserved parsed revisions reused from a previous run", async () => {
+		mocks.statHashService.run.mockReset()
+		mocks.statHashService.run.mockResolvedValueOnce({
+			runId: "run-1",
+			checkedFiles: 5,
+			skippedFiles: 0,
+			changedFiles: 1,
+			unchangedFiles: 0,
+			oversizedFiles: 0,
+			missingFiles: 0,
+			reusedParsedRevisionIds: ["revision-reused"],
+		})
+		mocks.metadataStore.getChunksForRevision.mockResolvedValueOnce([
+			{
+				chunkId: "chunk-reused",
+				revisionId: "revision-reused",
+			},
+			{
+				chunkId: "chunk-reused-2",
+				revisionId: "revision-reused",
+			},
+		])
+		mocks.parseChunkService.run.mockReset()
+		mocks.parseChunkService.run.mockResolvedValueOnce({
+			runId: "run-1",
+			attemptedRevisions: 0,
+			parsedRevisions: 0,
+			parsedChunks: 0,
+			parsedRevisionIds: [],
+			retryingRevisions: 0,
+			terminalFailedRevisions: 0,
+		})
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		expect(mocks.diffPlanner.run).toHaveBeenCalledWith("run-1", expect.anything(), {
+			revisionIds: ["revision-reused"],
+		})
+		expect(mocks.embedUpsertWorker.run).toHaveBeenCalled()
 	})
 
 	it("reports raw parsed chunk totals to the state manager so embedding estimates are not double-extrapolated", async () => {
@@ -523,8 +813,28 @@ describe("CodeIndexEngineV2 smoke", () => {
 		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
 		await engine.start()
 
-		expect(mocks.stateManager.reportEmbedProgress).toHaveBeenCalledWith(0, 10, 2)
-		expect(mocks.stateManager.reportEmbedProgress).toHaveBeenCalledWith(4, 10, 2, false)
+		expect(mocks.stateManager.startEmbedPhase).toHaveBeenCalledWith(
+			10,
+			true,
+			10,
+			0,
+			expect.objectContaining({
+				detailedStage: "planning_vectors",
+				hasKnownVectorWork: true,
+				hasStartedVectorSync: false,
+			}),
+		)
+		expect(mocks.stateManager.reportEmbedProgress).toHaveBeenCalledWith(
+			4,
+			10,
+			2,
+			false,
+			expect.objectContaining({
+				detailedStage: "embedding",
+				hasKnownVectorWork: true,
+				hasStartedVectorSync: true,
+			}),
+		)
 	})
 
 	it("continues parsing after an all-failure batch instead of treating it as completion", async () => {
@@ -582,7 +892,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 		await engine.start()
 
 		expect(mocks.parseChunkService.run).toHaveBeenCalledTimes(3)
-		expect(mocks.diffPlanner.run).toHaveBeenCalledWith("run-1", undefined, {
+		expect(mocks.diffPlanner.run).toHaveBeenCalledWith("run-1", expect.any(Object), {
 			revisionIds: ["revision-recovered"],
 		})
 		expect(mocks.embedUpsertWorker.run).toHaveBeenCalled()
@@ -614,6 +924,66 @@ describe("CodeIndexEngineV2 smoke", () => {
 		const status = await engine.getStatus()
 		expect(status.message).toContain("V2 mapped 2 files")
 		expect(status.message).not.toContain("queued retry jobs")
+	})
+
+	it("does not enter embedding for a no-op background reconcile on an already indexed workspace", async () => {
+		mocks.statHashService.run.mockReset()
+		mocks.statHashService.run.mockResolvedValueOnce({
+			runId: "run-1",
+			checkedFiles: 2,
+			skippedFiles: 1,
+			changedFiles: 1,
+		})
+		mocks.statHashService.run.mockResolvedValueOnce({
+			runId: "run-reconcile",
+			checkedFiles: 2,
+			skippedFiles: 2,
+			changedFiles: 0,
+		})
+		mocks.parseChunkService.run.mockReset()
+		mocks.parseChunkService.run
+			.mockResolvedValueOnce({
+				runId: "run-1",
+				attemptedRevisions: 1,
+				parsedRevisions: 1,
+				parsedChunks: 3,
+				parsedRevisionIds: ["revision-1"],
+				retryingRevisions: 0,
+				terminalFailedRevisions: 0,
+			})
+			.mockResolvedValueOnce({
+				runId: "run-1",
+				attemptedRevisions: 0,
+				parsedRevisions: 0,
+				parsedChunks: 0,
+				parsedRevisionIds: [],
+				retryingRevisions: 0,
+				terminalFailedRevisions: 0,
+			})
+		mocks.embedUpsertWorker.run.mockClear()
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+		mocks.stateManager.startEmbedPhase.mockClear()
+		mocks.stateManager.reportEmbedProgress.mockClear()
+		mocks.stateManager.reportCustomProgress.mockClear()
+
+		await (engine as any).runReconciliation()
+
+		expect(mocks.discoveryService.runReconciliationDiscovery).toHaveBeenCalledTimes(1)
+		expect(mocks.embedUpsertWorker.run).toHaveBeenCalledTimes(1)
+		expect(mocks.stateManager.startEmbedPhase).not.toHaveBeenCalled()
+		expect(mocks.stateManager.reportEmbedProgress).not.toHaveBeenCalled()
+		expect(mocks.stateManager.reportCustomProgress).toHaveBeenCalledWith(
+			"Reconciling local state with the workspace",
+			0,
+			1,
+			expect.objectContaining({
+				detailedStage: "reconciling",
+				isBackgroundReconcile: true,
+			}),
+		)
+		expect(mocks.stateManager.setSystemState).toHaveBeenCalledWith("Standby", "V2 is current across 3 files")
 	})
 
 	it("resumes queued retry jobs from prior failed runs even without freshly detected stale runs", async () => {
@@ -674,6 +1044,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.discoveryService.runTargetedDiscovery).toHaveBeenCalledWith(
 			["/workspace/src/problematic/parser.ts", "/workspace/src/problematic/embed.ts"],
 			"manual",
+			undefined,
 		)
 	})
 
@@ -695,6 +1066,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.discoveryService.runTargetedDiscovery).toHaveBeenCalledWith(
 			["/workspace/src/problematic/embed.ts"],
 			"manual",
+			undefined,
 		)
 	})
 })

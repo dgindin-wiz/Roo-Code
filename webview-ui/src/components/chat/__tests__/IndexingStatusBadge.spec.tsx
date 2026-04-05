@@ -4,6 +4,7 @@ import { render, screen, fireEvent, waitFor, act } from "@/utils/test-utils"
 import { vscode } from "@src/utils/vscode"
 
 import { IndexingStatusBadge } from "../IndexingStatusBadge"
+import { getIndexingBadgeTooltipText } from "../IndexingStatusBadge"
 
 vi.mock("@/i18n/setup", () => ({
 	__esModule: true,
@@ -248,6 +249,60 @@ describe("IndexingStatusBadge", () => {
 				"Indexed — resuming 4 unfinished jobs from the previous run, 2 degraded files, 1 failed file",
 			)
 		})
+	})
+
+	it("uses truth-first tooltip text for pre-embed planning work", () => {
+		const text = getIndexingBadgeTooltipText(
+			{
+				systemStatus: "Indexing",
+				processedItems: 0,
+				totalItems: 10,
+				currentItemUnit: "files",
+				detailedStage: "planning_vectors",
+				hasKnownVectorWork: true,
+				hasStartedVectorSync: false,
+			},
+			false,
+			(key: string) => key,
+			0,
+		)
+
+		expect(text).toBe("Preparing vector workload")
+	})
+
+	it("uses calm tooltip text for background reconcile work", () => {
+		const text = getIndexingBadgeTooltipText(
+			{
+				systemStatus: "Indexing",
+				processedItems: 0,
+				totalItems: 1,
+				currentItemUnit: "phases",
+				detailedStage: "reconciling",
+				isBackgroundReconcile: true,
+			},
+			false,
+			(key: string) => key,
+			0,
+		)
+
+		expect(text).toBe("Checking for workspace changes")
+	})
+
+	it("uses truth-first tooltip text for fresh-start stat/hash work", () => {
+		const text = getIndexingBadgeTooltipText(
+			{
+				systemStatus: "Indexing",
+				processedItems: 12,
+				totalItems: 40,
+				currentItemUnit: "files",
+				detailedStage: "hashing_initial",
+			},
+			false,
+			(key: string) => key,
+			0,
+		)
+
+		expect(text).toBe("Preparing files for indexing — 12 of 40 checked")
 	})
 
 	it("cleans up event listener on unmount", () => {

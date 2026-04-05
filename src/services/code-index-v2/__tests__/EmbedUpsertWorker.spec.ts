@@ -4,7 +4,15 @@ import { EmbedUpsertWorker } from "../pipeline/EmbedUpsertWorker"
 vi.mock("vscode", () => ({
 	workspace: {
 		getConfiguration: vi.fn().mockReturnValue({
-			get: vi.fn((_key: string, defaultValue: unknown) => defaultValue),
+			get: vi.fn((key: string, defaultValue: unknown) => {
+				if (key === "codeIndex.embeddingBatchSize") {
+					return 2
+				}
+				if (key === "codeIndex.embeddingLaneConcurrency") {
+					return 2
+				}
+				return defaultValue
+			}),
 		}),
 	},
 }))
@@ -15,14 +23,16 @@ describe("EmbedUpsertWorker", () => {
 			claimJobs: vi.fn(),
 			getChunksByIds: vi.fn(),
 			completeJob: vi.fn().mockResolvedValue(undefined),
+			completeJobs: vi.fn().mockResolvedValue(undefined),
 			failJob: vi.fn().mockResolvedValue(undefined),
 			markJobTerminalFailed: vi.fn().mockResolvedValue(undefined),
 			markChunkState: vi.fn().mockResolvedValue(undefined),
+			markChunkStates: vi.fn().mockResolvedValue(undefined),
 			getNextRetryAt: vi.fn(),
 			getRevisionsByState: vi.fn(),
 			getWorkspaceId: vi.fn().mockReturnValue("workspace-1"),
 			getRevisionJobResolution: vi.fn(),
-			getPreviousCommittedRevision: vi.fn(),
+			getDiffBaselineRevision: vi.fn(),
 			markRevisionCommitted: vi.fn().mockResolvedValue(undefined),
 			markRevisionDegraded: vi.fn().mockResolvedValue(undefined),
 			markRevisionTerminalFailure: vi.fn().mockResolvedValue(undefined),
@@ -30,14 +40,17 @@ describe("EmbedUpsertWorker", () => {
 		}
 
 		const embeddingAdapter = {
+			provider: "openai-compatible",
 			modelId: "test-embed-model",
 			createEmbeddings: vi.fn(),
+			recycleClient: vi.fn().mockResolvedValue(undefined),
 		}
 
 		const vectorStore = {
 			initialize: vi.fn().mockResolvedValue(undefined),
 			upsertPoints: vi.fn().mockResolvedValue(undefined),
 			deletePointsByIds: vi.fn().mockResolvedValue(undefined),
+			recycleClient: vi.fn().mockResolvedValue(undefined),
 		}
 
 		return { metadataStore, embeddingAdapter, vectorStore }
@@ -126,7 +139,7 @@ describe("EmbedUpsertWorker", () => {
 			terminalFailedJobs: 0,
 			totalJobs: 1,
 		})
-		metadataStore.getPreviousCommittedRevision.mockResolvedValue(undefined)
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
 		embeddingAdapter.createEmbeddings
 			.mockRejectedValueOnce(new Error("temporary embed failure"))
 			.mockResolvedValueOnce({ embeddings: [[0.1, 0.2, 0.3]] })
@@ -135,11 +148,13 @@ describe("EmbedUpsertWorker", () => {
 		const summary = await worker.run("run-1")
 
 		expect(metadataStore.failJob).toHaveBeenCalledTimes(1)
-		expect(metadataStore.completeJob).toHaveBeenCalledTimes(1)
+		expect(metadataStore.completeJobs).toHaveBeenCalledTimes(1)
 		expect(metadataStore.markRevisionCommitted).toHaveBeenCalledWith("revision-1")
 		expect(summary.retryingChunks).toBe(1)
 		expect(summary.upsertedChunks).toBe(1)
 		expect(summary.committedRevisions).toBe(1)
+		expect(summary.laneConcurrency).toBe(2)
+		expect(summary.peakInFlightChunkCount).toBeGreaterThanOrEqual(1)
 	})
 
 	it("isolates a permanently failing chunk so an unrelated chunk can still commit", async () => {
@@ -255,7 +270,7 @@ describe("EmbedUpsertWorker", () => {
 				totalJobs: 1,
 			}
 		})
-		metadataStore.getPreviousCommittedRevision.mockResolvedValue(undefined)
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
 		embeddingAdapter.createEmbeddings.mockImplementation(async (texts: string[]) => {
 			if (texts.length === 2) {
 				throw new Error("batch failed")
@@ -382,7 +397,7 @@ describe("EmbedUpsertWorker", () => {
 			terminalFailedJobs: 1,
 			totalJobs: 2,
 		})
-		metadataStore.getPreviousCommittedRevision.mockResolvedValue({
+		metadataStore.getDiffBaselineRevision.mockResolvedValue({
 			revisionId: "previous-revision",
 		})
 		embeddingAdapter.createEmbeddings.mockImplementation(async (texts: string[]) => {
@@ -407,5 +422,180 @@ describe("EmbedUpsertWorker", () => {
 		expect(summary.degradedRevisions).toBe(1)
 		expect(summary.terminallyFailedChunks).toBe(1)
 		expect(summary.upsertedChunks).toBe(1)
+	})
+
+	it("processes upsert batches with bounded concurrency and tracks in-flight counts", async () => {
+		const { metadataStore, embeddingAdapter, vectorStore } = createWorkerDeps()
+		const now = Date.now()
+		const jobs = Array.from({ length: 4 }, (_, index) => ({
+			jobId: `job-${index + 1}`,
+			workspaceId: "workspace-1",
+			runId: "run-1",
+			jobType: "upsert",
+			entityId: `chunk-${index + 1}`,
+			state: "running" as const,
+			priority: 100,
+			attemptCount: 1,
+			nextAttemptAt: now,
+			lastError: null,
+			createdAt: now,
+			updatedAt: now,
+		}))
+		const chunks = jobs.map((job, index) => ({
+			chunkId: job.entityId,
+			revisionId: `revision-${index + 1}`,
+			chunkFingerprint: `fp-${index + 1}`,
+			startLine: 1,
+			endLine: 2,
+			content: `content-${index + 1}`,
+			contentHash: `hash-${index + 1}`,
+			tokenEstimate: 5,
+			embeddingModel: null,
+			vectorPointId: null,
+			state: "parsed" as const,
+			createdAt: now,
+			updatedAt: now,
+			fileId: `file-${index + 1}`,
+			workspaceId: "workspace-1",
+			relativePath: `src/file-${index + 1}.ts`,
+			normalizedPath: `/workspace/src/file-${index + 1}.ts`,
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+		}))
+
+		let claimIndex = 0
+		metadataStore.claimJobs.mockImplementation(async (jobType: string, limit: number) => {
+			if (jobType === "delete") {
+				return []
+			}
+
+			if (claimIndex >= jobs.length) {
+				return []
+			}
+
+			const claimed = jobs.slice(claimIndex, claimIndex + limit)
+			claimIndex += claimed.length
+			return claimed
+		})
+		metadataStore.getChunksByIds.mockImplementation(async (chunkIds: string[]) =>
+			chunks.filter((chunk) => chunkIds.includes(chunk.chunkId)),
+		)
+		metadataStore.getNextRetryAt.mockResolvedValue(undefined)
+		metadataStore.getRevisionsByState.mockResolvedValue(
+			chunks.map((chunk) => ({ revisionId: chunk.revisionId, fileId: chunk.fileId, runId: "run-1" })),
+		)
+		metadataStore.getRevisionJobResolution.mockResolvedValue({
+			doneJobs: 1,
+			queuedJobs: 0,
+			runningJobs: 0,
+			terminalFailedJobs: 0,
+			totalJobs: 1,
+		})
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
+
+		let concurrentEmbeds = 0
+		let peakConcurrentEmbeds = 0
+		embeddingAdapter.createEmbeddings.mockImplementation(async (texts: string[]) => {
+			concurrentEmbeds++
+			peakConcurrentEmbeds = Math.max(peakConcurrentEmbeds, concurrentEmbeds)
+			await new Promise((resolve) => setTimeout(resolve, texts.length === 1 ? 5 : 20))
+			concurrentEmbeds--
+			return { embeddings: texts.map(() => [0.1, 0.2, 0.3]) }
+		})
+
+		const worker = new EmbedUpsertWorker(metadataStore as any, embeddingAdapter as any, vectorStore as any)
+		const progressSnapshots: Array<{ inFlightChunkCount: number; peakInFlightChunkCount: number }> = []
+		const summary = await worker.run("run-1", undefined, (progress) => {
+			progressSnapshots.push({
+				inFlightChunkCount: progress.inFlightChunkCount,
+				peakInFlightChunkCount: progress.peakInFlightChunkCount,
+			})
+		})
+
+		expect(peakConcurrentEmbeds).toBeGreaterThan(1)
+		expect(summary.laneConcurrency).toBe(2)
+		expect(summary.peakInFlightChunkCount).toBeLessThanOrEqual(summary.laneConcurrency * 60)
+		expect(progressSnapshots.some((snapshot) => snapshot.peakInFlightChunkCount >= 2)).toBe(true)
+		expect(summary.upsertedChunks).toBe(4)
+	})
+
+	it("drains and recycles shared clients after sustained batch volume", async () => {
+		const { metadataStore, embeddingAdapter, vectorStore } = createWorkerDeps()
+		const now = Date.now()
+		const jobs = Array.from({ length: 50 }, (_, index) => ({
+			jobId: `job-${index + 1}`,
+			workspaceId: "workspace-1",
+			runId: "run-1",
+			jobType: "upsert",
+			entityId: `chunk-${index + 1}`,
+			state: "running" as const,
+			priority: 100,
+			attemptCount: 1,
+			nextAttemptAt: now,
+			lastError: null,
+			createdAt: now,
+			updatedAt: now,
+		}))
+		const chunks = jobs.map((job, index) => ({
+			chunkId: job.entityId,
+			revisionId: `revision-${index + 1}`,
+			chunkFingerprint: `fp-${index + 1}`,
+			startLine: 1,
+			endLine: 2,
+			content: `content-${index + 1}`,
+			contentHash: `hash-${index + 1}`,
+			tokenEstimate: 5,
+			embeddingModel: null,
+			vectorPointId: null,
+			state: "parsed" as const,
+			createdAt: now,
+			updatedAt: now,
+			fileId: `file-${index + 1}`,
+			workspaceId: "workspace-1",
+			relativePath: `src/file-${index + 1}.ts`,
+			normalizedPath: `/workspace/src/file-${index + 1}.ts`,
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+		}))
+
+		let claimIndex = 0
+		metadataStore.claimJobs.mockImplementation(async (jobType: string, limit: number) => {
+			if (jobType === "delete") {
+				return []
+			}
+
+			if (claimIndex >= jobs.length) {
+				return []
+			}
+
+			const claimed = jobs.slice(claimIndex, claimIndex + limit)
+			claimIndex += claimed.length
+			return claimed
+		})
+		metadataStore.getChunksByIds.mockImplementation(async (chunkIds: string[]) =>
+			chunks.filter((chunk) => chunkIds.includes(chunk.chunkId)),
+		)
+		metadataStore.getNextRetryAt.mockResolvedValue(undefined)
+		metadataStore.getRevisionsByState.mockResolvedValue(
+			chunks.map((chunk) => ({ revisionId: chunk.revisionId, fileId: chunk.fileId, runId: "run-1" })),
+		)
+		metadataStore.getRevisionJobResolution.mockResolvedValue({
+			doneJobs: 1,
+			queuedJobs: 0,
+			runningJobs: 0,
+			terminalFailedJobs: 0,
+			totalJobs: 1,
+		})
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
+		embeddingAdapter.createEmbeddings.mockResolvedValue({
+			embeddings: Array.from({ length: 2 }, () => [0.1, 0.2, 0.3]),
+		})
+
+		const worker = new EmbedUpsertWorker(metadataStore as any, embeddingAdapter as any, vectorStore as any)
+		const summary = await worker.run("run-1")
+
+		expect(summary.batchesCompleted).toBe(25)
+		expect(embeddingAdapter.recycleClient).toHaveBeenCalledTimes(1)
+		expect(vectorStore.recycleClient).toHaveBeenCalledTimes(1)
 	})
 })

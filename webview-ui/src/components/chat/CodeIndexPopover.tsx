@@ -12,7 +12,12 @@ import {
 import * as ProgressPrimitive from "@radix-ui/react-progress"
 import { AlertTriangle } from "lucide-react"
 
-import { type IndexingStatus, type EmbedderProvider, CODEBASE_INDEX_DEFAULTS } from "@roo-code/types"
+import {
+	type IndexingStatus,
+	type IndexingDetailedStage,
+	type EmbedderProvider,
+	CODEBASE_INDEX_DEFAULTS,
+} from "@roo-code/types"
 
 import { vscode } from "@src/utils/vscode"
 import { useExtensionState } from "@src/context/ExtensionStateContext"
@@ -88,6 +93,112 @@ function formatCountLabel(count: number, singular: string, plural: string): stri
 	return `${count.toLocaleString()} ${count === 1 ? singular : plural}`
 }
 
+export function getIndexingHeadline(indexingStatus: IndexingStatus, isCurrentStandby: boolean, t: any): string {
+	if (isCurrentStandby) {
+		return t("settings:codeIndex.liveWatcherHeadline")
+	}
+	if (indexingStatus.systemStatus !== "Indexing") {
+		return (indexingStatus.message ?? "").split("\n")[0] ?? ""
+	}
+
+	switch (indexingStatus.detailedStage) {
+		case "preparing":
+			return "Preparing workspace index"
+		case "discovering":
+			return "Discovering workspace files"
+		case "hashing_initial":
+			return "Preparing files for indexing"
+		case "comparing_signatures":
+			return "Checking for changed files"
+		case "parsing":
+			return "Preparing changed files for indexing"
+		case "planning_vectors":
+			return indexingStatus.hasKnownVectorWork ? "Preparing vector workload" : "Checking for vector work"
+		case "embedding":
+			return "Building embeddings and syncing vectors"
+		case "deleting_vectors":
+			return "Removing stale vectors"
+		case "reconciling":
+			return indexingStatus.isBackgroundReconcile
+				? "Checking for workspace changes"
+				: "Reconciling workspace state"
+		case "complete":
+			return (indexingStatus.message ?? "").split("\n")[0] ?? ""
+		default:
+			if (indexingStatus.phase === "embedding") {
+				return "Building embeddings and syncing vectors"
+			}
+			if (indexingStatus.phase === "scanning") {
+				return "Checking workspace files"
+			}
+			return (indexingStatus.message ?? "").split("\n")[0] ?? ""
+	}
+}
+
+export function getProgressStageLabel(stage?: IndexingDetailedStage, phase?: IndexingStatus["phase"]): string {
+	switch (stage) {
+		case "embedding":
+		case "planning_vectors":
+			return "Embedding pass"
+		case "deleting_vectors":
+			return "Cleanup pass"
+		default:
+			return phase === "embedding" ? "Embedding pass" : "Workspace pass"
+	}
+}
+
+function parseTelemetryToken(token: string): {
+	label: string
+	value: string
+	emphasis?: "numeric" | "text"
+} {
+	if (token.startsWith("Memory ")) {
+		return {
+			label: "Memory",
+			value: token.replace(/^Memory\s+/, ""),
+			emphasis: "numeric",
+		}
+	}
+
+	if (token.startsWith("CPU ")) {
+		return {
+			label: "CPU",
+			value: token.replace(/^CPU\s+/, ""),
+			emphasis: "numeric",
+		}
+	}
+
+	if (token.includes("chunks/sec")) {
+		return {
+			label: "Throughput",
+			value: token,
+			emphasis: "numeric",
+		}
+	}
+
+	if (token.includes("avg batch")) {
+		return {
+			label: "Avg batch",
+			value: token,
+			emphasis: "numeric",
+		}
+	}
+
+	if (token.includes("sync batches")) {
+		return {
+			label: "Sync batches",
+			value: token,
+			emphasis: "numeric",
+		}
+	}
+
+	return {
+		label: "Status",
+		value: token,
+		emphasis: "text",
+	}
+}
+
 interface CodeIndexPopoverProps {
 	children: React.ReactNode
 	indexingStatus: IndexingStatus
@@ -105,6 +216,7 @@ interface LocalCodeIndexSettings {
 	codebaseIndexSearchMinScore?: number
 	codebaseIndexMaxFiles?: number
 	codebaseIndexEmbeddingBatchSize?: number
+	codebaseIndexEmbeddingLaneConcurrency?: number
 	codebaseIndexDebugLogging: boolean
 	maximumIndexedFilesForFileSearch?: number
 	codebaseIndexRespectGitIgnore: boolean
@@ -134,6 +246,8 @@ const createValidationSchema = (provider: EmbedderProvider, t: any) => {
 			.min(1, t("settings:codeIndex.validation.qdrantUrlRequired"))
 			.url(t("settings:codeIndex.validation.invalidQdrantUrl")),
 		codeIndexQdrantApiKey: z.string().optional(),
+		codebaseIndexEmbeddingBatchSize: z.number().int().min(1).max(200).optional(),
+		codebaseIndexEmbeddingLaneConcurrency: z.number().int().min(1).max(3).optional(),
 	})
 
 	switch (provider) {
@@ -281,6 +395,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		codebaseIndexSearchMinScore: CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_MIN_SCORE,
 		codebaseIndexMaxFiles: 100000,
 		codebaseIndexEmbeddingBatchSize: 60,
+		codebaseIndexEmbeddingLaneConcurrency: 2,
 		codebaseIndexDebugLogging: false,
 		maximumIndexedFilesForFileSearch: 10000,
 		codebaseIndexRespectGitIgnore: true,
@@ -308,15 +423,15 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		setIndexingStatus(externalIndexingStatus)
 		setWarningDetailsState((prev) => ({
 			...prev,
-			items: externalIndexingStatus.warningDetails ?? [],
-			total: Math.max(prev.total, externalIndexingStatus.warningDetails?.length ?? 0),
-			hasMore:
-				(prev.total || 0) > (externalIndexingStatus.warningDetails?.length ?? 0) ||
-				(externalIndexingStatus.warningDetails?.length ?? 0) >= 8,
-			filter: prev.filter,
-			sort: prev.sort,
+			...(warningDetailsBootstrapped
+				? {}
+				: {
+						items: externalIndexingStatus.warningDetails ?? [],
+						total: externalIndexingStatus.warningDetails?.length ?? 0,
+						hasMore: (externalIndexingStatus.warningDetails?.length ?? 0) >= 8,
+					}),
 		}))
-	}, [externalIndexingStatus])
+	}, [externalIndexingStatus, warningDetailsBootstrapped])
 
 	useEffect(() => {
 		if (!isSetupSettingsOpen) {
@@ -353,6 +468,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 					codebaseIndexConfig.codebaseIndexSearchMinScore ?? CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_MIN_SCORE,
 				codebaseIndexMaxFiles: codebaseIndexConfig.codebaseIndexMaxFiles ?? 100000,
 				codebaseIndexEmbeddingBatchSize: codebaseIndexConfig.codebaseIndexEmbeddingBatchSize ?? 60,
+				codebaseIndexEmbeddingLaneConcurrency: codebaseIndexConfig.codebaseIndexEmbeddingLaneConcurrency ?? 2,
 				codebaseIndexDebugLogging: codebaseIndexConfig.codebaseIndexDebugLogging ?? false,
 				maximumIndexedFilesForFileSearch: codebaseIndexConfig.maximumIndexedFilesForFileSearch ?? 10000,
 				codebaseIndexRespectGitIgnore: codebaseIndexConfig.codebaseIndexRespectGitIgnore ?? true,
@@ -437,6 +553,15 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 					setRetryWarningsPending(false)
 					setRetryingWarningPath(null)
 				}
+			} else if (event.data.type === "indexCleared") {
+				if (event.data.values?.success) {
+					setRetryWarningsPending(false)
+					setRetryingWarningPath(null)
+					setWarningFilter("all")
+					setWarningSort("severity")
+					resetWarningDetailsState("all", "severity")
+					vscode.postMessage({ type: "requestIndexingStatus" })
+				}
 			} else if (event.data.type === "indexingWarningDetails") {
 				if (!event.data.values.workspacePath || event.data.values.workspacePath === cwd) {
 					setWarningDetailsState((prev) => ({
@@ -481,7 +606,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 
 		window.addEventListener("message", handleMessage)
 		return () => window.removeEventListener("message", handleMessage)
-	}, [t, cwd])
+	}, [t, cwd, resetWarningDetailsState])
 
 	useEffect(() => {
 		if (!open) {
@@ -744,38 +869,36 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		})
 	}
 
-	const scanSubphase = useMemo(() => {
-		const message = indexingStatus.message ?? ""
-		if (message.startsWith("Comparing file signatures")) {
-			return "signature-compare"
-		}
-		if (message.startsWith("Walking the workspace")) {
-			return "discovery"
-		}
-		if (message.startsWith("Remote index is empty, rebuilding")) {
-			return "remote-rebuild"
-		}
-		return indexingStatus.phase === "scanning" ? "generic-scan" : null
-	}, [indexingStatus.message, indexingStatus.phase])
+	const detailedStage = indexingStatus.detailedStage
 	const progressPercentage = useMemo(() => {
-		// Use block-level progress during embedding (uniform cost per block → accurate ETA)
-		if (indexingStatus.phase === "embedding" && indexingStatus.totalBlocks && indexingStatus.totalBlocks > 0) {
-			// Clamp to 100% — the estimate can lag behind actual embedded count
+		if (
+			detailedStage === "embedding" &&
+			indexingStatus.hasStartedVectorSync &&
+			indexingStatus.totalBlocks &&
+			indexingStatus.totalBlocks > 0
+		) {
 			return Math.min(100, Math.round(((indexingStatus.blocksEmbedded ?? 0) / indexingStatus.totalBlocks) * 100))
 		}
-		if (indexingStatus.phase === "scanning" && scanSubphase === "discovery") {
+		if (detailedStage === "discovering") {
 			const processed = indexingStatus.processedItems ?? 0
 			const rawTotal = Math.max(indexingStatus.totalItems ?? 0, processed, 1)
 			const guardedTotal = rawTotal <= processed ? Math.max(Math.ceil(processed * 1.1), processed + 1) : rawTotal
 			return Math.min(99, Math.round((processed / guardedTotal) * 100))
+		}
+		if (
+			detailedStage === "preparing" ||
+			detailedStage === "planning_vectors" ||
+			(detailedStage === "embedding" && !indexingStatus.hasStartedVectorSync)
+		) {
+			return 0
 		}
 		// Fall back to legacy fields
 		return indexingStatus.totalItems > 0
 			? Math.min(100, Math.round((indexingStatus.processedItems / indexingStatus.totalItems) * 100))
 			: 0
 	}, [
-		scanSubphase,
-		indexingStatus.phase,
+		detailedStage,
+		indexingStatus.hasStartedVectorSync,
 		indexingStatus.blocksEmbedded,
 		indexingStatus.totalBlocks,
 		indexingStatus.processedItems,
@@ -801,27 +924,10 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 				/^Index up-to-date(?:\.| —|$)/.test(indexingStatus.message ?? "")),
 		[indexingStatus.message, indexingStatus.systemStatus],
 	)
-	const statusHeadline = useMemo(() => {
-		if (isCurrentStandby) {
-			return t("settings:codeIndex.liveWatcherHeadline")
-		}
-		if (indexingStatus.systemStatus !== "Indexing") {
-			return statusLines[0] ?? ""
-		}
-		if (indexingStatus.phase === "embedding") {
-			return "Building embeddings and syncing vectors"
-		}
-		if (indexingStatus.phase === "scanning") {
-			if (scanSubphase === "signature-compare") {
-				return "Comparing file signatures"
-			}
-			if (scanSubphase === "remote-rebuild") {
-				return "Rebuilding from local metadata"
-			}
-			return "Discovering workspace files"
-		}
-		return statusLines[0] ?? ""
-	}, [indexingStatus.phase, indexingStatus.systemStatus, isCurrentStandby, scanSubphase, statusLines, t])
+	const statusHeadline = useMemo(
+		() => getIndexingHeadline(indexingStatus, isCurrentStandby, t),
+		[indexingStatus, isCurrentStandby, t],
+	)
 	const statusSupplementalLines = useMemo(() => {
 		if (isCurrentStandby) {
 			return [statusLines[0], t("settings:codeIndex.liveWatcherDetail")].filter(Boolean)
@@ -844,37 +950,77 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		return [summaryLine, runtimeLine].filter(Boolean).slice(0, 2)
 	}, [indexingStatus.systemStatus, isCurrentStandby, statusLines, t])
 	const progressCaption = useMemo(() => {
-		if (indexingStatus.phase === "embedding") {
-			return `${(indexingStatus.blocksEmbedded ?? 0).toLocaleString()} / ${(indexingStatus.totalBlocks ?? 0).toLocaleString()} blocks`
-		}
-		if (indexingStatus.phase === "scanning") {
-			if (scanSubphase === "signature-compare") {
+		switch (detailedStage) {
+			case "preparing":
+				return "Initializing index engine"
+			case "reconciling":
+				return indexingStatus.isBackgroundReconcile
+					? "Verifying index freshness"
+					: "Reconciling workspace state"
+			case "discovering": {
+				const discoveredFiles = indexingStatus.processedItems ?? 0
+				const rawEstimatedTotal = Math.max(indexingStatus.totalItems ?? 0, discoveredFiles, 1)
+				const estimatedTotal =
+					rawEstimatedTotal <= discoveredFiles
+						? Math.max(Math.ceil(discoveredFiles * 1.1), discoveredFiles + 1)
+						: rawEstimatedTotal
+				return `${discoveredFiles.toLocaleString()} found • ~${estimatedTotal.toLocaleString()} estimated`
+			}
+			case "hashing_initial": {
 				const checkedFiles = indexingStatus.processedItems ?? 0
 				const totalFiles = Math.max(indexingStatus.totalItems ?? 0, checkedFiles, 1)
-				return `Comparing signatures... ${checkedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} checked`
+				return `${checkedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} checked`
 			}
-			if (scanSubphase === "remote-rebuild") {
-				const rebuiltFiles = indexingStatus.processedItems ?? 0
-				const totalFiles = Math.max(indexingStatus.totalItems ?? 0, rebuiltFiles, 1)
-				return `Rebuilding from local metadata... ${rebuiltFiles.toLocaleString()} / ${totalFiles.toLocaleString()} files`
+			case "comparing_signatures": {
+				const checkedFiles = indexingStatus.processedItems ?? 0
+				const totalFiles = Math.max(indexingStatus.totalItems ?? 0, checkedFiles, 1)
+				return `${checkedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} checked`
 			}
-			const discoveredFiles = indexingStatus.processedItems ?? 0
-			const rawEstimatedTotal = Math.max(indexingStatus.totalItems ?? 0, discoveredFiles, 1)
-			const estimatedTotal =
-				rawEstimatedTotal <= discoveredFiles
-					? Math.max(Math.ceil(discoveredFiles * 1.1), discoveredFiles + 1)
-					: rawEstimatedTotal
-			return `Discovering workspace files... ${discoveredFiles.toLocaleString()} found so far, estimating ~${estimatedTotal.toLocaleString()} total`
+			case "parsing": {
+				const parsedFiles = indexingStatus.processedItems ?? 0
+				const totalFiles = Math.max(indexingStatus.totalItems ?? 0, parsedFiles, 1)
+				return `${parsedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} files`
+			}
+			case "planning_vectors":
+				return indexingStatus.hasKnownVectorWork ? "Preparing vector workload" : "Checking for vector work"
+			case "embedding":
+				if (!indexingStatus.hasStartedVectorSync) {
+					return "Preparing vector workload"
+				}
+				return `${(indexingStatus.blocksEmbedded ?? 0).toLocaleString()} / ${(indexingStatus.totalBlocks ?? 0).toLocaleString()} blocks`
+			case "deleting_vectors":
+				return "Removing stale vectors"
+			default:
+				if (indexingStatus.phase === "embedding" && indexingStatus.hasStartedVectorSync) {
+					return `${(indexingStatus.blocksEmbedded ?? 0).toLocaleString()} / ${(indexingStatus.totalBlocks ?? 0).toLocaleString()} blocks`
+				}
+				if (indexingStatus.phase === "scanning") {
+					const processed = indexingStatus.processedItems ?? 0
+					const total = Math.max(indexingStatus.totalItems ?? 0, processed, 1)
+					return `${processed.toLocaleString()} / ${total.toLocaleString()} files`
+				}
 		}
 		return ""
 	}, [
+		detailedStage,
+		indexingStatus.hasKnownVectorWork,
+		indexingStatus.hasStartedVectorSync,
+		indexingStatus.isBackgroundReconcile,
 		indexingStatus.blocksEmbedded,
 		indexingStatus.phase,
 		indexingStatus.processedItems,
 		indexingStatus.totalBlocks,
 		indexingStatus.totalItems,
-		scanSubphase,
 	])
+	const isIndeterminateEmbeddingProgress = useMemo(
+		() =>
+			indexingStatus.systemStatus === "Indexing" &&
+			(detailedStage === "preparing" ||
+				detailedStage === "reconciling" ||
+				detailedStage === "planning_vectors" ||
+				(detailedStage === "embedding" && !indexingStatus.hasStartedVectorSync)),
+		[detailedStage, indexingStatus.hasStartedVectorSync, indexingStatus.systemStatus],
+	)
 	const estimationMetaTokens = useMemo(() => {
 		if (indexingStatus.systemStatus !== "Indexing") {
 			return []
@@ -1027,12 +1173,14 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const surfaceCardClass =
 		"rounded-2xl border border-vscode-dropdown-border/90 bg-[linear-gradient(180deg,rgba(255,255,255,0.035),rgba(255,255,255,0.015))] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
 	const disclosureButtonClass =
-		"flex w-full items-center justify-between rounded-2xl border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.02)] px-4 py-3 text-left transition-colors hover:bg-[rgba(255,255,255,0.035)] focus:outline-none"
-	const disclosurePanelClass = `${surfaceCardClass} mt-3 p-4`
+		"flex w-full items-center justify-between rounded-2xl border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.02)] px-4 py-2.5 text-left transition-colors hover:bg-[rgba(255,255,255,0.035)] focus:outline-none"
+	const disclosurePanelClass = "mt-2"
 	const sectionLabelClass =
 		"text-[10px] font-semibold uppercase tracking-[0.14em] text-vscode-descriptionForeground/70"
 	const fieldGroupClass =
-		"space-y-2 rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] p-3"
+		"grid gap-1.5 px-3 py-2.5 [&>label]:text-[11px] [&>label]:font-semibold [&>label]:uppercase [&>label]:tracking-[0.08em] [&>label]:text-vscode-descriptionForeground/78"
+	const groupedListClass =
+		"overflow-hidden rounded-xl border border-vscode-dropdown-border/55 bg-[rgba(255,255,255,0.012)] divide-y divide-vscode-dropdown-border/35 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]"
 	const footerButtonClass =
 		"h-10 rounded-full px-4 text-sm font-medium shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition-all"
 	const footerSecondaryButtonClass = `${footerButtonClass} border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.04)] text-vscode-foreground hover:bg-[rgba(255,255,255,0.08)]`
@@ -1040,6 +1188,9 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const footerPrimaryButtonClass = `${footerButtonClass} min-w-[96px] bg-primary text-primary-foreground hover:bg-primary/85`
 	const footerDisabledButtonClass =
 		"h-10 min-w-[96px] rounded-full border border-vscode-dropdown-border/50 bg-[rgba(255,255,255,0.03)] px-4 text-sm font-medium text-vscode-descriptionForeground/70 shadow-none"
+	const numericTextClass = "[font-variant-numeric:tabular-nums] tabular-nums whitespace-nowrap text-right"
+	const stableChipClass =
+		"flex min-h-[34px] items-center rounded-full border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.02)] px-3 py-1.5 text-[11px] text-vscode-descriptionForeground/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]"
 
 	return (
 		<>
@@ -1114,7 +1265,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 													)}
 										</div>
 										{statusHeadline && (
-											<div className="mt-1 text-[15px] font-semibold leading-5 tracking-[-0.01em]">
+											<div className="mt-1 min-h-[2.5rem] text-[15px] font-semibold leading-5 tracking-[-0.01em]">
 												{statusHeadline}
 											</div>
 										)}
@@ -1123,7 +1274,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 											resilienceHighlights.warningItems.length > 0) && (
 											<div className="mt-2 space-y-2">
 												{statusSupplementalLines[0] && (
-													<div className="text-[12px] leading-5 text-vscode-descriptionForeground">
+													<div className="min-h-[1.5rem] text-[12px] leading-5 text-vscode-descriptionForeground">
 														{statusSupplementalLines[0]}
 													</div>
 												)}
@@ -1147,13 +1298,28 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 												)}
 												{telemetryTokens.length > 0 && (
 													<div className="grid grid-cols-2 gap-2">
-														{telemetryTokens.slice(0, 4).map((token) => (
-															<div
-																key={token}
-																className="rounded-xl border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.018)] px-2.5 py-2 text-[11px] leading-4 text-vscode-descriptionForeground/88">
-																{token}
-															</div>
-														))}
+														{telemetryTokens.slice(0, 4).map((token) =>
+															(() => {
+																const parsedToken = parseTelemetryToken(token)
+																return (
+																	<div
+																		key={token}
+																		className="flex min-h-[56px] flex-col justify-between rounded-xl border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.018)] px-3 py-2.5 text-vscode-descriptionForeground/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+																		<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
+																			{parsedToken.label}
+																		</div>
+																		<div
+																			className={cn(
+																				"mt-2 text-[12px] leading-none tracking-[-0.01em] text-vscode-foreground/92",
+																				parsedToken.emphasis === "numeric" &&
+																					numericTextClass,
+																			)}>
+																			{parsedToken.value}
+																		</div>
+																	</div>
+																)
+															})(),
+														)}
 													</div>
 												)}
 												{(resilienceHighlights.resumedPendingJobs > 0 ||
@@ -1423,21 +1589,36 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 
 								{indexingStatus.systemStatus === "Indexing" && (
 									<div className="mt-4 space-y-3">
-										<div className="flex flex-wrap items-center gap-2 text-[11px] text-vscode-descriptionForeground/85">
+										<div className="grid gap-2 text-[11px] text-vscode-descriptionForeground/85 sm:grid-cols-[minmax(128px,auto)_minmax(168px,1fr)_minmax(140px,auto)]">
 											{indexingStatus.phase && (
-												<span className="rounded-full border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.02)] px-2.5 py-1">
+												<span
+													className={cn(stableChipClass, "justify-center sm:justify-start")}>
 													{indexingStatus.phase === "scanning"
 														? "Workspace pass"
 														: "Embedding pass"}
 												</span>
 											)}
 											{progressCaption && (
-												<span className="rounded-full border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.02)] px-2.5 py-1">
+												<span
+													className={cn(
+														stableChipClass,
+														indexingStatus.phase === "embedding"
+															? cn(
+																	"justify-between gap-3 sm:min-w-[168px]",
+																	numericTextClass,
+																)
+															: "min-w-0 justify-start whitespace-normal break-words text-left leading-4",
+													)}>
 													{progressCaption}
 												</span>
 											)}
 											{indexingStatus.estimatedTimeRemainingMs != null && (
-												<span className="rounded-full border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.02)] px-2.5 py-1">
+												<span
+													className={cn(
+														stableChipClass,
+														"justify-center sm:justify-end",
+														numericTextClass,
+													)}>
 													{formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}
 												</span>
 											)}
@@ -1447,14 +1628,23 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 												className="relative h-2.5 w-full min-w-[80px] overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]"
 												value={progressPercentage}>
 												<ProgressPrimitive.Indicator
-													className="h-full w-full flex-1 bg-[linear-gradient(90deg,rgba(80,168,255,0.9),rgba(128,203,255,0.92))] transition-transform duration-300 ease-in-out"
+													className={cn(
+														"h-full w-full flex-1 bg-[linear-gradient(90deg,rgba(80,168,255,0.9),rgba(128,203,255,0.92))] transition-transform duration-300 ease-in-out",
+														isIndeterminateEmbeddingProgress && "animate-pulse opacity-75",
+													)}
 													style={{
-														transform: transformStyleString,
+														transform: isIndeterminateEmbeddingProgress
+															? "translateX(-72%)"
+															: transformStyleString,
 													}}
 												/>
 											</ProgressPrimitive.Root>
-											<span className="min-w-[2.5rem] text-right text-xs font-medium text-vscode-descriptionForeground">
-												{progressPercentage}%
+											<span
+												className={cn(
+													"min-w-[3.75rem] text-xs font-medium text-vscode-descriptionForeground",
+													numericTextClass,
+												)}>
+												{isIndeterminateEmbeddingProgress ? "..." : `${progressPercentage}%`}
 											</span>
 										</div>
 									</div>
@@ -1463,14 +1653,14 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 						</div>
 
 						{/* Enable/Disable Toggle */}
-						<div className={`${surfaceCardClass} mt-5 p-3.5`}>
-							<div className="flex items-start justify-between gap-3">
+						<div className={`${surfaceCardClass} mt-5 p-3`}>
+							<div className="flex items-start justify-between gap-2.5">
 								<div className="space-y-0.5">
 									<div className={sectionLabelClass}>Indexer</div>
-									<div className="text-sm font-medium leading-5">
+									<div className="text-[13px] font-medium leading-5">
 										{t("settings:codeIndex.enableLabel")}
 									</div>
-									<div className="text-xs leading-4 text-vscode-descriptionForeground">
+									<div className="max-w-[32ch] text-[11px] leading-4 text-vscode-descriptionForeground">
 										Turn semantic code search on for this workspace.
 									</div>
 								</div>
@@ -1480,62 +1670,100 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 									</StandardTooltip>
 								</div>
 							</div>
-							<div className="mt-3">
-								<VSCodeCheckbox
-									checked={currentSettings.codebaseIndexEnabled}
-									onChange={(e: any) => updateSetting("codebaseIndexEnabled", e.target.checked)}>
-									<span className="text-sm font-medium">
-										{currentSettings.codebaseIndexEnabled ? "Enabled" : "Disabled"}
-									</span>
-								</VSCodeCheckbox>
+							<div className="mt-2.5 rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.016)] px-3 py-2.5">
+								<div className="flex items-center justify-between gap-3">
+									<div className="min-w-0">
+										<div className="text-[12px] font-medium leading-5 text-vscode-foreground">
+											Indexing engine
+										</div>
+										<div className="text-[11px] leading-4 text-vscode-descriptionForeground">
+											{currentSettings.codebaseIndexEnabled
+												? "Semantic code search is enabled for this workspace."
+												: "Semantic code search is currently turned off."}
+										</div>
+									</div>
+									<div className="shrink-0">
+										<VSCodeCheckbox
+											checked={currentSettings.codebaseIndexEnabled}
+											onChange={(e: any) =>
+												updateSetting("codebaseIndexEnabled", e.target.checked)
+											}>
+											<span className="text-[12px] font-medium">
+												{currentSettings.codebaseIndexEnabled ? "On" : "Off"}
+											</span>
+										</VSCodeCheckbox>
+									</div>
+								</div>
 							</div>
 							{currentSettings.codebaseIndexEnabled && (
-								<div className="mt-4 space-y-3 rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] p-3">
-									<div>
-										<div className="flex items-center gap-2">
-											<input
-												type="checkbox"
-												id="workspace-indexing-toggle"
-												checked={indexingStatus.workspaceEnabled ?? false}
-												onChange={(e) =>
-													vscode.postMessage({
-														type: "toggleWorkspaceIndexing",
-														bool: e.target.checked,
-													})
-												}
-												className="accent-vscode-focusBorder"
-											/>
-											<label
-												htmlFor="workspace-indexing-toggle"
-												className="cursor-pointer text-sm text-vscode-foreground">
-												{t("settings:codeIndex.workspaceToggleLabel")}
-											</label>
+								<div className="mt-2.5 rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] px-3 py-2">
+									<div className="space-y-0.5 pb-2">
+										<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
+											Workspace behavior
 										</div>
-										{!indexingStatus.workspaceEnabled && (
-											<p className="m-0 pt-2 text-xs leading-5 text-vscode-descriptionForeground">
-												{t("settings:codeIndex.workspaceDisabledMessage")}
-											</p>
-										)}
+										<div className="text-[11px] leading-4 text-vscode-descriptionForeground">
+											Choose how indexing behaves in this workspace and in future workspaces.
+										</div>
 									</div>
-									<div className="border-t border-vscode-dropdown-border/50 pt-3">
-										<div className="flex items-center gap-2">
-											<input
-												type="checkbox"
-												id="auto-enable-default-toggle"
-												checked={indexingStatus.autoEnableDefault ?? true}
-												onChange={(e) =>
-													vscode.postMessage({
-														type: "setAutoEnableDefault",
-														bool: e.target.checked,
-													})
-												}
-												className="accent-vscode-focusBorder"
-											/>
-											<label
-												htmlFor="auto-enable-default-toggle"
-												className="cursor-pointer text-sm text-vscode-foreground">
-												{t("settings:codeIndex.autoEnableDefaultLabel")}
-											</label>
+									<div className="divide-y divide-vscode-dropdown-border/40 rounded-lg border border-vscode-dropdown-border/40 bg-[rgba(0,0,0,0.06)]">
+										<div className="px-3 py-2.5">
+											<div className="flex items-start gap-2">
+												<input
+													type="checkbox"
+													id="workspace-indexing-toggle"
+													checked={indexingStatus.workspaceEnabled ?? false}
+													onChange={(e) =>
+														vscode.postMessage({
+															type: "toggleWorkspaceIndexing",
+															bool: e.target.checked,
+														})
+													}
+													className="accent-vscode-focusBorder"
+												/>
+												<label
+													htmlFor="workspace-indexing-toggle"
+													className="flex cursor-pointer flex-col gap-0.5 text-vscode-foreground">
+													<span className="text-[12px] font-medium leading-5">
+														{t("settings:codeIndex.workspaceToggleLabel")}
+													</span>
+													<span className="text-[11px] leading-4 text-vscode-descriptionForeground">
+														Control whether this workspace actively participates in code
+														indexing.
+													</span>
+												</label>
+											</div>
+											{!indexingStatus.workspaceEnabled && (
+												<p className="m-0 pt-1.5 pl-6 text-[11px] leading-4 text-vscode-descriptionForeground">
+													{t("settings:codeIndex.workspaceDisabledMessage")}
+												</p>
+											)}
+										</div>
+										<div className="px-3 py-2.5">
+											<div className="flex items-start gap-2">
+												<input
+													type="checkbox"
+													id="auto-enable-default-toggle"
+													checked={indexingStatus.autoEnableDefault ?? true}
+													onChange={(e) =>
+														vscode.postMessage({
+															type: "setAutoEnableDefault",
+															bool: e.target.checked,
+														})
+													}
+													className="accent-vscode-focusBorder"
+												/>
+												<label
+													htmlFor="auto-enable-default-toggle"
+													className="flex cursor-pointer flex-col gap-0.5 text-vscode-foreground">
+													<span className="text-[12px] font-medium leading-5">
+														{t("settings:codeIndex.autoEnableDefaultLabel")}
+													</span>
+													<span className="text-[11px] leading-4 text-vscode-descriptionForeground">
+														Apply your preferred indexing default automatically when new
+														workspaces open.
+													</span>
+												</label>
+											</div>
 										</div>
 									</div>
 								</div>
@@ -1550,9 +1778,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 								aria-expanded={isSetupSettingsOpen}>
 								<div>
 									<div className={sectionLabelClass}>Configuration</div>
-									<div className="mt-1 text-[15px] font-semibold tracking-[-0.01em]">
-										{t("settings:codeIndex.setupConfigLabel")}
-									</div>
+									<div className="mt-1 text-[15px] font-semibold tracking-[-0.01em]">Setup</div>
 								</div>
 								<span
 									className={`codicon codicon-${isSetupSettingsOpen ? "chevron-down" : "chevron-right"} text-vscode-descriptionForeground`}></span>
@@ -1560,7 +1786,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 
 							{isSetupSettingsOpen && (
 								<div className={disclosurePanelClass}>
-									<div className="space-y-4">
+									<div className={groupedListClass}>
 										{/* Embedder Provider Section */}
 										<div className={fieldGroupClass}>
 											<label className="text-sm font-medium">
@@ -2428,7 +2654,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 
 							{isAdvancedSettingsOpen && (
 								<div className={disclosurePanelClass}>
-									<div className="space-y-4">
+									<div className={groupedListClass}>
 										{/* Search Score Threshold Slider */}
 										<div className={fieldGroupClass}>
 											<div className="flex items-center gap-2">
@@ -2566,6 +2792,36 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 													)
 												}
 												placeholder="60"
+												className="w-full"
+											/>
+										</div>
+
+										<div className={fieldGroupClass}>
+											<div className="flex items-center gap-2">
+												<label className="text-sm font-medium">
+													{t("settings:codeIndex.embeddingLaneConcurrencyLabel")}
+												</label>
+												<StandardTooltip
+													content={t(
+														"settings:codeIndex.embeddingLaneConcurrencyDescription",
+													)}>
+													<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
+												</StandardTooltip>
+											</div>
+											<VSCodeTextField
+												value={
+													currentSettings.codebaseIndexEmbeddingLaneConcurrency?.toString() ||
+													""
+												}
+												onInput={(e: any) =>
+													updateSetting(
+														"codebaseIndexEmbeddingLaneConcurrency",
+														e.target.value
+															? parseInt(e.target.value, 10) || undefined
+															: undefined,
+													)
+												}
+												placeholder="2"
 												className="w-full"
 											/>
 										</div>

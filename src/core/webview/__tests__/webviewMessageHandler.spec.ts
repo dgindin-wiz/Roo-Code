@@ -98,6 +98,9 @@ vi.mock("vscode", () => {
 		workspace: {
 			workspaceFolders: [{ uri: { fsPath: "/mock/workspace" } }],
 			openTextDocument,
+			getConfiguration: vi.fn().mockReturnValue({
+				update: vi.fn().mockResolvedValue(undefined),
+			}),
 		},
 	}
 })
@@ -833,6 +836,49 @@ describe("webviewMessageHandler - indexing flows", () => {
 		} as any)
 
 		expect(mockManager.retryIndexWarningFiles).toHaveBeenCalledWith("failed", ["src/problematic/embed.ts"])
+	})
+
+	it("clears index data and immediately posts the reset status", async () => {
+		const mockManager = {
+			clearIndexData: vi.fn().mockResolvedValue(undefined),
+			getCurrentStatus: vi.fn().mockReturnValue({
+				systemStatus: "Standby",
+				message: "Index data cleared successfully.",
+				processedItems: 0,
+				totalItems: 0,
+				currentItemUnit: "blocks",
+				warningDetails: [],
+				resumedRetryJobs: 0,
+				resumedPendingJobs: 0,
+				retryingParseRevisions: 0,
+				terminalFailedParseRevisions: 0,
+				degradedRevisions: 0,
+				terminalFailedRevisions: 0,
+				terminallyFailedChunks: 0,
+				retryingChunks: 0,
+			}),
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "clearIndexData",
+		} as any)
+
+		expect(mockManager.clearIndexData).toHaveBeenCalledTimes(1)
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenNthCalledWith(1, {
+			type: "indexCleared",
+			values: { success: true },
+		})
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenNthCalledWith(2, {
+			type: "indexingStatusUpdate",
+			values: expect.objectContaining({
+				systemStatus: "Standby",
+				message: "Index data cleared successfully.",
+				resumedRetryJobs: 0,
+				degradedRevisions: 0,
+				warningDetails: [],
+			}),
+		})
 	})
 })
 

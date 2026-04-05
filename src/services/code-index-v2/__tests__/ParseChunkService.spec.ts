@@ -103,4 +103,29 @@ describe("ParseChunkService", () => {
 		expect(summary.terminalFailedRevisions).toBe(1)
 		expect(summary.parsedRevisionIds).toEqual(["revision-good"])
 	})
+
+	it("treats missing files as superseded instead of parser failures", async () => {
+		const { metadataStore, workspaceAdapter, parserAdapter } = createDeps()
+		metadataStore.getRevisionsByState.mockResolvedValue([
+			{
+				revisionId: "revision-missing",
+				fileId: "file-missing",
+				runId: "run-1",
+				normalizedPath: "/workspace/src/missing.ts",
+			},
+		])
+		const error = Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" })
+		workspaceAdapter.readFile.mockRejectedValue(error)
+
+		const service = new ParseChunkService(metadataStore as any, workspaceAdapter as any, parserAdapter as any)
+		const summary = await service.run("run-1")
+
+		expect(metadataStore.markRevisionState).toHaveBeenCalledWith("revision-missing", "superseded")
+		expect(metadataStore.markRevisionTerminalFailure).not.toHaveBeenCalled()
+		expect(parserAdapter.parseFile).not.toHaveBeenCalled()
+		expect(summary.parsedRevisions).toBe(0)
+		expect(summary.parsedChunks).toBe(0)
+		expect(summary.retryingRevisions).toBe(0)
+		expect(summary.terminalFailedRevisions).toBe(0)
+	})
 })

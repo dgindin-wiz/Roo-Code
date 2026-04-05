@@ -236,6 +236,8 @@
 		"maxFilesDescription": "Maximum number of code files the indexer will scan in this workspace. Increase this for very large monorepos.",
 		"embeddingBatchSizeLabel": "Embedding batch size",
 		"embeddingBatchSizeDescription": "How many chunks to send per embedding batch. Higher values can improve throughput but may hit provider limits sooner.",
+		"embeddingLaneConcurrencyLabel": "Embedding lane concurrency",
+		"embeddingLaneConcurrencyDescription": "How many embedding batches V2 may process at the same time. Higher values can improve throughput but increase memory usage and provider pressure.",
 		"fileSearchIndexLimitLabel": "Maximum indexed files for file search",
 		"fileSearchIndexLimitDescription": "Maximum number of files available to the @ file search feature. Higher values improve coverage in large projects but can use more memory.",
 		"debugLoggingLabel": "Enable indexing debug logs",

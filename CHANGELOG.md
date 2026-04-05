@@ -1,5 +1,13 @@
 # Roo Code Changelog
 
+## [Unreleased]
+
+### Minor Changes
+
+- Improve Code Index V2 resilience with better retry/resume behavior, stronger parse/chunk/diff/embed pipeline coordination, and more reliable reconciliation and metadata tracking for long-running indexing work.
+- Improve indexing observability and UX with richer progress reporting, updated indexing status surfaces, and new code index settings for embedding throughput and concurrency tuning.
+- Harden parser and indexing behavior with broader test coverage, parser improvements, and supporting type and message updates across the extension and webview.
+
 ## 3.51.1
 
 ### Patch Changes

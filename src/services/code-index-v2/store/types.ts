@@ -12,6 +12,8 @@ export type ChunkState = "parsed" | "upserted" | "deleted" | "abandoned" | "term
 
 export type JobState = "queued" | "running" | "done" | "abandoned" | "terminal_failed"
 
+export type IndexRunState = "started" | "discovery_complete" | "complete" | "failed" | "stopped"
+
 export interface WorkspaceRecord {
 	workspaceId: string
 	workspacePath: string

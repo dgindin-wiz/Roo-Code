@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { MAX_FILE_SIZE_BYTES } from "../../code-index/constants"
 import { StatHashService } from "../pipeline/StatHashService"
 
 describe("StatHashService", () => {
@@ -49,5 +50,65 @@ describe("StatHashService", () => {
 		expect(metadataStore.createFileRevision).not.toHaveBeenCalled()
 		expect(summary.changedFiles).toBe(1)
 		expect(summary.skippedFiles).toBe(0)
+		expect(summary.unchangedFiles).toBe(0)
+		expect(summary.oversizedFiles).toBe(0)
+		expect(summary.missingFiles).toBe(0)
+	})
+
+	it("skips missing files without crashing the run", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue([
+			{
+				fileId: "file-1",
+				relativePath: "src/missing.ts",
+				normalizedPath: "/workspace/src/missing.ts",
+				lastSeenSize: 10,
+				lastSeenMtimeMs: 20,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+			},
+		])
+		const error = Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" })
+		workspaceAdapter.readFile.mockRejectedValue(error)
+
+		const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+		const summary = await service.run("run-1")
+
+		expect(metadataStore.createFileRevision).not.toHaveBeenCalled()
+		expect(summary.checkedFiles).toBe(1)
+		expect(summary.changedFiles).toBe(0)
+		expect(summary.skippedFiles).toBe(1)
+		expect(summary.unchangedFiles).toBe(0)
+		expect(summary.oversizedFiles).toBe(0)
+		expect(summary.missingFiles).toBe(1)
+	})
+
+	it("skips oversized files before reading content", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue([
+			{
+				fileId: "file-large",
+				relativePath: "src/large.pb.go",
+				normalizedPath: "/workspace/src/large.pb.go",
+				lastSeenSize: MAX_FILE_SIZE_BYTES + 1,
+				lastSeenMtimeMs: 20,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+			},
+		])
+
+		const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+		const summary = await service.run("run-1")
+
+		expect(workspaceAdapter.readFile).not.toHaveBeenCalled()
+		expect(metadataStore.createFileRevision).not.toHaveBeenCalled()
+		expect(summary.checkedFiles).toBe(1)
+		expect(summary.changedFiles).toBe(0)
+		expect(summary.skippedFiles).toBe(1)
+		expect(summary.unchangedFiles).toBe(0)
+		expect(summary.oversizedFiles).toBe(1)
+		expect(summary.missingFiles).toBe(0)
 	})
 })

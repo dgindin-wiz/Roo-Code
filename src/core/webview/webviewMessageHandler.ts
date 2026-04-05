@@ -73,6 +73,23 @@ import { resolveDefaultSaveUri, saveLastExportPath } from "../../utils/export"
 import { getCommand } from "../../utils/commands"
 
 const ALLOWED_VSCODE_SETTINGS = new Set(["terminal.integrated.inheritEnv"])
+const CODE_INDEX_VSCODE_SETTINGS: Array<{
+	stateKey:
+		| "codebaseIndexMaxFiles"
+		| "codebaseIndexEmbeddingBatchSize"
+		| "codebaseIndexEmbeddingLaneConcurrency"
+		| "codebaseIndexDebugLogging"
+		| "maximumIndexedFilesForFileSearch"
+		| "codebaseIndexRespectGitIgnore"
+	configurationKey: string
+}> = [
+	{ stateKey: "codebaseIndexMaxFiles", configurationKey: "codeIndex.maxFiles" },
+	{ stateKey: "codebaseIndexEmbeddingBatchSize", configurationKey: "codeIndex.embeddingBatchSize" },
+	{ stateKey: "codebaseIndexEmbeddingLaneConcurrency", configurationKey: "codeIndex.embeddingLaneConcurrency" },
+	{ stateKey: "codebaseIndexDebugLogging", configurationKey: "codeIndex.debugLogging" },
+	{ stateKey: "maximumIndexedFilesForFileSearch", configurationKey: "maximumIndexedFilesForFileSearch" },
+	{ stateKey: "codebaseIndexRespectGitIgnore", configurationKey: "codeIndex.respectGitIgnore" },
+]
 
 import { MarketplaceManager, MarketplaceItemType } from "../../services/marketplace"
 import { setPendingTodoList } from "../tools/UpdateTodoListTool"
@@ -2495,6 +2512,7 @@ export const webviewMessageHandler = async (
 			}
 
 			const settings = message.codeIndexSettings
+			const settingsRecord = settings as Record<string, unknown>
 
 			try {
 				// Check if embedder provider has changed
@@ -2521,6 +2539,14 @@ export const webviewMessageHandler = async (
 
 				// Save global state first
 				await updateGlobalState("codebaseIndexConfig", globalStateConfig)
+
+				for (const { stateKey, configurationKey } of CODE_INDEX_VSCODE_SETTINGS) {
+					if (Object.prototype.hasOwnProperty.call(settings, stateKey)) {
+						await vscode.workspace
+							.getConfiguration(Package.name)
+							.update(configurationKey, settingsRecord[stateKey], vscode.ConfigurationTarget.Workspace)
+					}
+				}
 
 				// Save secrets directly using context proxy
 				if (settings.codeIndexOpenAiKey !== undefined) {
@@ -2852,7 +2878,7 @@ export const webviewMessageHandler = async (
 					provider.log("Cannot stop indexing: No workspace folder open")
 					return
 				}
-				manager.stopIndexing()
+				await manager.stopIndexing()
 				provider.postMessageToWebview({
 					type: "indexingStatusUpdate",
 					values: manager.getCurrentStatus(),
@@ -2875,7 +2901,7 @@ export const webviewMessageHandler = async (
 					await toggleManager.initialize(provider.contextProxy)
 					toggleManager.startIndexing()
 				} else if (!enabled) {
-					toggleManager.stopIndexing()
+					await toggleManager.stopIndexing()
 				}
 			} catch (error) {
 				provider.log(
@@ -2906,7 +2932,7 @@ export const webviewMessageHandler = async (
 					const wasEnabled = priorStates.get(m)!
 					const isNowEnabled = m.isWorkspaceEnabled
 					if (wasEnabled && !isNowEnabled) {
-						m.stopIndexing()
+						await m.stopIndexing()
 					} else if (!wasEnabled && isNowEnabled && m.isFeatureEnabled && m.isFeatureConfigured) {
 						await m.initialize(provider.contextProxy)
 						m.startIndexing()
@@ -2939,6 +2965,10 @@ export const webviewMessageHandler = async (
 				}
 				await manager.clearIndexData()
 				provider.postMessageToWebview({ type: "indexCleared", values: { success: true } })
+				provider.postMessageToWebview({
+					type: "indexingStatusUpdate",
+					values: manager.getCurrentStatus(),
+				})
 			} catch (error) {
 				provider.log(`Error clearing index data: ${error instanceof Error ? error.message : String(error)}`)
 				provider.postMessageToWebview({

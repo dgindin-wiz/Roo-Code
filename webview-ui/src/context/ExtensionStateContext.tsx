@@ -254,6 +254,7 @@ export const ExtensionStateContextProvider: React.FC<{ children: React.ReactNode
 			codebaseIndexEmbedderModelId: "",
 			codebaseIndexMaxFiles: 100000,
 			codebaseIndexEmbeddingBatchSize: 60,
+			codebaseIndexEmbeddingLaneConcurrency: 2,
 			codebaseIndexDebugLogging: false,
 			maximumIndexedFilesForFileSearch: 10000,
 			codebaseIndexRespectGitIgnore: true,

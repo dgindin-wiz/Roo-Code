@@ -34,7 +34,7 @@ export const CLIENT_RECYCLE_INTERVAL = 25 // Recycle HTTP clients every N batche
 export const SEARCH_EMBEDDING_TIMEOUT_MS = 30_000 // 30 seconds — timeout for generating query embedding during search
 
 /**Parser */
-export const MAX_PARSEABLE_FILE_SIZE_BYTES = 2 * 1024 * 1024 // 2MB — skip files larger than this to prevent OOM
+export const MAX_PARSEABLE_FILE_SIZE_BYTES = MAX_FILE_SIZE_BYTES // Keep parser hard-stop aligned with the effective indexing limit.
 export const PARSER_LOAD_TIMEOUT_MS = 30_000 // 30 seconds — timeout for loading a tree-sitter WASM parser
 
 /**OpenAI Embedder */

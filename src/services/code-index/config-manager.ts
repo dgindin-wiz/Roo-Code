@@ -29,6 +29,7 @@ export class CodeIndexConfigManager {
 	private searchMinScore?: number
 	private searchMaxResults?: number
 	private respectGitIgnore: boolean = true
+	private embeddingLaneConcurrency: number = 2
 
 	constructor(private readonly contextProxy: ContextProxy) {
 		// Initialize with current configuration to avoid false restart triggers
@@ -72,6 +73,9 @@ export class CodeIndexConfigManager {
 		const respectGitIgnoreSetting = vscode.workspace
 			.getConfiguration(Package.name)
 			.get<boolean>("codeIndex.respectGitIgnore", true)
+		const embeddingLaneConcurrencySetting = vscode.workspace
+			.getConfiguration(Package.name)
+			.get<number>("codeIndex.embeddingLaneConcurrency", 2)
 
 		const openAiKey = this.contextProxy?.getSecret("codeIndexOpenAiKey") ?? ""
 		const qdrantApiKey = this.contextProxy?.getSecret("codeIndexQdrantApiKey") ?? ""
@@ -93,6 +97,7 @@ export class CodeIndexConfigManager {
 		this.searchMinScore = codebaseIndexSearchMinScore
 		this.searchMaxResults = codebaseIndexSearchMaxResults
 		this.respectGitIgnore = respectGitIgnoreSetting
+		this.embeddingLaneConcurrency = Math.max(1, Math.min(3, Math.trunc(embeddingLaneConcurrencySetting || 2)))
 
 		// Validate and set model dimension
 		const rawDimension = codebaseIndexConfig.codebaseIndexEmbedderModelDimension
@@ -179,6 +184,7 @@ export class CodeIndexConfigManager {
 			qdrantApiKey?: string
 			searchMinScore?: number
 			respectGitIgnore?: boolean
+			embeddingLaneConcurrency?: number
 		}
 		requiresRestart: boolean
 	}> {
@@ -203,6 +209,7 @@ export class CodeIndexConfigManager {
 			qdrantUrl: this.qdrantUrl ?? "",
 			qdrantApiKey: this.qdrantApiKey ?? "",
 			respectGitIgnore: this.respectGitIgnore,
+			embeddingLaneConcurrency: this.embeddingLaneConcurrency,
 		}
 
 		// Refresh secrets from VSCode storage to ensure we have the latest values
@@ -244,6 +251,7 @@ export class CodeIndexConfigManager {
 				qdrantApiKey: this.qdrantApiKey,
 				searchMinScore: this.currentSearchMinScore,
 				respectGitIgnore: this.respectGitIgnore,
+				embeddingLaneConcurrency: this.embeddingLaneConcurrency,
 			},
 			requiresRestart,
 		}
@@ -515,6 +523,7 @@ export class CodeIndexConfigManager {
 			searchMinScore: this.currentSearchMinScore,
 			searchMaxResults: this.currentSearchMaxResults,
 			respectGitIgnore: this.respectGitIgnore,
+			embeddingLaneConcurrency: this.embeddingLaneConcurrency,
 		}
 	}
 
@@ -579,6 +588,10 @@ export class CodeIndexConfigManager {
 
 	public get currentRespectGitIgnore(): boolean {
 		return this.respectGitIgnore
+	}
+
+	public get currentEmbeddingLaneConcurrency(): number {
+		return this.embeddingLaneConcurrency
 	}
 
 	/**

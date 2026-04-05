@@ -78,7 +78,11 @@ export class DiscoveryService {
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error)
-			await this.metadataStore.markRunFailed(runId, message)
+			if (signal?.aborted && /aborted/i.test(message)) {
+				await this.metadataStore.markRunStopped(runId, "Stopped by user.")
+			} else {
+				await this.metadataStore.markRunFailed(runId, message)
+			}
 			throw error
 		}
 	}
@@ -142,7 +146,11 @@ export class DiscoveryService {
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error)
-			await this.metadataStore.markRunFailed(runId, message)
+			if (signal?.aborted && /aborted/i.test(message)) {
+				await this.metadataStore.markRunStopped(runId, "Stopped by user.")
+			} else {
+				await this.metadataStore.markRunFailed(runId, message)
+			}
 			throw error
 		}
 	}

@@ -5,6 +5,7 @@ import { CodeIndexStateManager } from "../../code-index/state-manager"
 import { VectorStoreSearchResult } from "../../code-index/interfaces"
 import { CacheManager } from "../../code-index/cache-manager"
 import { CodeIndexConfigManager } from "../../code-index/config-manager"
+import { MAX_FILE_SIZE_BYTES } from "../../code-index/constants"
 import { CodeIndexServiceFactory } from "../../code-index/service-factory"
 import { ExistingEmbedderAdapter } from "../adapters/ExistingEmbedderAdapter"
 import { QdrantRestVectorStoreAdapter } from "../adapters/QdrantRestVectorStoreAdapter"
@@ -34,6 +35,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private _watcherCoordinator: WatcherCoordinator | undefined
 	private _reconciliationTimer: NodeJS.Timeout | undefined
 	private _activityHeartbeatTimer: NodeJS.Timeout | undefined
+	private _activeAbortController: AbortController | undefined
 	private _lastCpuSample:
 		| {
 				cpuUsage: NodeJS.CpuUsage
@@ -41,6 +43,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		  }
 		| undefined
 	private _started = false
+	private _stopRequested = false
 	private _operationChain: Promise<void> = Promise.resolve()
 	private _staleRunIdsToResume: string[] = []
 	private _resumedRetryJobsCount = 0
@@ -60,6 +63,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			return
 		}
 
+		this._stopRequested = false
 		this._started = true
 		this._status = {
 			engine: this.engine,
@@ -78,6 +82,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this._staleRunIdsToResume = staleRunCleanup.staleRunIds
 		this._resumedRetryJobsCount = 0
 		this._resumedPendingJobsCount = 0
+		if (staleRunCleanup.staleRunIds.length > 0) {
+			this.stateManager.setRecoveryContext("stale_recovery", "reusable_revisions")
+		}
 		if (staleRunCleanup.staleRunsMarkedFailed > 0) {
 			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "stale-v2-runs-cleaned", {
 				component: "CodeIndexEngineV2",
@@ -94,14 +101,22 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this.stateManager.reportCustomProgress("Preparing the workspace map", 0, 1, {
 			currentItemUnit: "phases",
 			phase: "scanning",
+			detailedStage: "preparing",
 		})
 		this._workspaceAdapter = new VsCodeWorkspaceAdapter(this.workspacePath, {
 			respectGitIgnore: this.configManager.currentRespectGitIgnore,
 		})
 		await this._workspaceAdapter.initialize()
-		await this.runSerialized(async () => {
-			await this.runFullIndex()
-		})
+		try {
+			await this.runSerialized(async (signal) => {
+				await this.runFullIndex(signal)
+			})
+		} catch (error) {
+			if (this.isAbortError(error) && this._stopRequested) {
+				return
+			}
+			throw error
+		}
 		await this.ensureWatcher()
 		this.startReconciliationTimer()
 	}
@@ -116,8 +131,12 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this._status = {
 			engine: this.engine,
 			state: "stopping",
-			message: "Stopping Code Index V2 scaffolding",
+			message: "Stopping indexing",
 		}
+		this._stopRequested = true
+		this.stateManager.setSystemState("Stopping", "Stopping indexing...")
+		this._activeAbortController?.abort()
+		await this._operationChain.catch(() => undefined)
 		this._watcherCoordinator?.dispose()
 		this._watcherCoordinator = undefined
 		if (this._reconciliationTimer) {
@@ -129,64 +148,76 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		await this._vectorStore?.recycleClient()
 		await this.metadataStore.dispose()
 		this._started = false
+		this._activeAbortController = undefined
 		this._status = {
 			engine: this.engine,
 			state: "idle",
+			message: "Indexing stopped.",
 		}
+		this.stateManager.setSystemState("Standby", "Indexing stopped.")
 	}
 
 	async clear(): Promise<void> {
-		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "clear-requested", {
-			engine: this.engine,
-			workspacePath: this.workspacePath,
-		})
+		await this.runSerialized(async () => {
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "clear-requested", {
+				engine: this.engine,
+				workspacePath: this.workspacePath,
+			})
 
-		this._status = {
-			engine: this.engine,
-			state: "running",
-			message: "Clearing Code Index V2 data",
-		}
-		this.stateManager.reportCustomProgress("Clearing indexed data", 0, 1, {
-			currentItemUnit: "phases",
-			phase: "embedding",
-		})
-
-		this._watcherCoordinator?.dispose()
-		this._watcherCoordinator = undefined
-		if (this._reconciliationTimer) {
-			clearInterval(this._reconciliationTimer)
-			this._reconciliationTimer = undefined
-		}
-		this.stopActivityHeartbeat()
-
-		try {
-			const { vectorStore } = this.getOrCreateSearchDependencies()
-			await vectorStore.deleteCollection()
-			await vectorStore.recycleClient()
-			await this._embeddingAdapter?.recycleClient()
-			this._vectorStore = undefined
-			this._embeddingAdapter = undefined
-			await this.metadataStore.clearStorage()
-			this._workspaceAdapter = undefined
-			this._started = false
 			this._status = {
 				engine: this.engine,
-				state: "idle",
-				message: "Index data cleared successfully.",
+				state: "running",
+				message: "Clearing Code Index V2 data",
 			}
-			this.stateManager.setSystemState("Standby", "Index data cleared successfully.")
-		} catch (error) {
-			this._status = {
-				engine: this.engine,
-				state: "error",
-				message: error instanceof Error ? error.message : String(error),
+			this.stateManager.reportCustomProgress("Clearing indexed data", 0, 1, {
+				currentItemUnit: "phases",
+				phase: "embedding",
+				detailedStage: "deleting_vectors",
+				hasKnownVectorWork: true,
+				hasStartedVectorSync: false,
+			})
+
+			this._watcherCoordinator?.dispose()
+			this._watcherCoordinator = undefined
+			if (this._reconciliationTimer) {
+				clearInterval(this._reconciliationTimer)
+				this._reconciliationTimer = undefined
 			}
-			this.stateManager.setSystemState(
-				"Error",
-				error instanceof Error ? error.message : "Failed to clear Code Index V2 data.",
-			)
-			throw error
-		}
+			this.stopActivityHeartbeat()
+
+			try {
+				const { vectorStore } = this.getOrCreateSearchDependencies()
+				await vectorStore.deleteCollection()
+				await vectorStore.recycleClient()
+				await this._embeddingAdapter?.recycleClient()
+				this._vectorStore = undefined
+				this._embeddingAdapter = undefined
+				await this.metadataStore.clearStorage()
+				this._workspaceAdapter = undefined
+				this._started = false
+				this._staleRunIdsToResume = []
+				this._resumedRetryJobsCount = 0
+				this._resumedPendingJobsCount = 0
+				this._lastCpuSample = undefined
+				this._status = {
+					engine: this.engine,
+					state: "idle",
+					message: "Index data cleared successfully.",
+				}
+				this.stateManager.resetIndexingState("Index data cleared successfully.")
+			} catch (error) {
+				this._status = {
+					engine: this.engine,
+					state: "error",
+					message: error instanceof Error ? error.message : String(error),
+				}
+				this.stateManager.setSystemState(
+					"Error",
+					error instanceof Error ? error.message : "Failed to clear Code Index V2 data.",
+				)
+				throw error
+			}
+		})
 	}
 
 	async search(query: string, limit: number): Promise<VectorStoreSearchResult[]> {
@@ -203,20 +234,27 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}
 
 	async enqueuePathsChanged(paths: string[], reason: "watcher" | "manual" | "reconcile"): Promise<void> {
-		await this.runSerialized(async () => {
-			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "paths-enqueued", {
-				engine: this.engine,
-				workspacePath: this.workspacePath,
-				component: "WatcherCoordinator",
-				jobId: `${reason}:${paths.length}`,
-			})
+		await this.runSerialized(async (signal) => {
+			try {
+				IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "paths-enqueued", {
+					engine: this.engine,
+					workspacePath: this.workspacePath,
+					component: "WatcherCoordinator",
+					jobId: `${reason}:${paths.length}`,
+				})
 
-			if (reason === "reconcile") {
-				await this.runReconciliation()
-				return
+				if (reason === "reconcile") {
+					await this.runReconciliation(signal)
+					return
+				}
+
+				await this.runTargetedUpdate(paths, reason, signal)
+			} catch (error) {
+				if (this.isAbortError(error) && this._stopRequested) {
+					return
+				}
+				throw error
 			}
-
-			await this.runTargetedUpdate(paths, reason)
 		})
 	}
 
@@ -312,8 +350,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 	}
 
-	private async runFullIndex(): Promise<void> {
+	private async runFullIndex(signal?: AbortSignal): Promise<void> {
 		const workspaceAdapter = this.requireWorkspaceAdapter()
+		await this.preflightIndexingDependencies(signal)
 		const discoveryService = new DiscoveryService(this.metadataStore, workspaceAdapter)
 		this._status = {
 			engine: this.engine,
@@ -323,6 +362,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this.stateManager.reportCustomProgress("Walking the workspace", 0, 1, {
 			currentItemUnit: "files",
 			phase: "scanning",
+			detailedStage: "discovering",
 		})
 		let discoveredFiles = 0
 		let processedDirectories = 0
@@ -364,7 +404,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this.startActivityHeartbeat(() => discoveryMessage)
 		const summary = await discoveryService.runWorkspaceDiscoveryWithProgress(
 			"initial-discovery",
-			undefined,
+			signal,
 			(progress) => {
 				discoveredFiles = progress.discoveredFiles
 				processedDirectories = Math.max(processedDirectories, progress.processedDirectories)
@@ -372,6 +412,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				this.stateManager.reportCustomProgress(discoveryMessage, discoveredFiles, getDiscoveryEstimate(), {
 					currentItemUnit: "files",
 					phase: "scanning",
+					detailedStage: "discovering",
 					estimationConfidence: getDiscoveryConfidence(),
 				})
 				updateDiscoveryDetail()
@@ -385,7 +426,13 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			message: `Mapped ${summary.discoveredFiles.toLocaleString()} files, now checking what changed`,
 		}
 		this.stateManager.reportScanProgress(summary.discoveredFiles, summary.discoveredFiles)
-		const pipelineSummary = await this.runPipelineForRun(summary.runId, summary.discoveredFiles)
+		const pipelineSummary = await this.runPipelineForRun(
+			summary.runId,
+			summary.discoveredFiles,
+			undefined,
+			undefined,
+			signal,
+		)
 		this.stateManager.setResilienceStats({
 			resumedRetryJobs: this._resumedRetryJobsCount,
 			resumedPendingJobs: this._resumedPendingJobsCount,
@@ -458,7 +505,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 	}
 
-	private async runTargetedUpdate(paths: string[], reason: "watcher" | "manual"): Promise<void> {
+	private async runTargetedUpdate(
+		paths: string[],
+		reason: "watcher" | "manual",
+		signal?: AbortSignal,
+	): Promise<void> {
 		if (paths.length === 0) {
 			return
 		}
@@ -475,6 +526,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			{
 				currentItemUnit: "files",
 				phase: "scanning",
+				detailedStage: "reconciling",
 			},
 		)
 		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "targeted-update-start", {
@@ -486,12 +538,21 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		const workspaceAdapter = this.requireWorkspaceAdapter()
 		const normalizedPaths = Array.from(new Set(paths.map((filePath) => path.normalize(filePath))))
 		const existingPaths: string[] = []
+		const oversizedPaths: string[] = []
 		const deletedPaths: string[] = []
 
 		for (const filePath of normalizedPaths) {
+			if (signal?.aborted) {
+				throw new Error("Targeted update aborted")
+			}
 			try {
 				await fs.access(filePath)
-				existingPaths.push(filePath)
+				const stat = await workspaceAdapter.statFile(filePath)
+				if (stat.size > MAX_FILE_SIZE_BYTES) {
+					oversizedPaths.push(filePath)
+				} else {
+					existingPaths.push(filePath)
+				}
 			} catch {
 				deletedPaths.push(filePath)
 			}
@@ -499,16 +560,22 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 
 		if (existingPaths.length > 0) {
 			const discoveryService = new DiscoveryService(this.metadataStore, workspaceAdapter)
-			const summary = await discoveryService.runTargetedDiscovery(existingPaths, reason)
+			const summary = await discoveryService.runTargetedDiscovery(existingPaths, reason, signal)
 			await this.runPipelineForRun(
 				summary.runId,
 				summary.discoveredFiles,
 				existingPaths.map((filePath) => path.relative(this.workspacePath, filePath)),
+				undefined,
+				signal,
 			)
 		}
 
 		if (deletedPaths.length > 0) {
-			await this.runDeletionPipeline(deletedPaths, `delete-${reason}`)
+			await this.runDeletionPipeline(deletedPaths, `delete-${reason}`, signal)
+		}
+
+		if (oversizedPaths.length > 0) {
+			await this.runDeletionPipeline(oversizedPaths, `oversized-${reason}`, signal)
 		}
 
 		const workspaceId = this.metadataStore.getWorkspaceId()
@@ -523,7 +590,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this.stateManager.setSystemState("Standby", liveMessage)
 	}
 
-	private async runDeletionPipeline(paths: string[], triggerType: string): Promise<void> {
+	private async runDeletionPipeline(paths: string[], triggerType: string, signal?: AbortSignal): Promise<void> {
 		this._status = {
 			engine: this.engine,
 			state: "running",
@@ -536,6 +603,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			{
 				currentItemUnit: "files",
 				phase: "embedding",
+				detailedStage: "deleting_vectors",
+				hasKnownVectorWork: true,
+				hasStartedVectorSync: false,
 			},
 		)
 		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "deletion-pipeline-start", {
@@ -548,6 +618,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		let deleteJobs = 0
 
 		for (const filePath of paths) {
+			if (signal?.aborted) {
+				throw new Error("Deletion pipeline aborted")
+			}
 			const relativePath = path.relative(this.workspacePath, filePath)
 			const fileRecord = await this.metadataStore.getFileRecordByWorkspacePathOptional(workspaceId, relativePath)
 			if (!fileRecord) {
@@ -581,8 +654,15 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			dependencies.vectorStore,
 		)
 		try {
-			await embedUpsertWorker.run(runId)
+			await embedUpsertWorker.run(runId, signal)
 			await this.metadataStore.markRunComplete(runId)
+		} catch (error) {
+			if (this.isAbortError(error) && this._stopRequested) {
+				await this.metadataStore.markRunStopped(runId, "Stopped by user.")
+			} else {
+				await this.metadataStore.markRunFailed(runId, this.getStopAwareErrorMessage(error))
+			}
+			throw error
 		} finally {
 			await dependencies.embeddingAdapter.recycleClient?.()
 			await dependencies.vectorStore.recycleClient?.()
@@ -596,7 +676,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this.stateManager.reportComplete(deleteJobs, paths.length)
 	}
 
-	private async runReconciliation(): Promise<void> {
+	private async runReconciliation(signal?: AbortSignal): Promise<void> {
 		this._status = {
 			engine: this.engine,
 			state: "running",
@@ -605,6 +685,8 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this.stateManager.reportCustomProgress("Reconciling local state with the workspace", 0, 1, {
 			currentItemUnit: "passes",
 			phase: "scanning",
+			detailedStage: "reconciling",
+			isBackgroundReconcile: true,
 		})
 		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "reconciliation-start", {
 			component: "CodeIndexEngineV2",
@@ -613,23 +695,44 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		const workspaceAdapter = this.requireWorkspaceAdapter()
 		const discoveryService = new DiscoveryService(this.metadataStore, workspaceAdapter)
 		const reconciliationService = new ReconciliationService(this.metadataStore, workspaceAdapter)
-		const summary = await discoveryService.runReconciliationDiscovery()
+		const summary = await discoveryService.runReconciliationDiscovery(signal)
 		const reconciliationSummary = await reconciliationService.findMissingFiles(summary)
 
 		if (reconciliationSummary.missingFiles.length > 0) {
 			await this.runDeletionPipeline(
 				reconciliationSummary.missingFiles.map((relativePath) => path.join(this.workspacePath, relativePath)),
 				"reconcile-delete",
+				signal,
 			)
 		}
 
-		await this.runPipelineForRun(summary.runId, summary.discoveredFiles)
+		await this.runPipelineForRun(
+			summary.runId,
+			summary.discoveredFiles,
+			undefined,
+			{ isBackgroundReconcile: true },
+			signal,
+		)
+		const indexedFiles = await this.metadataStore.countActiveIndexedFilesForWorkspace(
+			this.metadataStore.getWorkspaceId(),
+		)
+		const liveMessage = `V2 is current across ${indexedFiles.toLocaleString()} files`
+		this._status = {
+			engine: this.engine,
+			state: "idle",
+			message: liveMessage,
+		}
+		this.stateManager.setSystemState("Standby", liveMessage)
 	}
 
 	private async runPipelineForRun(
 		runId: string,
 		knownTotalFiles?: number,
 		relativePaths?: string[],
+		options?: {
+			isBackgroundReconcile?: boolean
+		},
+		signal?: AbortSignal,
 	): Promise<{
 		changedFiles: number
 		parsedChunks: number
@@ -643,36 +746,51 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}> {
 		const workspaceAdapter = this.requireWorkspaceAdapter()
 		const statHashService = new StatHashService(this.metadataStore, workspaceAdapter)
+		const baselineIndexedFiles = await this.metadataStore.countActiveIndexedFilesForWorkspace(
+			this.metadataStore.getWorkspaceId(),
+		)
+		const hasComparableBaseline = baselineIndexedFiles > 0
+		const statHashStage = hasComparableBaseline ? "comparing_signatures" : "hashing_initial"
+		const statHashHeadline = hasComparableBaseline ? "Comparing file signatures" : "Preparing files for indexing"
 		this._status = {
 			engine: this.engine,
 			state: "running",
-			message: "Comparing file signatures",
+			message: statHashHeadline,
 		}
 		const initialTotalFiles = Math.max(knownTotalFiles ?? relativePaths?.length ?? 0, 1)
-		this.stateManager.reportCustomProgress("Comparing file signatures", 0, initialTotalFiles, {
+		this.stateManager.reportCustomProgress(statHashHeadline, 0, initialTotalFiles, {
 			currentItemUnit: "files",
 			phase: "scanning",
+			detailedStage: statHashStage,
+			isBackgroundReconcile: options?.isBackgroundReconcile ?? false,
 		})
 		let checkedFiles = 0
 		let changedFiles = 0
 		let skippedFiles = 0
+		let unchangedFiles = 0
+		let oversizedFiles = 0
+		let missingFiles = 0
 		const getStatHashForecast = () => {
 			const totalFiles = Math.max(knownTotalFiles ?? relativePaths?.length ?? checkedFiles, checkedFiles, 1)
 			if (checkedFiles <= 0) {
 				return {
 					totalFiles,
 					projectedChangedFiles: changedFiles,
+					projectedUnchangedFiles: unchangedFiles,
 					projectedSkippedFiles: skippedFiles,
 				}
 			}
 
 			const changedRatio = changedFiles / checkedFiles
 			const projectedChangedFiles = Math.max(changedFiles, Math.round(totalFiles * changedRatio))
+			const unchangedRatio = unchangedFiles / checkedFiles
+			const projectedUnchangedFiles = Math.max(unchangedFiles, Math.round(totalFiles * unchangedRatio))
 			const projectedSkippedFiles = Math.max(skippedFiles, totalFiles - projectedChangedFiles)
 
 			return {
 				totalFiles,
 				projectedChangedFiles,
+				projectedUnchangedFiles,
 				projectedSkippedFiles,
 			}
 		}
@@ -689,46 +807,103 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 		const updateHashDetail = () => {
 			const forecast = getStatHashForecast()
+			const detailParts = [`${changedFiles.toLocaleString()} changed`]
+			if (unchangedFiles > 0) {
+				detailParts.push(`${unchangedFiles.toLocaleString()} unchanged`)
+			}
+			if (oversizedFiles > 0) {
+				detailParts.push(`${oversizedFiles.toLocaleString()} oversized`)
+			}
+			if (missingFiles > 0) {
+				detailParts.push(`${missingFiles.toLocaleString()} missing`)
+			}
 			const projectionSuffix =
 				checkedFiles > 0 && checkedFiles < forecast.totalFiles
-					? ` • Projecting ~${forecast.projectedChangedFiles.toLocaleString()} changed, ~${forecast.projectedSkippedFiles.toLocaleString()} unchanged`
+					? hasComparableBaseline && oversizedFiles === 0 && missingFiles === 0
+						? ` • Projecting ~${forecast.projectedChangedFiles.toLocaleString()} changed, ~${forecast.projectedUnchangedFiles.toLocaleString()} unchanged`
+						: ` • Projecting ~${forecast.projectedChangedFiles.toLocaleString()} changed`
 					: ""
 			this.stateManager.setActivityDetail(
-				`${changedFiles.toLocaleString()} changed • ${skippedFiles.toLocaleString()} unchanged${projectionSuffix} • ${this.getMemoryStatusText()}`,
+				`${detailParts.join(" • ")}${projectionSuffix} • ${this.getMemoryStatusText()}`,
 			)
 		}
 		updateHashDetail()
 		this.startActivityHeartbeat(() => {
 			const forecast = getStatHashForecast()
+			const summaryParts = [
+				`${checkedFiles.toLocaleString()} checked`,
+				`${changedFiles.toLocaleString()} changed`,
+			]
+			if (unchangedFiles > 0) {
+				summaryParts.push(`${unchangedFiles.toLocaleString()} unchanged`)
+			}
+			if (oversizedFiles > 0) {
+				summaryParts.push(`${oversizedFiles.toLocaleString()} oversized`)
+			}
+			if (missingFiles > 0) {
+				summaryParts.push(`${missingFiles.toLocaleString()} missing`)
+			}
 			const projectedChanged =
 				checkedFiles > 0 && checkedFiles < forecast.totalFiles
 					? `, projecting ~${forecast.projectedChangedFiles.toLocaleString()} changed`
 					: ""
-			return `Comparing file signatures... ${checkedFiles.toLocaleString()} checked, ${changedFiles.toLocaleString()} changed, ${skippedFiles.toLocaleString()} unchanged${projectedChanged}`
+			return `${statHashHeadline}... ${summaryParts.join(", ")}${projectedChanged}`
 		})
-		let statHashSummary = await statHashService.run(runId, undefined, relativePaths, {
-			onProgress: (progress) => {
-				checkedFiles = progress.checkedFiles
-				changedFiles = progress.changedFiles
-				skippedFiles = progress.skippedFiles
-				const forecast = getStatHashForecast()
-				this.stateManager.reportCustomProgress(
-					`Comparing file signatures... ${checkedFiles.toLocaleString()} checked, ${changedFiles.toLocaleString()} changed, ${skippedFiles.toLocaleString()} unchanged${
-						checkedFiles < forecast.totalFiles
-							? ` • ~${forecast.projectedChangedFiles.toLocaleString()} changed by completion`
-							: ""
-					}`,
-					checkedFiles,
-					forecast.totalFiles,
-					{
-						currentItemUnit: "files",
-						phase: "scanning",
-						estimationConfidence: getStatHashConfidence(),
-					},
-				)
-				updateHashDetail()
-			},
-		})
+		let statHashSummary: Awaited<ReturnType<StatHashService["run"]>>
+		try {
+			statHashSummary = await statHashService.run(runId, signal, relativePaths, {
+				onProgress: (progress) => {
+					checkedFiles = progress.checkedFiles
+					changedFiles = progress.changedFiles
+					skippedFiles = progress.skippedFiles
+					unchangedFiles = progress.unchangedFiles
+					oversizedFiles = progress.oversizedFiles
+					missingFiles = progress.missingFiles
+					const forecast = getStatHashForecast()
+					const summaryParts = [
+						`${checkedFiles.toLocaleString()} checked`,
+						`${changedFiles.toLocaleString()} changed`,
+					]
+					if (unchangedFiles > 0) {
+						summaryParts.push(`${unchangedFiles.toLocaleString()} unchanged`)
+					}
+					if (oversizedFiles > 0) {
+						summaryParts.push(`${oversizedFiles.toLocaleString()} oversized`)
+					}
+					if (missingFiles > 0) {
+						summaryParts.push(`${missingFiles.toLocaleString()} missing`)
+					}
+					this.stateManager.reportCustomProgress(
+						`${statHashHeadline}... ${summaryParts.join(", ")}${
+							checkedFiles < forecast.totalFiles
+								? ` • ~${forecast.projectedChangedFiles.toLocaleString()} changed by completion`
+								: ""
+						}`,
+						checkedFiles,
+						forecast.totalFiles,
+						{
+							currentItemUnit: "files",
+							phase: "scanning",
+							detailedStage: statHashStage,
+							changedFiles,
+							unchangedFiles,
+							oversizedFiles,
+							missingFiles,
+							estimationConfidence: getStatHashConfidence(),
+							isBackgroundReconcile: options?.isBackgroundReconcile ?? false,
+						},
+					)
+					updateHashDetail()
+				},
+			})
+		} catch (error) {
+			if (this.isAbortError(error) && this._stopRequested) {
+				await this.metadataStore.markRunStopped(runId, "Stopped by user.")
+			} else {
+				await this.metadataStore.markRunFailed(runId, this.getStopAwareErrorMessage(error))
+			}
+			throw error
+		}
 		this.stopActivityHeartbeat()
 		this.stateManager.setActivityDetail("")
 		const parserAdapter = new CodeIndexParserAdapter()
@@ -739,6 +914,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this._resumedRetryJobsCount = resumedJobs
 		await this.refreshOutstandingResumedJobs(runId)
 		if (resumedJobs > 0) {
+			this.stateManager.setRecoveryContext("stale_recovery", "stale_jobs")
 			this.stateManager.setResilienceStats({
 				resumedRetryJobs: resumedJobs,
 				resumedPendingJobs: this._resumedPendingJobsCount,
@@ -772,31 +948,65 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				{
 					currentItemUnit: "files",
 					phase: "scanning",
+					detailedStage: "hashing_initial",
+					isBackgroundReconcile: options?.isBackgroundReconcile ?? false,
 				},
 			)
 			this.startActivityHeartbeat(
-				() => `Remote index is empty, rebuilding ${checkedFiles.toLocaleString()} files from local metadata`,
+				() => `Rebuilding from local index metadata... ${checkedFiles.toLocaleString()} checked`,
 			)
-			statHashSummary = await statHashService.run(runId, undefined, relativePaths, {
-				forceReindex: true,
-				onProgress: (progress) => {
-					checkedFiles = progress.checkedFiles
-					changedFiles = progress.changedFiles
-					skippedFiles = progress.skippedFiles
-					this.stateManager.reportCustomProgress(
-						`Remote index is empty, rebuilding ${checkedFiles.toLocaleString()} files from local metadata`,
-						checkedFiles,
-						Math.max(statHashSummary.checkedFiles, progress.checkedFiles, 1),
-						{
-							currentItemUnit: "files",
-							phase: "scanning",
-						},
-					)
-					this.stateManager.setActivityDetail(this.getMemoryStatusText())
-				},
-			})
+			try {
+				statHashSummary = await statHashService.run(runId, signal, relativePaths, {
+					forceReindex: true,
+					onProgress: (progress) => {
+						checkedFiles = progress.checkedFiles
+						changedFiles = progress.changedFiles
+						skippedFiles = progress.skippedFiles
+						unchangedFiles = progress.unchangedFiles
+						oversizedFiles = progress.oversizedFiles
+						missingFiles = progress.missingFiles
+						this.stateManager.reportCustomProgress(
+							`Rebuilding from local index metadata... ${checkedFiles.toLocaleString()} checked`,
+							checkedFiles,
+							Math.max(statHashSummary.checkedFiles, progress.checkedFiles, 1),
+							{
+								currentItemUnit: "files",
+								phase: "scanning",
+								detailedStage: "hashing_initial",
+								changedFiles,
+								unchangedFiles,
+								oversizedFiles,
+								missingFiles,
+								isBackgroundReconcile: options?.isBackgroundReconcile ?? false,
+							},
+						)
+						this.stateManager.setActivityDetail(this.getMemoryStatusText())
+					},
+				})
+			} catch (error) {
+				if (this.isAbortError(error) && this._stopRequested) {
+					await this.metadataStore.markRunStopped(runId, "Stopped by user.")
+				} else {
+					await this.metadataStore.markRunFailed(runId, this.getStopAwareErrorMessage(error))
+				}
+				throw error
+			}
 			this.stopActivityHeartbeat()
 			this.stateManager.setActivityDetail("")
+		}
+		if (statHashSummary.changedFiles === 0 && this._resumedPendingJobsCount === 0) {
+			await this.metadataStore.markRunComplete(runId)
+			return {
+				changedFiles: 0,
+				parsedChunks: 0,
+				syncedChunks: 0,
+				retryingParseRevisions: 0,
+				terminalFailedParseRevisions: 0,
+				degradedRevisions: 0,
+				terminalFailedRevisions: 0,
+				terminallyFailedChunks: 0,
+				retryingChunks: 0,
+			}
 		}
 		try {
 			const embedUpsertWorker = new EmbedUpsertWorker(
@@ -810,6 +1020,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			let retryingParseRevisions = 0
 			let terminalFailedParseRevisions = 0
 			let syncedChunksCompleted = 0
+			let embedPhaseStarted = false
 			let latestSyncTelemetry:
 				| {
 						chunksPerSecond?: number
@@ -856,87 +1067,42 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					].join("\n"),
 				)
 			}
-
-			this._status = {
-				engine: this.engine,
-				state: "running",
-				message: `Building embeddings and streaming to Qdrant`,
-			}
-			this.stateManager.startEmbedPhase(1, true, totalChangedFiles, 0, {
-				runtimeKind: dependencies.embeddingAdapter.runtimeKind === "local" ? "local" : "remote",
-			})
-			updateEmbeddingDetail()
-
-			for (;;) {
-				this.startActivityHeartbeat(() => `Building embeddings and streaming to Qdrant`)
-				const parseChunkSummary = await parseChunkService.run(
-					runId,
-					undefined,
-					({ parsedRevisions, parsedChunks }) => {
-						const totalParsedRevisions = parsedRevisionsCompleted + parsedRevisions
-						const totalParsedChunks = parsedChunksCompleted + parsedChunks
-						this.stateManager.reportCustomProgress(
-							`Building embeddings and streaming to Qdrant`,
-							totalParsedRevisions,
-							totalChangedFiles,
-							{
-								currentItemUnit: "files",
-								phase: "embedding",
-								resilienceStats: {
-									resumedRetryJobs: this._resumedRetryJobsCount,
-									resumedPendingJobs: this._resumedPendingJobsCount,
-									retryingParseRevisions,
-									terminalFailedParseRevisions,
-									degradedRevisions: latestSyncTelemetry?.degradedRevisions ?? 0,
-									terminalFailedRevisions: latestSyncTelemetry?.terminalFailedRevisions ?? 0,
-									terminallyFailedChunks: latestSyncTelemetry?.terminallyFailedChunks ?? 0,
-									retryingChunks: latestSyncTelemetry?.retryingChunks ?? 0,
-								},
-							},
-						)
-						this.stateManager.reportEmbedProgress(
-							syncedChunksCompleted,
-							Math.max(totalParsedChunks, syncedChunksCompleted, 1),
-							totalParsedRevisions,
-						)
-						this.stateManager.setActivityDetail(
-							[
-								`Parsing ${totalParsedRevisions.toLocaleString()} of ${totalChangedFiles.toLocaleString()} files • Streaming ${syncedChunksCompleted.toLocaleString()} of ${Math.max(totalParsedChunks, 1).toLocaleString()} parsed chunks`,
-								this.getEmbeddingRuntimeStatusText(dependencies.embeddingAdapter, latestSyncTelemetry),
-							].join("\n"),
-						)
-					},
-					{ limit: CodeIndexEngineV2.REVISION_BATCH_SIZE },
-				)
-				this.stopActivityHeartbeat()
-
-				retryingParseRevisions += parseChunkSummary.retryingRevisions
-				terminalFailedParseRevisions += parseChunkSummary.terminalFailedRevisions
-				this.stateManager.setResilienceStats({
-					resumedRetryJobs: this._resumedRetryJobsCount,
-					resumedPendingJobs: this._resumedPendingJobsCount,
-					retryingParseRevisions,
-					terminalFailedParseRevisions,
-					degradedRevisions: latestSyncTelemetry?.degradedRevisions ?? 0,
-					terminalFailedRevisions: latestSyncTelemetry?.terminalFailedRevisions ?? 0,
-					terminallyFailedChunks: latestSyncTelemetry?.terminallyFailedChunks ?? 0,
-					retryingChunks: latestSyncTelemetry?.retryingChunks ?? 0,
-				})
-
-				if (parseChunkSummary.attemptedRevisions === 0) {
-					break
+			const countChunksForRevisions = async (revisionIds: string[]) => {
+				let totalChunks = 0
+				for (const revisionId of revisionIds) {
+					totalChunks += (await this.metadataStore.getChunksForRevision(revisionId)).length
 				}
-
-				parsedRevisionsCompleted += parseChunkSummary.parsedRevisions
-				parsedChunksCompleted += parseChunkSummary.parsedChunks
-				updateEmbeddingDetail()
-
+				return totalChunks
+			}
+			const syncVectorWork = async (parsedRevisionIds: string[], parsedChunkCount: number) => {
 				this._status = {
 					engine: this.engine,
 					state: "running",
-					message: `Planning vector updates for ${parseChunkSummary.parsedChunks.toLocaleString()} chunks`,
+					message: `Planning vector updates for ${parsedChunkCount.toLocaleString()} chunks`,
 				}
-				await diffPlanner.run(runId, undefined, { revisionIds: parseChunkSummary.parsedRevisionIds })
+				if (!embedPhaseStarted) {
+					this.stateManager.startEmbedPhase(
+						Math.max(parsedChunksCompleted, syncedChunksCompleted, parsedChunkCount, 1),
+						true,
+						totalChangedFiles,
+						0,
+						{
+							runtimeKind: dependencies.embeddingAdapter.runtimeKind === "local" ? "local" : "remote",
+							detailedStage: "planning_vectors",
+							hasKnownVectorWork: parsedChunkCount > 0 || this._resumedPendingJobsCount > 0,
+							hasStartedVectorSync: false,
+							isBackgroundReconcile: options?.isBackgroundReconcile ?? false,
+						},
+					)
+					embedPhaseStarted = true
+				}
+				this.stateManager.setActivityDetail(
+					[
+						`Parsing ${parsedRevisionsCompleted.toLocaleString()} of ${totalChangedFiles.toLocaleString()} files • Preparing ${Math.max(parsedChunksCompleted, 0).toLocaleString()} parsed chunks for vector sync${buildFailureSuffix()}`,
+						this.getEmbeddingRuntimeStatusText(dependencies.embeddingAdapter, latestSyncTelemetry),
+					].join("\n"),
+				)
+				await diffPlanner.run(runId, signal, { revisionIds: parsedRevisionIds })
 
 				this._status = {
 					engine: this.engine,
@@ -946,7 +1112,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				this.startActivityHeartbeat(() => `Building embeddings and streaming to Qdrant`)
 				const syncSummary = await embedUpsertWorker.run(
 					runId,
-					undefined,
+					signal,
 					({
 						upsertedChunks,
 						deletedChunks,
@@ -991,6 +1157,12 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 							Math.max(parsedChunksCompleted, totalSyncedChunks, 1),
 							parsedRevisionsCompleted,
 							parsedRevisionsCompleted >= statHashSummary.changedFiles,
+							{
+								detailedStage: "embedding",
+								hasKnownVectorWork: true,
+								hasStartedVectorSync: totalSyncedChunks > 0,
+								isBackgroundReconcile: options?.isBackgroundReconcile ?? false,
+							},
 						)
 					},
 				)
@@ -1009,6 +1181,100 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				})
 				updateEmbeddingDetail()
 			}
+
+			this._status = {
+				engine: this.engine,
+				state: "running",
+				message: `Preparing changed files for indexing`,
+			}
+			this.stateManager.reportCustomProgress("Preparing changed files for indexing", 0, totalChangedFiles, {
+				currentItemUnit: "files",
+				phase: "scanning",
+				detailedStage: "parsing",
+				isBackgroundReconcile: options?.isBackgroundReconcile ?? false,
+				resilienceStats: {
+					resumedRetryJobs: this._resumedRetryJobsCount,
+					resumedPendingJobs: this._resumedPendingJobsCount,
+				},
+			})
+			updateEmbeddingDetail()
+
+			const reusedParsedRevisionIds = statHashSummary.reusedParsedRevisionIds ?? []
+			if (reusedParsedRevisionIds.length > 0) {
+				const reusedParsedChunks = await countChunksForRevisions(reusedParsedRevisionIds)
+				parsedRevisionsCompleted += reusedParsedRevisionIds.length
+				parsedChunksCompleted += reusedParsedChunks
+				updateEmbeddingDetail()
+				await syncVectorWork(reusedParsedRevisionIds, reusedParsedChunks)
+			}
+
+			for (;;) {
+				this.startActivityHeartbeat(() => `Building embeddings and streaming to Qdrant`)
+				const parseChunkSummary = await parseChunkService.run(
+					runId,
+					signal,
+					({ parsedRevisions, parsedChunks }) => {
+						const totalParsedRevisions = parsedRevisionsCompleted + parsedRevisions
+						const totalParsedChunks = parsedChunksCompleted + parsedChunks
+						this.stateManager.reportCustomProgress(
+							`Preparing changed files for indexing`,
+							totalParsedRevisions,
+							totalChangedFiles,
+							{
+								currentItemUnit: "files",
+								phase: "scanning",
+								detailedStage: "parsing",
+								isBackgroundReconcile: options?.isBackgroundReconcile ?? false,
+								resilienceStats: {
+									resumedRetryJobs: this._resumedRetryJobsCount,
+									resumedPendingJobs: this._resumedPendingJobsCount,
+									retryingParseRevisions,
+									terminalFailedParseRevisions,
+									degradedRevisions: latestSyncTelemetry?.degradedRevisions ?? 0,
+									terminalFailedRevisions: latestSyncTelemetry?.terminalFailedRevisions ?? 0,
+									terminallyFailedChunks: latestSyncTelemetry?.terminallyFailedChunks ?? 0,
+									retryingChunks: latestSyncTelemetry?.retryingChunks ?? 0,
+								},
+							},
+						)
+						this.stateManager.setActivityDetail(
+							[
+								`Parsing ${totalParsedRevisions.toLocaleString()} of ${totalChangedFiles.toLocaleString()} files • Streaming ${syncedChunksCompleted.toLocaleString()} of ${Math.max(totalParsedChunks, 1).toLocaleString()} parsed chunks`,
+								this.getEmbeddingRuntimeStatusText(dependencies.embeddingAdapter, latestSyncTelemetry),
+							].join("\n"),
+						)
+					},
+					{ limit: CodeIndexEngineV2.REVISION_BATCH_SIZE },
+				)
+				this.stopActivityHeartbeat()
+
+				retryingParseRevisions += parseChunkSummary.retryingRevisions
+				terminalFailedParseRevisions += parseChunkSummary.terminalFailedRevisions
+				this.stateManager.setResilienceStats({
+					resumedRetryJobs: this._resumedRetryJobsCount,
+					resumedPendingJobs: this._resumedPendingJobsCount,
+					retryingParseRevisions,
+					terminalFailedParseRevisions,
+					degradedRevisions: latestSyncTelemetry?.degradedRevisions ?? 0,
+					terminalFailedRevisions: latestSyncTelemetry?.terminalFailedRevisions ?? 0,
+					terminallyFailedChunks: latestSyncTelemetry?.terminallyFailedChunks ?? 0,
+					retryingChunks: latestSyncTelemetry?.retryingChunks ?? 0,
+				})
+
+				if (parseChunkSummary.attemptedRevisions === 0) {
+					break
+				}
+
+				parsedRevisionsCompleted += parseChunkSummary.parsedRevisions
+				parsedChunksCompleted += parseChunkSummary.parsedChunks
+				updateEmbeddingDetail()
+
+				if (parseChunkSummary.parsedChunks === 0 && this._resumedPendingJobsCount === 0) {
+					continue
+				}
+
+				await syncVectorWork(parseChunkSummary.parsedRevisionIds, parseChunkSummary.parsedChunks)
+			}
 			this.stateManager.setActivityDetail("")
 
 			await this.metadataStore.markRunComplete(runId)
@@ -1025,7 +1291,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				retryingChunks: latestSyncTelemetry?.retryingChunks ?? 0,
 			}
 		} catch (error) {
-			await this.metadataStore.markRunFailed(runId, error instanceof Error ? error.message : String(error))
+			if (this.isAbortError(error) && this._stopRequested) {
+				await this.metadataStore.markRunStopped(runId, "Stopped by user.")
+			} else {
+				await this.metadataStore.markRunFailed(runId, this.getStopAwareErrorMessage(error))
+			}
 			throw error
 		} finally {
 			this.stopActivityHeartbeat()
@@ -1070,10 +1340,72 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return this._workspaceAdapter
 	}
 
-	private async runSerialized(task: () => Promise<void>): Promise<void> {
-		const next = this._operationChain.then(task, task)
+	private async runSerialized(task: (signal: AbortSignal) => Promise<void>): Promise<void> {
+		const runTask = async () => {
+			const controller = new AbortController()
+			this._activeAbortController = controller
+			try {
+				await task(controller.signal)
+			} finally {
+				if (this._activeAbortController === controller) {
+					this._activeAbortController = undefined
+				}
+			}
+		}
+		const next = this._operationChain.then(runTask, runTask)
 		this._operationChain = next.catch(() => undefined)
 		return next
+	}
+
+	private async preflightIndexingDependencies(signal?: AbortSignal): Promise<void> {
+		const { embeddingAdapter, vectorStore } = this.getOrCreateSearchDependencies()
+		this._status = {
+			engine: this.engine,
+			state: "running",
+			message: "Verifying indexing services",
+		}
+		this.stateManager.reportCustomProgress("Verifying indexing services", 0, 2, {
+			currentItemUnit: "checks",
+			phase: "scanning",
+			detailedStage: "preparing",
+		})
+
+		if (signal?.aborted) {
+			throw new Error("Indexing preflight aborted")
+		}
+
+		await vectorStore.initialize()
+		this.stateManager.reportCustomProgress("Verifying indexing services", 1, 2, {
+			currentItemUnit: "checks",
+			phase: "scanning",
+			detailedStage: "preparing",
+		})
+
+		if (signal?.aborted) {
+			throw new Error("Indexing preflight aborted")
+		}
+
+		await embeddingAdapter.createEmbeddings(["preflight"], {
+			isQuery: true,
+			signal,
+		})
+		this.stateManager.reportCustomProgress("Verifying indexing services", 2, 2, {
+			currentItemUnit: "checks",
+			phase: "scanning",
+			detailedStage: "preparing",
+		})
+	}
+
+	private isAbortError(error: unknown): boolean {
+		const message = error instanceof Error ? error.message : String(error)
+		return /aborted/i.test(message)
+	}
+
+	private getStopAwareErrorMessage(error: unknown): string {
+		if (this.isAbortError(error) && this._stopRequested) {
+			return "Stopped by user."
+		}
+		return error instanceof Error ? error.message : String(error)
 	}
 
 	private startActivityHeartbeat(messageFactory: () => string): void {

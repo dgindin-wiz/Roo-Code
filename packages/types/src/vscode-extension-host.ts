@@ -722,6 +722,18 @@ export interface IndexingStatusPayload {
 	message: string
 }
 
+export type IndexingDetailedStage =
+	| "preparing"
+	| "discovering"
+	| "hashing_initial"
+	| "comparing_signatures"
+	| "parsing"
+	| "planning_vectors"
+	| "embedding"
+	| "deleting_vectors"
+	| "reconciling"
+	| "complete"
+
 export interface IndexClearedPayload {
 	success: boolean
 	error?: string
@@ -756,14 +768,24 @@ export interface IndexingStatus {
 	autoEnableDefault?: boolean
 	// Two-phase progress fields
 	phase?: "scanning" | "embedding" | "complete"
+	detailedStage?: IndexingDetailedStage
 	totalFiles?: number
 	processedFiles?: number
 	totalBlocks?: number
 	blocksEmbedded?: number
+	changedFiles?: number
+	unchangedFiles?: number
+	oversizedFiles?: number
+	missingFiles?: number
 	estimatedTimeRemainingMs?: number | null
 	isEstimatedTotal?: boolean
 	estimationConfidence?: "low" | "medium" | "high"
 	isBackpressured?: boolean
+	hasKnownVectorWork?: boolean
+	hasStartedVectorSync?: boolean
+	isBackgroundReconcile?: boolean
+	interruptionKind?: "none" | "user_stop" | "stale_recovery"
+	resumeContext?: "none" | "stale_jobs" | "reusable_revisions"
 	resumedRetryJobs?: number
 	resumedPendingJobs?: number
 	retryingParseRevisions?: number
