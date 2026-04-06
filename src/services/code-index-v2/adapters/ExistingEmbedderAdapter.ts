@@ -43,6 +43,7 @@ export class ExistingEmbedderAdapter implements EmbeddingAdapter {
 
 		const response = await this.embedder.createEmbeddings(texts, undefined, {
 			isQuery: options?.isQuery,
+			signal: options?.signal,
 			debugContext: options?.debugContext,
 		})
 

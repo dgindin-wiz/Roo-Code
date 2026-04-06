@@ -29,6 +29,8 @@ import { CodeIndexStatus, ICodeIndexEngine } from "./interfaces"
 export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private static readonly REVISION_BATCH_SIZE = 20
 	private static readonly HEARTBEAT_INTERVAL_MS = 2_000
+	private static readonly PREFLIGHT_QDRANT_TIMEOUT_MS = 10_000
+	private static readonly PREFLIGHT_EMBEDDER_TIMEOUT_MS = 15_000
 	public readonly engine = CODE_INDEX_V2_ENGINE_ID
 	private _status: CodeIndexStatus = {
 		engine: CODE_INDEX_V2_ENGINE_ID,
@@ -83,49 +85,66 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			workspacePath: this.workspacePath,
 		})
 
-		await this.metadataStore.initialize()
-		const staleRunCleanup = await this.metadataStore.cleanupStaleRuns()
-		this._staleRunIdsToResume = staleRunCleanup.staleRunIds
-		this._resumedRetryJobsCount = 0
-		this._resumedPendingJobsCount = 0
-		if (staleRunCleanup.staleRunIds.length > 0) {
-			this.stateManager.setRecoveryContext("stale_recovery", "reusable_revisions")
-		}
-		if (staleRunCleanup.staleRunsMarkedFailed > 0) {
-			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "stale-v2-runs-cleaned", {
-				component: "CodeIndexEngineV2",
-				workspacePath: this.workspacePath,
-				jobId: `${staleRunCleanup.staleRunsMarkedFailed}:${staleRunCleanup.staleJobsAbandoned}:${staleRunCleanup.staleJobsPreservedForResume}:${staleRunCleanup.staleRevisionsFailed}:${staleRunCleanup.staleChunksAbandoned}`,
-			})
-		}
-		this._status = {
-			engine: this.engine,
-			state: "running",
-			message: "Preparing the workspace map",
-		}
-		this.stateManager.startIndexingTimer()
-		this.stateManager.reportCustomProgress("Preparing the workspace map", 0, 1, {
-			currentItemUnit: "phases",
-			phase: "scanning",
-			detailedStage: "preparing",
-		})
-		this._workspaceAdapter = new VsCodeWorkspaceAdapter(this.workspacePath, {
-			respectGitIgnore: this.configManager.currentRespectGitIgnore,
-		})
-		await this._workspaceAdapter.initialize()
-		await this.refreshTrackedOversizedFiles()
 		try {
+			await this.metadataStore.initialize()
+			const staleRunCleanup = await this.metadataStore.cleanupStaleRuns()
+			this._staleRunIdsToResume = staleRunCleanup.staleRunIds
+			this._resumedRetryJobsCount = 0
+			this._resumedPendingJobsCount = 0
+			if (staleRunCleanup.staleRunIds.length > 0) {
+				this.stateManager.setRecoveryContext("stale_recovery", "reusable_revisions")
+			}
+			if (staleRunCleanup.staleRunsMarkedFailed > 0) {
+				IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "stale-v2-runs-cleaned", {
+					component: "CodeIndexEngineV2",
+					workspacePath: this.workspacePath,
+					jobId: `${staleRunCleanup.staleRunsMarkedFailed}:${staleRunCleanup.staleJobsAbandoned}:${staleRunCleanup.staleJobsPreservedForResume}:${staleRunCleanup.staleRevisionsFailed}:${staleRunCleanup.staleChunksAbandoned}`,
+				})
+			}
+			this._status = {
+				engine: this.engine,
+				state: "running",
+				message: "Preparing the workspace map",
+			}
+			this.stateManager.startIndexingTimer()
+			this.stateManager.reportCustomProgress("Preparing the workspace map", 0, 1, {
+				currentItemUnit: "phases",
+				phase: "scanning",
+				detailedStage: "preparing",
+			})
+			this._workspaceAdapter = new VsCodeWorkspaceAdapter(this.workspacePath, {
+				respectGitIgnore: this.configManager.currentRespectGitIgnore,
+			})
+			await this._workspaceAdapter.initialize()
+			await this.refreshTrackedOversizedFiles()
 			await this.runSerialized(async (signal) => {
 				await this.runFullIndex("start", signal)
 			})
+			await this.ensureWatcher()
+			this.startReconciliationTimer()
 		} catch (error) {
+			this._started = false
+			this._activeAbortController = undefined
+			this.stopActivityHeartbeat()
+			if (this._reconciliationTimer) {
+				clearInterval(this._reconciliationTimer)
+				this._reconciliationTimer = undefined
+			}
+			this._watcherCoordinator?.dispose()
+			this._watcherCoordinator = undefined
+			this._status = {
+				engine: this.engine,
+				state: "error",
+				message: this.getStopAwareErrorMessage(error),
+			}
+			if (!this._stopRequested) {
+				this.stateManager.setSystemState("Error", this.getStopAwareErrorMessage(error))
+			}
 			if (this.isAbortError(error) && this._stopRequested) {
 				return
 			}
 			throw error
 		}
-		await this.ensureWatcher()
-		this.startReconciliationTimer()
 	}
 
 	async refreshAll(): Promise<void> {
@@ -2203,36 +2222,152 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			state: "running",
 			message: "Verifying indexing services",
 		}
-		this.stateManager.reportCustomProgress("Verifying indexing services", 0, 2, {
+		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "preflight-start", {
+			component: "CodeIndexEngineV2",
+			workspacePath: this.workspacePath,
+			provider: embeddingAdapter.provider,
+			modelId: embeddingAdapter.modelId,
+			jobId: this.configManager.qdrantConfig.url,
+		})
+		this.stateManager.reportCustomProgress("Verifying indexing services: Qdrant", 0, 2, {
 			currentItemUnit: "checks",
 			phase: "scanning",
 			detailedStage: "preparing",
 		})
 
-		if (signal?.aborted) {
-			throw new Error("Indexing preflight aborted")
-		}
-
-		await vectorStore.initialize()
-		this.stateManager.reportCustomProgress("Verifying indexing services", 1, 2, {
+		await this.verifyVectorStoreReady(vectorStore, signal)
+		this.stateManager.reportCustomProgress("Verifying indexing services: embedding provider", 1, 2, {
 			currentItemUnit: "checks",
 			phase: "scanning",
 			detailedStage: "preparing",
 		})
 
-		if (signal?.aborted) {
-			throw new Error("Indexing preflight aborted")
-		}
+		await this.verifyEmbeddingProviderReady(embeddingAdapter, signal)
+		this.stateManager.reportCustomProgress("Verifying indexing services: complete", 2, 2, {
+			currentItemUnit: "checks",
+			phase: "scanning",
+			detailedStage: "preparing",
+		})
+	}
 
-		await embeddingAdapter.createEmbeddings(["preflight"], {
-			isQuery: true,
+	private async verifyVectorStoreReady(
+		vectorStore: QdrantRestVectorStoreAdapter,
+		signal?: AbortSignal,
+	): Promise<void> {
+		await this.runPreflightStep({
+			step: "qdrant",
+			label: "Qdrant",
+			timeoutMs: CodeIndexEngineV2.PREFLIGHT_QDRANT_TIMEOUT_MS,
+			details: {
+				jobId: this.configManager.qdrantConfig.url,
+			},
 			signal,
+			action: (stepSignal) => vectorStore.initialize(stepSignal),
 		})
-		this.stateManager.reportCustomProgress("Verifying indexing services", 2, 2, {
-			currentItemUnit: "checks",
-			phase: "scanning",
-			detailedStage: "preparing",
+	}
+
+	private async verifyEmbeddingProviderReady(
+		embeddingAdapter: ExistingEmbedderAdapter,
+		signal?: AbortSignal,
+	): Promise<void> {
+		await this.runPreflightStep({
+			step: "embedder",
+			label: "embedding provider",
+			timeoutMs: CodeIndexEngineV2.PREFLIGHT_EMBEDDER_TIMEOUT_MS,
+			details: {
+				provider: embeddingAdapter.provider,
+				modelId: embeddingAdapter.modelId,
+			},
+			signal,
+			action: (stepSignal) =>
+				embeddingAdapter.createEmbeddings(["preflight"], {
+					isQuery: true,
+					signal: stepSignal,
+				}),
 		})
+	}
+
+	private async runPreflightStep(options: {
+		step: "qdrant" | "embedder"
+		label: string
+		timeoutMs: number
+		signal?: AbortSignal
+		details?: Record<string, unknown>
+		action: (signal: AbortSignal) => Promise<unknown>
+	}): Promise<void> {
+		if (options.signal?.aborted) {
+			throw new Error("Indexing preflight aborted")
+		}
+
+		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "preflight-step-start", {
+			component: "CodeIndexEngineV2",
+			workspacePath: this.workspacePath,
+			jobId: options.step,
+			timeoutMs: options.timeoutMs,
+			...options.details,
+		})
+
+		const controller = new AbortController()
+		const abortStep = () => controller.abort()
+		options.signal?.addEventListener("abort", abortStep, { once: true })
+
+		let timeoutHandle: NodeJS.Timeout | undefined
+		try {
+			await Promise.race([
+				options.action(controller.signal),
+				new Promise<never>((_, reject) => {
+					timeoutHandle = setTimeout(() => {
+						controller.abort()
+						const message = `${options.label === "Qdrant" ? "Qdrant" : "Embedding provider"} verification timed out after ${Math.round(options.timeoutMs / 1000)}s`
+						IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "preflight-timeout", {
+							component: "CodeIndexEngineV2",
+							workspacePath: this.workspacePath,
+							jobId: options.step,
+							timeoutMs: options.timeoutMs,
+							errorMessage: message,
+							...options.details,
+						})
+						reject(new Error(message))
+					}, options.timeoutMs)
+				}),
+			])
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "preflight-step-complete", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				jobId: options.step,
+				timeoutMs: options.timeoutMs,
+				...options.details,
+			})
+		} catch (error) {
+			const message =
+				options.signal?.aborted || (controller.signal.aborted && this.isAbortError(error))
+					? "Indexing preflight aborted"
+					: error instanceof Error
+						? error.message
+						: String(error)
+			const normalizedError =
+				options.signal?.aborted || /aborted/i.test(message)
+					? new Error("Indexing preflight aborted")
+					: /timed out/i.test(message)
+						? new Error(message)
+						: new Error(
+								`${options.label === "Qdrant" ? "Qdrant" : "Embedding provider"} verification failed: ${message}`,
+							)
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "preflight-step-failed", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				jobId: options.step,
+				timeoutMs: options.timeoutMs,
+				errorMessage: normalizedError.message,
+				...options.details,
+			})
+			throw normalizedError
+		} finally {
+			options.signal?.removeEventListener("abort", abortStep)
+			if (timeoutHandle) {
+				clearTimeout(timeoutHandle)
+			}
+		}
 	}
 
 	private isAbortError(error: unknown): boolean {

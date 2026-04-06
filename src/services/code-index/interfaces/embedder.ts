@@ -6,6 +6,7 @@ export interface EmbedderDebugContext {
 
 export interface EmbedderCreateEmbeddingsOptions {
 	isQuery?: boolean
+	signal?: AbortSignal
 	debugContext?: EmbedderDebugContext
 }
 

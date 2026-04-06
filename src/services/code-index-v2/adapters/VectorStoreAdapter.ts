@@ -32,7 +32,7 @@ export interface VectorPoint {
 }
 
 export interface VectorStoreAdapter {
-	initialize(): Promise<void>
+	initialize(signal?: AbortSignal): Promise<void>
 	hasIndexedPoints(): Promise<boolean>
 	upsertPoints(points: VectorPoint[]): Promise<void>
 	deletePointsByIds(pointIds: string[]): Promise<void>

@@ -32,24 +32,28 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 		this.transport = createIsolatedFetch()
 	}
 
-	async initialize(): Promise<void> {
-		const collection = await this.getCollection()
+	async initialize(signal?: AbortSignal): Promise<void> {
+		const collection = await this.getCollection(signal)
 		if (!collection) {
-			await this.request(`/collections/${this.collectionName}`, {
-				method: "PUT",
-				body: {
-					vectors: {
-						size: this.vectorSize,
-						distance: "Cosine",
-						on_disk: true,
-					},
-					hnsw_config: {
-						m: 64,
-						ef_construct: 512,
-						on_disk: true,
+			await this.request(
+				`/collections/${this.collectionName}`,
+				{
+					method: "PUT",
+					body: {
+						vectors: {
+							size: this.vectorSize,
+							distance: "Cosine",
+							on_disk: true,
+						},
+						hnsw_config: {
+							m: 64,
+							ef_construct: 512,
+							on_disk: true,
+						},
 					},
 				},
-			})
+				signal,
+			)
 			IndexDebugLoggerV2.log("basic", "QdrantRestVectorStoreAdapter", "collection-created", {
 				component: "QdrantRestVectorStoreAdapter",
 				workspacePath: this.workspacePath,
@@ -63,9 +67,9 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 			})
 		}
 
-		await this.ensurePayloadIndex("filePath")
-		await this.ensurePayloadIndex("revisionId")
-		await this.ensurePayloadIndex("fileId")
+		await this.ensurePayloadIndex("filePath", signal)
+		await this.ensurePayloadIndex("revisionId", signal)
+		await this.ensurePayloadIndex("fileId", signal)
 	}
 
 	async upsertPoints(points: VectorPoint[]): Promise<void> {
@@ -180,11 +184,24 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 		}
 	}
 
-	private async getCollection(): Promise<Record<string, unknown> | undefined> {
-		const response = await this.transport.fetch(`${this.baseUrl}/collections/${this.collectionName}`, {
-			method: "GET",
-			headers: this.buildHeaders(),
-		})
+	private async getCollection(signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
+		let response: Awaited<ReturnType<IsolatedFetch["fetch"]>>
+		try {
+			response = await this.transport.fetch(`${this.baseUrl}/collections/${this.collectionName}`, {
+				method: "GET",
+				headers: this.buildHeaders(),
+				signal,
+			})
+		} catch (error) {
+			const formattedError = this.formatTransportError(error)
+			IndexDebugLoggerV2.log("basic", "QdrantRestVectorStoreAdapter", "qdrant-transport-failed", {
+				component: "QdrantRestVectorStoreAdapter",
+				workspacePath: this.workspacePath,
+				jobId: `GET /collections/${this.collectionName}`,
+				errorMessage: formattedError.message,
+			})
+			throw formattedError
+		}
 
 		if (response.status === 404) {
 			return undefined
@@ -198,15 +215,19 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 		return body.result
 	}
 
-	private async ensurePayloadIndex(fieldName: string): Promise<void> {
+	private async ensurePayloadIndex(fieldName: string, signal?: AbortSignal): Promise<void> {
 		try {
-			await this.request(`/collections/${this.collectionName}/index`, {
-				method: "PUT",
-				body: {
-					field_name: fieldName,
-					field_schema: "keyword",
+			await this.request(
+				`/collections/${this.collectionName}/index`,
+				{
+					method: "PUT",
+					body: {
+						field_name: fieldName,
+						field_schema: "keyword",
+					},
 				},
-			})
+				signal,
+			)
 		} catch (error) {
 			IndexDebugLoggerV2.log("basic", "QdrantRestVectorStoreAdapter", "payload-index-create-failed", {
 				component: "QdrantRestVectorStoreAdapter",
@@ -217,12 +238,29 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 		}
 	}
 
-	private async request<T>(resourcePath: string, init: { method: string; body?: unknown }): Promise<T> {
-		const response = await this.transport.fetch(`${this.baseUrl}${resourcePath}`, {
-			method: init.method,
-			headers: this.buildHeaders(),
-			body: init.body ? JSON.stringify(init.body) : undefined,
-		})
+	private async request<T>(
+		resourcePath: string,
+		init: { method: string; body?: unknown },
+		signal?: AbortSignal,
+	): Promise<T> {
+		let response: Awaited<ReturnType<IsolatedFetch["fetch"]>>
+		try {
+			response = await this.transport.fetch(`${this.baseUrl}${resourcePath}`, {
+				method: init.method,
+				headers: this.buildHeaders(),
+				body: init.body ? JSON.stringify(init.body) : undefined,
+				signal,
+			})
+		} catch (error) {
+			const formattedError = this.formatTransportError(error)
+			IndexDebugLoggerV2.log("basic", "QdrantRestVectorStoreAdapter", "qdrant-transport-failed", {
+				component: "QdrantRestVectorStoreAdapter",
+				workspacePath: this.workspacePath,
+				jobId: `${init.method} ${resourcePath}`,
+				errorMessage: formattedError.message,
+			})
+			throw formattedError
+		}
 
 		if (!response.ok) {
 			const body = await response.text().catch(() => "")
@@ -263,6 +301,39 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 			"User-Agent": "Roo-Code",
 			...(this.apiKey ? { "api-key": this.apiKey } : {}),
 		}
+	}
+
+	private formatTransportError(error: unknown): Error {
+		const message = error instanceof Error ? error.message : String(error)
+		const code =
+			typeof error === "object" && error && "code" in error
+				? String((error as { code?: unknown }).code ?? "")
+				: ""
+		const causeCode =
+			typeof error === "object" &&
+			error &&
+			"cause" in error &&
+			(error as { cause?: unknown }).cause &&
+			typeof (error as { cause?: unknown }).cause === "object" &&
+			"code" in ((error as { cause?: unknown }).cause as object)
+				? String(((error as { cause?: unknown }).cause as { code?: unknown }).code ?? "")
+				: ""
+		const combined = `${message} ${code} ${causeCode}`.toUpperCase()
+
+		if (error instanceof Error && error.name === "AbortError") {
+			return new Error(`Request to Qdrant at ${this.baseUrl} was aborted`)
+		}
+		if (combined.includes("ECONNREFUSED") || message.includes("fetch failed")) {
+			return new Error(`Could not connect to Qdrant at ${this.baseUrl} (connection refused)`)
+		}
+		if (combined.includes("ENOTFOUND") || combined.includes("EAI_AGAIN")) {
+			return new Error(`Could not resolve the Qdrant host at ${this.baseUrl}`)
+		}
+		if (combined.includes("ETIMEDOUT") || combined.includes("TIMEOUT")) {
+			return new Error(`Request to Qdrant at ${this.baseUrl} timed out`)
+		}
+
+		return new Error(`Qdrant request failed at ${this.baseUrl}: ${message}`)
 	}
 
 	private normalizeBaseUrl(url: string): string {

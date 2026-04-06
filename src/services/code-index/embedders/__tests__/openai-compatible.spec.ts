@@ -244,6 +244,29 @@ describe("OpenAICompatibleEmbedder", () => {
 			})
 		})
 
+		it("passes AbortSignal to the SDK request when provided", async () => {
+			const controller = new AbortController()
+			mockEmbeddingsCreate.mockResolvedValue({
+				data: [{ embedding: [0.1, 0.2, 0.3] }],
+				usage: { prompt_tokens: 10, total_tokens: 15 },
+			})
+
+			await embedder.createEmbeddings(["Hello world"], undefined, {
+				signal: controller.signal,
+			})
+
+			expect(mockEmbeddingsCreate).toHaveBeenCalledWith(
+				{
+					input: ["Hello world"],
+					model: testModelId,
+					encoding_format: "base64",
+				},
+				expect.objectContaining({
+					signal: controller.signal,
+				}),
+			)
+		})
+
 		it("should handle missing usage data gracefully", async () => {
 			const testTexts = ["Hello world"]
 			const mockResponse = {

@@ -501,6 +501,57 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.discoveryService.runWorkspaceDiscoveryWithProgress).not.toHaveBeenCalled()
 	})
 
+	it("times out Qdrant preflight with a specific error and does not wedge future starts", async () => {
+		mocks.vectorStore.initialize.mockImplementationOnce(() => new Promise<void>(() => undefined))
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		const startPromise = expect(engine.start()).rejects.toThrow("Qdrant verification timed out after 10s")
+
+		await vi.advanceTimersByTimeAsync(10_000)
+
+		await startPromise
+		expect(mocks.discoveryService.runWorkspaceDiscoveryWithProgress).not.toHaveBeenCalled()
+		expect(mocks.stateManager.reportCustomProgress).toHaveBeenCalledWith(
+			"Verifying indexing services: Qdrant",
+			0,
+			2,
+			expect.any(Object),
+		)
+		expect(mocks.stateManager.setSystemState).toHaveBeenCalledWith(
+			"Error",
+			"Qdrant verification timed out after 10s",
+		)
+
+		await engine.start()
+
+		expect(mocks.discoveryService.runWorkspaceDiscoveryWithProgress).toHaveBeenCalledTimes(1)
+	})
+
+	it("times out embedder preflight with a specific error", async () => {
+		mocks.embeddingAdapter.createEmbeddings.mockImplementationOnce(() => new Promise(() => undefined))
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		const startPromise = expect(engine.start()).rejects.toThrow(
+			"Embedding provider verification timed out after 15s",
+		)
+
+		await vi.advanceTimersByTimeAsync(15_000)
+
+		await startPromise
+		expect(mocks.vectorStore.initialize).toHaveBeenCalled()
+		expect(mocks.discoveryService.runWorkspaceDiscoveryWithProgress).not.toHaveBeenCalled()
+		expect(mocks.stateManager.reportCustomProgress).toHaveBeenCalledWith(
+			"Verifying indexing services: embedding provider",
+			1,
+			2,
+			expect.any(Object),
+		)
+		expect(mocks.stateManager.setSystemState).toHaveBeenCalledWith(
+			"Error",
+			"Embedding provider verification timed out after 15s",
+		)
+	})
+
 	it("returns watcher-driven targeted updates to standby after the pipeline completes", async () => {
 		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
 

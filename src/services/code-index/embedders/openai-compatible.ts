@@ -133,6 +133,10 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 		model?: string,
 		options?: EmbedderCreateEmbeddingsOptions,
 	): Promise<EmbeddingResponse> {
+		if (options?.signal?.aborted) {
+			throw new Error("Embedding request aborted")
+		}
+
 		const modelToUse = model || this.defaultModelId
 		const requestStartedAt = Date.now()
 
@@ -219,7 +223,12 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 			}
 
 			if (currentBatch.length > 0) {
-				const batchResult = await this._embedBatchWithRetries(currentBatch, modelToUse, options?.debugContext)
+				const batchResult = await this._embedBatchWithRetries(
+					currentBatch,
+					modelToUse,
+					options?.debugContext,
+					options?.signal,
+				)
 				allEmbeddings.push(...batchResult.embeddings)
 				usage.promptTokens += batchResult.usage.promptTokens
 				usage.totalTokens += batchResult.usage.totalTokens
@@ -300,6 +309,7 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 		url: string,
 		batchTexts: string[],
 		model: string,
+		signal?: AbortSignal,
 	): Promise<OpenAIEmbeddingResponse> {
 		// Use the isolated fetch (private undici Agent) instead of global fetch.
 		// Global fetch routes through Node's shared dispatcher whose native TLS
@@ -318,6 +328,7 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 				model: model,
 				encoding_format: "base64",
 			}),
+			signal,
 		})
 
 		if (!response || !response.ok) {
@@ -364,6 +375,7 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 		batchTexts: string[],
 		model: string,
 		debugContext?: EmbedderCreateEmbeddingsOptions["debugContext"],
+		signal?: AbortSignal,
 	): Promise<{
 		embeddings: number[][]
 		usage: { promptTokens: number; totalTokens: number }
@@ -373,6 +385,10 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 		const isFullUrl = this.isFullUrl
 
 		for (let attempts = 0; attempts < MAX_RETRIES; attempts++) {
+			if (signal?.aborted) {
+				throw new Error("Embedding request aborted")
+			}
+
 			// Check global rate limit before attempting request
 			await this.waitForGlobalRateLimit()
 
@@ -382,17 +398,22 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 
 				if (isFullUrl) {
 					// Use direct HTTP request for full endpoint URLs
-					response = await this.makeDirectEmbeddingRequest(this.baseUrl, batchTexts, model)
+					response = await this.makeDirectEmbeddingRequest(this.baseUrl, batchTexts, model, signal)
 				} else {
 					// Use OpenAI SDK for base URLs
-					response = (await this.embeddingsClient.embeddings.create({
+					const requestBody = {
 						input: batchTexts,
 						model: model,
 						// OpenAI package (as of v4.78.1) has a parsing issue that truncates embedding dimensions to 256
 						// when processing numeric arrays, which breaks compatibility with models using larger dimensions.
 						// By requesting base64 encoding, we bypass the package's parser and handle decoding ourselves.
-						encoding_format: "base64",
-					})) as OpenAIEmbeddingResponse
+						encoding_format: "base64" as const,
+					}
+					response = signal
+						? ((await this.embeddingsClient.embeddings.create(requestBody, {
+								signal,
+							} as any)) as OpenAIEmbeddingResponse)
+						: ((await this.embeddingsClient.embeddings.create(requestBody)) as OpenAIEmbeddingResponse)
 				}
 				const requestLatencyMs = Date.now() - requestStartedAt
 
@@ -416,6 +437,10 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 					requestLatencyMs,
 				}
 			} catch (error) {
+				if (signal?.aborted || (error instanceof Error && /aborted/i.test(error.message))) {
+					throw new Error("Embedding request aborted")
+				}
+
 				// Capture telemetry before error is reformatted
 				TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
 					error: error instanceof Error ? error.message : String(error),
