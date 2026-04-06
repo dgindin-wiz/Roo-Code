@@ -146,6 +146,14 @@ const testTypedObjectLiteralDefinition: TestTypeDefinition = {
     }
 };
 
+// Exported constant definition with multiline payload
+export const TEST_TYPED_SCHEMA_DEFINITION = {
+    tableName: 'typed_records',
+    primaryKey: 'id',
+    timestamps: true,
+    columns: ['value', 'created_at']
+};
+
 // JSX element with TypeScript props
 interface TestJsxPropsDefinition {
     title: string;

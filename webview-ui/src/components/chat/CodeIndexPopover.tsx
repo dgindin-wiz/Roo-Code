@@ -93,6 +93,45 @@ function formatCountLabel(count: number, singular: string, plural: string): stri
 	return `${count.toLocaleString()} ${count === 1 ? singular : plural}`
 }
 
+function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`
+	const kb = bytes / 1024
+	if (kb < 1024) return `${kb.toFixed(1)} KB`
+	const mb = kb / 1024
+	if (mb < 1024) return `${mb.toFixed(2)} MB`
+	return `${(mb / 1024).toFixed(2)} GB`
+}
+
+function formatModifiedTime(mtimeMs: number | null): string | null {
+	if (mtimeMs == null) {
+		return null
+	}
+
+	const diffMs = Date.now() - mtimeMs
+	const minuteMs = 60_000
+	const hourMs = 60 * minuteMs
+	const dayMs = 24 * hourMs
+
+	if (diffMs < hourMs) {
+		const minutes = Math.max(1, Math.round(diffMs / minuteMs))
+		return `Modified ${minutes}m ago`
+	}
+	if (diffMs < dayMs) {
+		const hours = Math.max(1, Math.round(diffMs / hourMs))
+		return `Modified ${hours}h ago`
+	}
+	if (diffMs < 7 * dayMs) {
+		const days = Math.max(1, Math.round(diffMs / dayMs))
+		return `Modified ${days}d ago`
+	}
+
+	return `Modified ${new Date(mtimeMs).toLocaleString()}`
+}
+
+function computeApprovedMaxBytes(sizeBytes: number): number {
+	return Math.max(Math.ceil(sizeBytes * 1.2), sizeBytes + 256 * 1024)
+}
+
 export function getIndexingHeadline(indexingStatus: IndexingStatus, isCurrentStandby: boolean, t: any): string {
 	if (isCurrentStandby) {
 		return t("settings:codeIndex.liveWatcherHeadline")
@@ -133,6 +172,54 @@ export function getIndexingHeadline(indexingStatus: IndexingStatus, isCurrentSta
 			}
 			return (indexingStatus.message ?? "").split("\n")[0] ?? ""
 	}
+}
+
+function getLiveWatcherCurrentLine(
+	indexingStatus: IndexingStatus,
+	fallbackLine?: string,
+	oversizedCount?: number,
+): string | null {
+	const message = indexingStatus.message ?? ""
+	const firstLine = fallbackLine ?? message.split("\n")[0]?.trim() ?? ""
+	const oversizedSuffix =
+		oversizedCount && oversizedCount > 0 ? ` with ${oversizedCount.toLocaleString()} oversized files skipped` : ""
+
+	const mappedMatch = firstLine.match(/^V2 mapped ([\d,]+) files/i)
+	if (mappedMatch?.[1]) {
+		return `V2 is current across ${mappedMatch[1]} files${oversizedSuffix}`
+	}
+
+	const refreshedMatch = firstLine.match(/^V2 refresh re-evaluated ([\d,]+) files/i)
+	if (refreshedMatch?.[1]) {
+		return `V2 is current across ${refreshedMatch[1]} files${oversizedSuffix}`
+	}
+
+	if (/^V2 is current across /i.test(firstLine)) {
+		return firstLine.replace(/\s+with\s+[\d,]+\s+oversized files skipped/i, "") + oversizedSuffix
+	}
+
+	if (/^Index up-to-date/i.test(firstLine)) {
+		return firstLine
+	}
+
+	return firstLine || null
+}
+
+function getLiveWatcherRefreshLine(indexingStatus: IndexingStatus, fallbackLine?: string): string | null {
+	const message = indexingStatus.message ?? ""
+	const firstLine = fallbackLine ?? message.split("\n")[0]?.trim() ?? ""
+
+	const refreshedMatch = firstLine.match(/refreshed ([\d,]+) changed files/i)
+	const syncedMatch = firstLine.match(/synced ([\d,]+) chunks/i)
+	const oversizedMatch = firstLine.match(/with ([\d,]+) oversized files skipped/i)
+
+	const parts = [
+		refreshedMatch?.[1] ? `${refreshedMatch[1]} changed files` : null,
+		syncedMatch?.[1] ? `${syncedMatch[1]} chunks synced` : null,
+		oversizedMatch?.[1] ? `${oversizedMatch[1]} oversized files skipped` : null,
+	].filter((part): part is string => Boolean(part))
+
+	return parts.length > 0 ? `Last refresh: ${parts.join(" • ")}` : null
 }
 
 export function getProgressStageLabel(stage?: IndexingDetailedStage, phase?: IndexingStatus["phase"]): string {
@@ -208,6 +295,7 @@ interface LocalCodeIndexSettings {
 	// Global state settings
 	codebaseIndexEnabled: boolean
 	codebaseIndexQdrantUrl: string
+	codebaseIndexMaxFileSizeMb?: number
 	codebaseIndexEmbedderProvider: EmbedderProvider
 	codebaseIndexEmbedderBaseUrl?: string
 	codebaseIndexEmbedderModelId: string
@@ -235,6 +323,13 @@ interface LocalCodeIndexSettings {
 	codebaseIndexVercelAiGatewayApiKey?: string
 	codebaseIndexOpenRouterApiKey?: string
 	codebaseIndexOpenRouterSpecificProvider?: string
+	codebaseIndexOversizedFileApprovals?: Array<{
+		workspacePath: string
+		relativePath: string
+		sizeAtApprovalBytes: number
+		approvedMaxBytes: number
+		approvedAt: number
+	}>
 }
 
 // Validation schema for codebase index settings
@@ -245,6 +340,7 @@ const createValidationSchema = (provider: EmbedderProvider, t: any) => {
 			.string()
 			.min(1, t("settings:codeIndex.validation.qdrantUrlRequired"))
 			.url(t("settings:codeIndex.validation.invalidQdrantUrl")),
+		codebaseIndexMaxFileSizeMb: z.number().int().min(1).max(100).optional(),
 		codeIndexQdrantApiKey: z.string().optional(),
 		codebaseIndexEmbeddingBatchSize: z.number().int().min(1).max(200).optional(),
 		codebaseIndexEmbeddingLaneConcurrency: z.number().int().min(1).max(3).optional(),
@@ -370,11 +466,37 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		sort: "severity",
 	})
 	const [warningDetailsBootstrapped, setWarningDetailsBootstrapped] = useState(false)
+	const [oversizedDetailsState, setOversizedDetailsState] = useState<{
+		items: Array<{
+			relativePath: string
+			normalizedPath: string
+			status: "skipped" | "needs_reapproval" | "approved" | "eligible" | "missing"
+			sizeBytes: number
+			lastModifiedMtimeMs: number | null
+			recommendation: "likely_useful" | "review_manually" | "probably_skip"
+			reason: string
+			approvedMaxBytes: number | null
+			lastEvaluatedAt: number
+		}>
+		total: number
+		actionable: number
+		loading: boolean
+		hasMore: boolean
+	}>({
+		items: [],
+		total: 0,
+		actionable: 0,
+		loading: false,
+		hasMore: false,
+	})
+	const [oversizedDetailsBootstrapped, setOversizedDetailsBootstrapped] = useState(false)
+	const [isOversizedReviewOpen, setIsOversizedReviewOpen] = useState(false)
 	const [warningFilter, setWarningFilter] = useState<"all" | "parser_failed" | "failed" | "degraded">("all")
 	const [warningSort, setWarningSort] = useState<"severity" | "recent" | "path">("severity")
 	const [retryWarningsPending, setRetryWarningsPending] = useState(false)
 	const [retryingWarningPath, setRetryingWarningPath] = useState<string | null>(null)
 	const { copyWithFeedback, showCopyFeedback } = useCopyToClipboard()
+	const saveFeedbackTimerRef = useRef<number | null>(null)
 
 	// Form validation state
 	const [formErrors, setFormErrors] = useState<Record<string, string>>({})
@@ -387,6 +509,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const getDefaultSettings = (): LocalCodeIndexSettings => ({
 		codebaseIndexEnabled: true,
 		codebaseIndexQdrantUrl: "",
+		codebaseIndexMaxFileSizeMb: 1,
 		codebaseIndexEmbedderProvider: "openai",
 		codebaseIndexEmbedderBaseUrl: "",
 		codebaseIndexEmbedderModelId: "",
@@ -410,6 +533,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		codebaseIndexVercelAiGatewayApiKey: "",
 		codebaseIndexOpenRouterApiKey: "",
 		codebaseIndexOpenRouterSpecificProvider: "",
+		codebaseIndexOversizedFileApprovals: [],
 	})
 
 	// Initial settings state - stores the settings when popover opens
@@ -457,6 +581,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 			const settings = {
 				codebaseIndexEnabled: codebaseIndexConfig.codebaseIndexEnabled ?? true,
 				codebaseIndexQdrantUrl: codebaseIndexConfig.codebaseIndexQdrantUrl || "",
+				codebaseIndexMaxFileSizeMb: codebaseIndexConfig.codebaseIndexMaxFileSizeMb ?? 1,
 				codebaseIndexEmbedderProvider: codebaseIndexConfig.codebaseIndexEmbedderProvider || "openai",
 				codebaseIndexEmbedderBaseUrl: codebaseIndexConfig.codebaseIndexEmbedderBaseUrl || "",
 				codebaseIndexEmbedderModelId: codebaseIndexConfig.codebaseIndexEmbedderModelId || "",
@@ -484,6 +609,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 				codebaseIndexOpenRouterApiKey: "",
 				codebaseIndexOpenRouterSpecificProvider:
 					codebaseIndexConfig.codebaseIndexOpenRouterSpecificProvider || "",
+				codebaseIndexOversizedFileApprovals: codebaseIndexConfig.codebaseIndexOversizedFileApprovals ?? [],
 			}
 			setInitialSettings(settings)
 			setCurrentSettings(settings)
@@ -514,6 +640,30 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		return () => window.removeEventListener("message", handleMessage)
 	}, [open])
 
+	const showSaveError = useCallback(
+		(message?: string) => {
+			if (saveFeedbackTimerRef.current !== null) {
+				window.clearTimeout(saveFeedbackTimerRef.current)
+			}
+			setSaveStatus("error")
+			setSaveError(message || t("settings:codeIndex.saveError"))
+			saveFeedbackTimerRef.current = window.setTimeout(() => {
+				setSaveStatus("idle")
+				setSaveError(null)
+				saveFeedbackTimerRef.current = null
+			}, 5000)
+		},
+		[t],
+	)
+
+	useEffect(() => {
+		return () => {
+			if (saveFeedbackTimerRef.current !== null) {
+				window.clearTimeout(saveFeedbackTimerRef.current)
+			}
+		}
+	}, [])
+
 	const requestWarningDetails = useCallback(
 		(offset: number, limit = 20, filter = warningFilter, sort = warningSort) => {
 			setWarningDetailsState((prev) => ({ ...prev, loading: true, filter, sort }))
@@ -524,6 +674,14 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		},
 		[warningFilter, warningSort],
 	)
+
+	const requestOversizedDetails = useCallback((offset: number, limit = 20) => {
+		setOversizedDetailsState((prev) => ({ ...prev, loading: true }))
+		vscode.postMessage({
+			type: "requestIndexingOversizedFilesDetails",
+			values: { offset, limit },
+		})
+	}, [])
 
 	const resetWarningDetailsState = useCallback(
 		(filter = warningFilter, sort = warningSort) => {
@@ -540,9 +698,62 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		[warningFilter, warningSort],
 	)
 
+	const resetOversizedDetailsState = useCallback(() => {
+		setOversizedDetailsBootstrapped(false)
+		setOversizedDetailsState({
+			items: [],
+			total: 0,
+			actionable: 0,
+			loading: false,
+			hasMore: false,
+		})
+	}, [])
+
 	// Use a ref to capture current settings for the save handler
 	const currentSettingsRef = useRef(currentSettings)
 	currentSettingsRef.current = currentSettings
+
+	const oversizedApprovalMap = useMemo(() => {
+		const map = new Map<
+			string,
+			{
+				workspacePath: string
+				relativePath: string
+				sizeAtApprovalBytes: number
+				approvedMaxBytes: number
+				approvedAt: number
+			}
+		>()
+		for (const approval of currentSettings.codebaseIndexOversizedFileApprovals ?? []) {
+			if (approval.workspacePath === cwd) {
+				map.set(approval.relativePath, approval)
+			}
+		}
+		return map
+	}, [currentSettings.codebaseIndexOversizedFileApprovals, cwd])
+
+	const approveOversizedFile = useCallback(
+		(relativePath: string, sizeBytes: number) => {
+			const nextApproval = {
+				workspacePath: cwd ?? "",
+				relativePath,
+				sizeAtApprovalBytes: sizeBytes,
+				approvedMaxBytes: computeApprovedMaxBytes(sizeBytes),
+				approvedAt: Date.now(),
+			}
+
+			setCurrentSettings((prev) => ({
+				...prev,
+				codebaseIndexOversizedFileApprovals: [
+					...(prev.codebaseIndexOversizedFileApprovals ?? []).filter(
+						(entry) => !(entry.workspacePath === cwd && entry.relativePath === relativePath),
+					),
+					nextApproval,
+				],
+			}))
+		},
+		[cwd],
+	)
 
 	// Listen for indexing status updates and save responses
 	useEffect(() => {
@@ -560,6 +771,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 					setWarningFilter("all")
 					setWarningSort("severity")
 					resetWarningDetailsState("all", "severity")
+					resetOversizedDetailsState()
 					vscode.postMessage({ type: "requestIndexingStatus" })
 				}
 			} else if (event.data.type === "indexingWarningDetails") {
@@ -579,6 +791,22 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 						setWarningDetailsBootstrapped(true)
 					}
 				}
+			} else if (event.data.type === "indexingOversizedFilesDetails") {
+				if (!event.data.values.workspacePath || event.data.values.workspacePath === cwd) {
+					setOversizedDetailsState((prev) => ({
+						items:
+							event.data.values.offset > 0
+								? [...prev.items, ...event.data.values.items]
+								: event.data.values.items,
+						total: event.data.values.total,
+						actionable: event.data.values.actionable,
+						loading: false,
+						hasMore: event.data.values.hasMore,
+					}))
+					if (event.data.values.offset === 0) {
+						setOversizedDetailsBootstrapped(true)
+					}
+				}
 			} else if (event.data.type === "codeIndexSettingsSaved") {
 				if (event.data.success) {
 					setSaveStatus("saved")
@@ -595,18 +823,14 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 
 					setSaveStatus("idle")
 				} else {
-					setSaveStatus("error")
-					setSaveError(event.data.error || t("settings:codeIndex.saveError"))
-					// Clear error message after 5 seconds
-					setSaveStatus("idle")
-					setSaveError(null)
+					showSaveError(event.data.error)
 				}
 			}
 		}
 
 		window.addEventListener("message", handleMessage)
 		return () => window.removeEventListener("message", handleMessage)
-	}, [t, cwd, resetWarningDetailsState])
+	}, [cwd, resetOversizedDetailsState, resetWarningDetailsState, showSaveError])
 
 	useEffect(() => {
 		if (!open) {
@@ -645,6 +869,13 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		warningFilter,
 		warningSort,
 	])
+
+	useEffect(() => {
+		if (!open || oversizedDetailsBootstrapped) {
+			return
+		}
+		requestOversizedDetails(0, 20)
+	}, [open, oversizedDetailsBootstrapped, requestOversizedDetails])
 
 	// Listen for secret status
 	useEffect(() => {
@@ -836,6 +1067,8 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const handleSaveSettings = () => {
 		// Validate settings before saving
 		if (!validateSettings()) {
+			setIsSetupSettingsOpen(true)
+			showSaveError("Complete the required setup fields before saving.")
 			return
 		}
 
@@ -921,16 +1154,22 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 					indexingStatus.message ?? "",
 				)) ||
 			(indexingStatus.systemStatus === "Indexed" &&
-				/^Index up-to-date(?:\.| —|$)/.test(indexingStatus.message ?? "")),
+				/^(?:Index up-to-date(?:\.| —|$)|V2 mapped |V2 refresh re-evaluated |V2 is current across )/.test(
+					indexingStatus.message ?? "",
+				)),
 		[indexingStatus.message, indexingStatus.systemStatus],
 	)
 	const statusHeadline = useMemo(
 		() => getIndexingHeadline(indexingStatus, isCurrentStandby, t),
 		[indexingStatus, isCurrentStandby, t],
 	)
+	const displayedOversizedCount = Math.max(indexingStatus.oversizedFiles ?? 0, oversizedDetailsState.actionable)
 	const statusSupplementalLines = useMemo(() => {
 		if (isCurrentStandby) {
-			return [statusLines[0], t("settings:codeIndex.liveWatcherDetail")].filter(Boolean)
+			return [
+				getLiveWatcherCurrentLine(indexingStatus, statusLines[0], displayedOversizedCount),
+				getLiveWatcherRefreshLine(indexingStatus, statusLines[0]) ?? t("settings:codeIndex.liveWatcherDetail"),
+			].filter(Boolean)
 		}
 		if (indexingStatus.systemStatus !== "Indexing") {
 			return statusLines.slice(1, 3)
@@ -948,7 +1187,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 			) ?? detailLines[1]
 
 		return [summaryLine, runtimeLine].filter(Boolean).slice(0, 2)
-	}, [indexingStatus.systemStatus, isCurrentStandby, statusLines, t])
+	}, [displayedOversizedCount, indexingStatus, isCurrentStandby, statusLines, t])
 	const progressCaption = useMemo(() => {
 		switch (detailedStage) {
 			case "preparing":
@@ -1076,6 +1315,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		indexingStatus.terminallyFailedChunks,
 	])
 	const warningDetails = useMemo(() => warningDetailsState.items, [warningDetailsState.items])
+	const oversizedDetails = useMemo(() => oversizedDetailsState.items, [oversizedDetailsState.items])
 	const warningFilterOptions = useMemo(
 		() => [
 			{ value: "all" as const, label: "All warnings" },
@@ -1096,9 +1336,10 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const statusTokens = useMemo(
 		() =>
 			statusSupplementalLines
+				.filter((line): line is string => Boolean(line))
 				.flatMap((line) => line.split(" • "))
 				.map((token) => token.trim())
-				.filter(Boolean),
+				.filter((token): token is string => Boolean(token)),
 		[statusSupplementalLines],
 	)
 	const identityTokens = useMemo(
@@ -1182,15 +1423,15 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const groupedListClass =
 		"overflow-hidden rounded-xl border border-vscode-dropdown-border/55 bg-[rgba(255,255,255,0.012)] divide-y divide-vscode-dropdown-border/35 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)]"
 	const footerButtonClass =
-		"h-10 rounded-full px-4 text-sm font-medium shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition-all"
+		"h-10 w-full justify-center rounded-full px-4 text-sm font-medium shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition-all sm:w-auto"
 	const footerSecondaryButtonClass = `${footerButtonClass} border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.04)] text-vscode-foreground hover:bg-[rgba(255,255,255,0.08)]`
 	const footerDestructiveButtonClass = `${footerButtonClass} border border-red-500/25 bg-[rgba(255,120,120,0.08)] text-vscode-foreground hover:bg-[rgba(255,120,120,0.14)]`
 	const footerPrimaryButtonClass = `${footerButtonClass} min-w-[96px] bg-primary text-primary-foreground hover:bg-primary/85`
 	const footerDisabledButtonClass =
-		"h-10 min-w-[96px] rounded-full border border-vscode-dropdown-border/50 bg-[rgba(255,255,255,0.03)] px-4 text-sm font-medium text-vscode-descriptionForeground/70 shadow-none"
+		"h-10 w-full min-w-[96px] rounded-full border border-vscode-dropdown-border/50 bg-[rgba(255,255,255,0.03)] px-4 text-sm font-medium text-vscode-descriptionForeground/70 shadow-none sm:w-auto"
 	const numericTextClass = "[font-variant-numeric:tabular-nums] tabular-nums whitespace-nowrap text-right"
 	const stableChipClass =
-		"flex min-h-[34px] items-center rounded-full border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.02)] px-3 py-1.5 text-[11px] text-vscode-descriptionForeground/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]"
+		"flex min-h-[34px] min-w-0 items-center rounded-xl border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.02)] px-3 py-1.5 text-[11px] text-vscode-descriptionForeground/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] sm:rounded-full"
 
 	return (
 		<>
@@ -1238,436 +1479,608 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 						{/* Status Section */}
 						<div className="space-y-2">
 							<div className={sectionLabelClass}>{t("settings:codeIndex.statusTitle")}</div>
-							<div className={`${surfaceCardClass} p-4`}>
-								<div className="flex items-start gap-3">
-									<span
-										className={cn(
-											"mt-1.5 inline-block h-2.5 w-2.5 shrink-0 rounded-full shadow-[0_0_12px_rgba(245,158,11,0.35)]",
-											{
-												"bg-gray-400":
-													indexingStatus.systemStatus === "Standby" && !isCurrentStandby,
-												"bg-yellow-500 animate-pulse":
-													indexingStatus.systemStatus === "Indexing",
-												"bg-green-500":
-													indexingStatus.systemStatus === "Indexed" || isCurrentStandby,
-												"bg-amber-500 animate-pulse":
-													indexingStatus.systemStatus === "Stopping",
-												"bg-red-500": indexingStatus.systemStatus === "Error",
-											},
-										)}
-									/>
-									<div className="min-w-0 flex-1">
-										<div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-vscode-descriptionForeground/70">
-											{isCurrentStandby
-												? "Live"
-												: t(
-														`settings:codeIndex.indexingStatuses.${indexingStatus.systemStatus.toLowerCase()}`,
-													)}
-										</div>
-										{statusHeadline && (
-											<div className="mt-1 min-h-[2.5rem] text-[15px] font-semibold leading-5 tracking-[-0.01em]">
-												{statusHeadline}
+							<div className={`${surfaceCardClass} h-[13rem] overflow-hidden p-4`}>
+								<div className="h-full overflow-y-auto pr-1">
+									<div className="flex items-start gap-3">
+										<span
+											className={cn(
+												"mt-1.5 inline-block h-2.5 w-2.5 shrink-0 rounded-full shadow-[0_0_12px_rgba(245,158,11,0.35)]",
+												{
+													"bg-gray-400":
+														indexingStatus.systemStatus === "Standby" && !isCurrentStandby,
+													"bg-yellow-500 animate-pulse":
+														indexingStatus.systemStatus === "Indexing",
+													"bg-green-500":
+														indexingStatus.systemStatus === "Indexed" || isCurrentStandby,
+													"bg-amber-500 animate-pulse":
+														indexingStatus.systemStatus === "Stopping",
+													"bg-red-500": indexingStatus.systemStatus === "Error",
+												},
+											)}
+										/>
+										<div className="min-w-0 flex-1">
+											<div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-vscode-descriptionForeground/70">
+												{isCurrentStandby
+													? t("settings:codeIndex.liveWatcherHeadline")
+													: t(
+															`settings:codeIndex.indexingStatuses.${indexingStatus.systemStatus.toLowerCase()}`,
+														)}
 											</div>
-										)}
-										{(statusSupplementalLines.length > 0 ||
-											resilienceHighlights.resumedPendingJobs > 0 ||
-											resilienceHighlights.warningItems.length > 0) && (
-											<div className="mt-2 space-y-2">
-												{statusSupplementalLines[0] && (
-													<div className="min-h-[1.5rem] text-[12px] leading-5 text-vscode-descriptionForeground">
-														{statusSupplementalLines[0]}
-													</div>
-												)}
-												{(identityTokens.length > 0 || estimationMetaTokens.length > 0) && (
-													<div className="flex flex-wrap gap-1.5">
-														{identityTokens.slice(0, 3).map((token) => (
-															<span
-																key={token}
-																className="rounded-full border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[11px] leading-none text-vscode-descriptionForeground/92">
-																{token}
-															</span>
-														))}
-														{estimationMetaTokens.map((token) => (
-															<span
-																key={token}
-																className="rounded-full border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[11px] leading-none text-vscode-descriptionForeground/92">
-																{token}
-															</span>
-														))}
-													</div>
-												)}
-												{telemetryTokens.length > 0 && (
-													<div className="grid grid-cols-2 gap-2">
-														{telemetryTokens.slice(0, 4).map((token) =>
-															(() => {
-																const parsedToken = parseTelemetryToken(token)
-																return (
-																	<div
-																		key={token}
-																		className="flex min-h-[56px] flex-col justify-between rounded-xl border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.018)] px-3 py-2.5 text-vscode-descriptionForeground/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
-																		<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
-																			{parsedToken.label}
-																		</div>
+											{statusHeadline && (
+												<div className="mt-1 min-h-[2.5rem] text-[15px] font-semibold leading-5 tracking-[-0.01em]">
+													{statusHeadline}
+												</div>
+											)}
+											{(statusSupplementalLines.length > 0 ||
+												resilienceHighlights.resumedPendingJobs > 0 ||
+												resilienceHighlights.warningItems.length > 0) && (
+												<div className="mt-2 space-y-2">
+													{statusSupplementalLines[0] && (
+														<div className="min-h-[1.5rem] text-[12px] leading-5 text-vscode-descriptionForeground">
+															{statusSupplementalLines[0]}
+														</div>
+													)}
+													{(identityTokens.length > 0 || estimationMetaTokens.length > 0) && (
+														<div className="flex flex-wrap gap-1.5">
+															{identityTokens.slice(0, 3).map((token) => (
+																<span
+																	key={token}
+																	className="max-w-full rounded-xl border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[11px] leading-4 text-vscode-descriptionForeground/92 break-words sm:rounded-full">
+																	{token}
+																</span>
+															))}
+															{estimationMetaTokens.map((token) => (
+																<span
+																	key={token}
+																	className="max-w-full rounded-xl border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[11px] leading-4 text-vscode-descriptionForeground/92 break-words sm:rounded-full">
+																	{token}
+																</span>
+															))}
+														</div>
+													)}
+													{telemetryTokens.length > 0 && (
+														<div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+															{telemetryTokens.slice(0, 4).map((token) =>
+																(() => {
+																	const parsedToken = parseTelemetryToken(token)
+																	return (
 																		<div
-																			className={cn(
-																				"mt-2 text-[12px] leading-none tracking-[-0.01em] text-vscode-foreground/92",
-																				parsedToken.emphasis === "numeric" &&
-																					numericTextClass,
-																			)}>
-																			{parsedToken.value}
+																			key={token}
+																			className="flex min-h-[56px] flex-col justify-between rounded-xl border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.018)] px-3 py-2.5 text-vscode-descriptionForeground/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+																			<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
+																				{parsedToken.label}
+																			</div>
+																			<div
+																				className={cn(
+																					"mt-2 min-w-0 break-words text-[12px] leading-4 tracking-[-0.01em] text-vscode-foreground/92",
+																					parsedToken.emphasis ===
+																						"numeric" &&
+																						"tabular-nums [font-variant-numeric:tabular-nums]",
+																				)}>
+																				{parsedToken.value}
+																			</div>
 																		</div>
+																	)
+																})(),
+															)}
+														</div>
+													)}
+													{(resilienceHighlights.resumedPendingJobs > 0 ||
+														resilienceHighlights.warningItems.length > 0) && (
+														<div className="space-y-2">
+															{resilienceHighlights.resumedPendingJobs > 0 && (
+																<div className="rounded-xl border border-sky-500/20 bg-[rgba(80,168,255,0.08)] px-3 py-2 text-[11px] leading-4 text-vscode-foreground/92">
+																	Resuming{" "}
+																	{resilienceHighlights.resumedPendingJobs.toLocaleString()}{" "}
+																	unfinished
+																	{" indexing "}
+																	{resilienceHighlights.resumedPendingJobs === 1
+																		? "job"
+																		: "jobs"}{" "}
+																	from the previous run
+																</div>
+															)}
+															{resilienceHighlights.warningItems.length > 0 && (
+																<div className="rounded-xl border border-amber-500/20 bg-[rgba(245,158,11,0.08)] px-3 py-2">
+																	<div className="flex items-center gap-2 text-[11px] font-medium text-vscode-foreground/92">
+																		<AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
+																		<span>Indexing warnings</span>
 																	</div>
-																)
-															})(),
-														)}
-													</div>
-												)}
-												{(resilienceHighlights.resumedPendingJobs > 0 ||
-													resilienceHighlights.warningItems.length > 0) && (
-													<div className="space-y-2">
-														{resilienceHighlights.resumedPendingJobs > 0 && (
-															<div className="rounded-xl border border-sky-500/20 bg-[rgba(80,168,255,0.08)] px-3 py-2 text-[11px] leading-4 text-vscode-foreground/92">
-																Resuming{" "}
-																{resilienceHighlights.resumedPendingJobs.toLocaleString()}{" "}
-																unfinished
-																{" indexing "}
-																{resilienceHighlights.resumedPendingJobs === 1
-																	? "job"
-																	: "jobs"}{" "}
-																from the previous run
-															</div>
-														)}
-														{resilienceHighlights.warningItems.length > 0 && (
-															<div className="rounded-xl border border-amber-500/20 bg-[rgba(245,158,11,0.08)] px-3 py-2">
-																<div className="flex items-center gap-2 text-[11px] font-medium text-vscode-foreground/92">
-																	<AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
-																	<span>Indexing warnings</span>
-																</div>
-																<div className="mt-2 flex flex-wrap gap-1.5">
-																	{resilienceHighlights.warningItems.map((item) => (
-																		<span
-																			key={item}
-																			className="rounded-full border border-amber-500/20 bg-[rgba(255,255,255,0.05)] px-2.5 py-1 text-[11px] leading-none text-vscode-descriptionForeground/96">
-																			{item}
-																		</span>
-																	))}
-																</div>
-																{(warningDetailsState.total > 0 ||
-																	warningDetailsState.loading ||
-																	warningDetailsBootstrapped) && (
-																	<div className="mt-3 space-y-2">
-																		<div className="flex items-center justify-between gap-2">
-																			<div>
-																				<div className="text-[11px] font-medium text-vscode-foreground/90">
-																					Affected files
-																				</div>
-																				<div className="mt-1 text-[10px] text-vscode-descriptionForeground/85">
-																					Showing{" "}
-																					{warningDetails.length.toLocaleString()}{" "}
-																					of{" "}
-																					{warningDetailsState.total.toLocaleString()}{" "}
-																					matching files
-																				</div>
-																			</div>
-																			<button
-																				type="button"
-																				onClick={() => {
-																					setRetryWarningsPending(true)
-																					resetWarningDetailsState(
-																						warningFilter,
-																						warningSort,
-																					)
-																					vscode.postMessage({
-																						type: "retryIndexingWarnings",
-																						values: {
-																							filter: warningFilter,
-																						},
-																					})
-																				}}
-																				disabled={
-																					retryWarningsPending ||
-																					indexingStatus.systemStatus ===
-																						"Indexing"
-																				}
-																				className="rounded-lg border border-amber-500/30 bg-[rgba(245,158,11,0.12)] px-3 py-1.5 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(245,158,11,0.18)] disabled:cursor-default disabled:opacity-60">
-																				{retryWarningsPending
-																					? "Retrying affected files..."
-																					: warningFilter === "all"
-																						? "Retry affected files only"
-																						: "Retry filtered files only"}
-																			</button>
-																		</div>
-																		<div className="space-y-2">
-																			<div className="flex flex-wrap gap-1">
-																				{warningFilterOptions.map((option) => (
-																					<button
-																						key={option.value}
-																						type="button"
-																						onClick={() => {
-																							setWarningFilter(
-																								option.value,
-																							)
-																							resetWarningDetailsState(
-																								option.value,
-																								warningSort,
-																							)
-																						}}
-																						className={cn(
-																							"rounded-full border px-2 py-1 text-[10px] leading-none transition-colors",
-																							warningFilter ===
-																								option.value
-																								? "border-amber-400/40 bg-[rgba(245,158,11,0.18)] text-vscode-foreground"
-																								: "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground/95 hover:bg-[rgba(255,255,255,0.08)]",
-																						)}>
-																						{option.label}
-																					</button>
-																				))}
-																			</div>
-																			<div className="flex flex-wrap gap-1">
-																				{warningSortOptions.map((option) => (
-																					<button
-																						key={option.value}
-																						type="button"
-																						onClick={() => {
-																							setWarningSort(option.value)
-																							resetWarningDetailsState(
-																								warningFilter,
-																								option.value,
-																							)
-																						}}
-																						className={cn(
-																							"rounded-full border px-2 py-1 text-[10px] leading-none transition-colors",
-																							warningSort === option.value
-																								? "border-sky-400/35 bg-[rgba(80,168,255,0.16)] text-vscode-foreground"
-																								: "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground/95 hover:bg-[rgba(255,255,255,0.08)]",
-																						)}>
-																						Sort: {option.label}
-																					</button>
-																				))}
-																			</div>
-																		</div>
-																		<div className="space-y-2">
-																			{warningDetails.length > 0 ? (
-																				warningDetails.map((detail) => (
-																					<div
-																						key={`${detail.state}:${detail.relativePath}`}
-																						className="rounded-lg border border-vscode-dropdown-border/60 bg-[rgba(0,0,0,0.08)] px-2.5 py-2 text-[11px] leading-4">
-																						<div className="flex flex-wrap items-center gap-2">
-																							<span className="font-medium text-vscode-foreground/95">
-																								{detail.relativePath}
-																							</span>
-																							<span className="rounded-full border border-amber-500/20 bg-[rgba(255,255,255,0.05)] px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-vscode-descriptionForeground/95">
-																								{detail.category ===
-																								"parser_failed"
-																									? "parser"
-																									: detail.state ===
-																										  "terminal_failed"
-																										? "failed"
-																										: detail.state}
-																							</span>
-																							<div className="ml-auto flex flex-wrap gap-1">
-																								<button
-																									type="button"
-																									onClick={() =>
-																										vscode.postMessage(
-																											{
-																												type: "openFile",
-																												text: detail.relativePath,
-																											},
-																										)
-																									}
-																									className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-2 py-0.5 text-[10px] text-vscode-descriptionForeground/95 transition-colors hover:bg-[rgba(255,255,255,0.08)]">
-																									Open
-																								</button>
-																								<button
-																									type="button"
-																									onClick={() =>
-																										void copyWithFeedback(
-																											detail.relativePath,
-																										)
-																									}
-																									className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-2 py-0.5 text-[10px] text-vscode-descriptionForeground/95 transition-colors hover:bg-[rgba(255,255,255,0.08)]">
-																									{showCopyFeedback
-																										? "Copied"
-																										: "Copy path"}
-																								</button>
-																								<button
-																									type="button"
-																									onClick={() => {
-																										setRetryingWarningPath(
-																											detail.relativePath,
-																										)
-																										vscode.postMessage(
-																											{
-																												type: "retryIndexingWarnings",
-																												values: {
-																													filter: warningFilter,
-																													relativePaths:
-																														[
-																															detail.relativePath,
-																														],
-																												},
-																											},
-																										)
-																									}}
-																									disabled={
-																										retryWarningsPending ||
-																										indexingStatus.systemStatus ===
-																											"Indexing" ||
-																										retryingWarningPath ===
-																											detail.relativePath
-																									}
-																									className="rounded-full border border-amber-500/30 bg-[rgba(245,158,11,0.12)] px-2 py-0.5 text-[10px] text-vscode-foreground transition-colors hover:bg-[rgba(245,158,11,0.18)] disabled:cursor-default disabled:opacity-60">
-																									{retryingWarningPath ===
-																									detail.relativePath
-																										? "Retrying..."
-																										: "Retry file"}
-																								</button>
-																							</div>
-																						</div>
-																						{detail.failureReason && (
-																							<div className="mt-1 text-vscode-descriptionForeground/90">
-																								{detail.failureReason}
-																							</div>
-																						)}
-																					</div>
-																				))
-																			) : (
-																				<div className="rounded-lg border border-vscode-dropdown-border/60 bg-[rgba(0,0,0,0.08)] px-2.5 py-2 text-[11px] leading-4 text-vscode-descriptionForeground/90">
-																					{warningDetailsState.loading
-																						? "Loading affected files..."
-																						: "No files match the current warning filter."}
-																				</div>
-																			)}
-																		</div>
-																		{warningDetailsState.hasMore && (
-																			<button
-																				type="button"
-																				onClick={() =>
-																					requestWarningDetails(
-																						warningDetails.length,
-																						20,
-																						warningFilter,
-																						warningSort,
-																					)
-																				}
-																				disabled={warningDetailsState.loading}
-																				className="w-full rounded-lg border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-3 py-2 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(255,255,255,0.08)] disabled:cursor-default disabled:opacity-60">
-																				{warningDetailsState.loading
-																					? "Loading affected files..."
-																					: "Load more affected files"}
-																			</button>
+																	<div className="mt-2 flex flex-wrap gap-1.5">
+																		{resilienceHighlights.warningItems.map(
+																			(item) => (
+																				<span
+																					key={item}
+																					className="rounded-full border border-amber-500/20 bg-[rgba(255,255,255,0.05)] px-2.5 py-1 text-[11px] leading-none text-vscode-descriptionForeground/96">
+																					{item}
+																				</span>
+																			),
 																		)}
 																	</div>
-																)}
-															</div>
-														)}
-													</div>
-												)}
+																	{(warningDetailsState.total > 0 ||
+																		warningDetailsState.loading ||
+																		warningDetailsBootstrapped) && (
+																		<div className="mt-3 space-y-2">
+																			<div className="flex items-center justify-between gap-2">
+																				<div>
+																					<div className="text-[11px] font-medium text-vscode-foreground/90">
+																						Affected files
+																					</div>
+																					<div className="mt-1 text-[10px] text-vscode-descriptionForeground/85">
+																						Showing{" "}
+																						{warningDetails.length.toLocaleString()}{" "}
+																						of{" "}
+																						{warningDetailsState.total.toLocaleString()}{" "}
+																						matching files
+																					</div>
+																				</div>
+																				<button
+																					type="button"
+																					onClick={() => {
+																						setRetryWarningsPending(true)
+																						resetWarningDetailsState(
+																							warningFilter,
+																							warningSort,
+																						)
+																						vscode.postMessage({
+																							type: "retryIndexingWarnings",
+																							values: {
+																								filter: warningFilter,
+																							},
+																						})
+																					}}
+																					disabled={
+																						retryWarningsPending ||
+																						indexingStatus.systemStatus ===
+																							"Indexing"
+																					}
+																					className="rounded-lg border border-amber-500/30 bg-[rgba(245,158,11,0.12)] px-3 py-1.5 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(245,158,11,0.18)] disabled:cursor-default disabled:opacity-60">
+																					{retryWarningsPending
+																						? "Retrying affected files..."
+																						: warningFilter === "all"
+																							? "Retry affected files only"
+																							: "Retry filtered files only"}
+																				</button>
+																			</div>
+																			<div className="space-y-2">
+																				<div className="flex flex-wrap gap-1">
+																					{warningFilterOptions.map(
+																						(option) => (
+																							<button
+																								key={option.value}
+																								type="button"
+																								onClick={() => {
+																									setWarningFilter(
+																										option.value,
+																									)
+																									resetWarningDetailsState(
+																										option.value,
+																										warningSort,
+																									)
+																								}}
+																								className={cn(
+																									"rounded-full border px-2 py-1 text-[10px] leading-none transition-colors",
+																									warningFilter ===
+																										option.value
+																										? "border-amber-400/40 bg-[rgba(245,158,11,0.18)] text-vscode-foreground"
+																										: "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground/95 hover:bg-[rgba(255,255,255,0.08)]",
+																								)}>
+																								{option.label}
+																							</button>
+																						),
+																					)}
+																				</div>
+																				<div className="flex flex-wrap gap-1">
+																					{warningSortOptions.map(
+																						(option) => (
+																							<button
+																								key={option.value}
+																								type="button"
+																								onClick={() => {
+																									setWarningSort(
+																										option.value,
+																									)
+																									resetWarningDetailsState(
+																										warningFilter,
+																										option.value,
+																									)
+																								}}
+																								className={cn(
+																									"rounded-full border px-2 py-1 text-[10px] leading-none transition-colors",
+																									warningSort ===
+																										option.value
+																										? "border-sky-400/35 bg-[rgba(80,168,255,0.16)] text-vscode-foreground"
+																										: "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground/95 hover:bg-[rgba(255,255,255,0.08)]",
+																								)}>
+																								Sort: {option.label}
+																							</button>
+																						),
+																					)}
+																				</div>
+																			</div>
+																			<div className="space-y-2">
+																				{warningDetails.length > 0 ? (
+																					warningDetails.map((detail) => (
+																						<div
+																							key={`${detail.state}:${detail.relativePath}`}
+																							className="rounded-lg border border-vscode-dropdown-border/60 bg-[rgba(0,0,0,0.08)] px-2.5 py-2 text-[11px] leading-4">
+																							<div className="flex flex-wrap items-center gap-2">
+																								<span className="font-medium text-vscode-foreground/95">
+																									{
+																										detail.relativePath
+																									}
+																								</span>
+																								<span className="rounded-full border border-amber-500/20 bg-[rgba(255,255,255,0.05)] px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-vscode-descriptionForeground/95">
+																									{detail.category ===
+																									"parser_failed"
+																										? "parser"
+																										: detail.state ===
+																											  "terminal_failed"
+																											? "failed"
+																											: detail.state}
+																								</span>
+																								<div className="ml-auto flex flex-wrap gap-1">
+																									<button
+																										type="button"
+																										onClick={() =>
+																											vscode.postMessage(
+																												{
+																													type: "openFile",
+																													text: detail.relativePath,
+																												},
+																											)
+																										}
+																										className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-2 py-0.5 text-[10px] text-vscode-descriptionForeground/95 transition-colors hover:bg-[rgba(255,255,255,0.08)]">
+																										Open
+																									</button>
+																									<button
+																										type="button"
+																										onClick={() =>
+																											void copyWithFeedback(
+																												detail.relativePath,
+																											)
+																										}
+																										className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-2 py-0.5 text-[10px] text-vscode-descriptionForeground/95 transition-colors hover:bg-[rgba(255,255,255,0.08)]">
+																										{showCopyFeedback
+																											? "Copied"
+																											: "Copy path"}
+																									</button>
+																									<button
+																										type="button"
+																										onClick={() => {
+																											setRetryingWarningPath(
+																												detail.relativePath,
+																											)
+																											vscode.postMessage(
+																												{
+																													type: "retryIndexingWarnings",
+																													values: {
+																														filter: warningFilter,
+																														relativePaths:
+																															[
+																																detail.relativePath,
+																															],
+																													},
+																												},
+																											)
+																										}}
+																										disabled={
+																											retryWarningsPending ||
+																											indexingStatus.systemStatus ===
+																												"Indexing" ||
+																											retryingWarningPath ===
+																												detail.relativePath
+																										}
+																										className="rounded-full border border-amber-500/30 bg-[rgba(245,158,11,0.12)] px-2 py-0.5 text-[10px] text-vscode-foreground transition-colors hover:bg-[rgba(245,158,11,0.18)] disabled:cursor-default disabled:opacity-60">
+																										{retryingWarningPath ===
+																										detail.relativePath
+																											? "Retrying..."
+																											: "Retry file"}
+																									</button>
+																								</div>
+																							</div>
+																							{detail.failureReason && (
+																								<div className="mt-1 text-vscode-descriptionForeground/90">
+																									{
+																										detail.failureReason
+																									}
+																								</div>
+																							)}
+																						</div>
+																					))
+																				) : (
+																					<div className="rounded-lg border border-vscode-dropdown-border/60 bg-[rgba(0,0,0,0.08)] px-2.5 py-2 text-[11px] leading-4 text-vscode-descriptionForeground/90">
+																						{warningDetailsState.loading
+																							? "Loading affected files..."
+																							: "No files match the current warning filter."}
+																					</div>
+																				)}
+																			</div>
+																			{warningDetailsState.hasMore && (
+																				<button
+																					type="button"
+																					onClick={() =>
+																						requestWarningDetails(
+																							warningDetails.length,
+																							20,
+																							warningFilter,
+																							warningSort,
+																						)
+																					}
+																					disabled={
+																						warningDetailsState.loading
+																					}
+																					className="w-full rounded-lg border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-3 py-2 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(255,255,255,0.08)] disabled:cursor-default disabled:opacity-60">
+																					{warningDetailsState.loading
+																						? "Loading affected files..."
+																						: "Load more affected files"}
+																				</button>
+																			)}
+																		</div>
+																	)}
+																</div>
+															)}
+														</div>
+													)}
+												</div>
+											)}
+										</div>
+									</div>
+
+									{/* Index stats when indexed */}
+									{indexingStatus.systemStatus === "Indexed" &&
+										Boolean(indexingStatus.totalFiles || indexingStatus.totalBlocks) && (
+											<div className="mt-3 text-xs text-vscode-descriptionForeground">
+												{indexingStatus.totalFiles != null &&
+													t("settings:codeIndex.indexedFilesCount", {
+														count: indexingStatus.totalFiles,
+													})}
+												{indexingStatus.totalFiles != null &&
+													indexingStatus.totalBlocks != null &&
+													" · "}
+												{indexingStatus.totalBlocks != null &&
+													t("settings:codeIndex.indexedBlocksCount", {
+														count: indexingStatus.totalBlocks,
+													})}
 											</div>
 										)}
-									</div>
-								</div>
 
-								{/* Index stats when indexed */}
-								{indexingStatus.systemStatus === "Indexed" &&
-									(indexingStatus.totalFiles || indexingStatus.totalBlocks) && (
-										<div className="mt-3 text-xs text-vscode-descriptionForeground">
-											{indexingStatus.totalFiles != null &&
-												t("settings:codeIndex.indexedFilesCount", {
-													count: indexingStatus.totalFiles,
-												})}
-											{indexingStatus.totalFiles != null &&
-												indexingStatus.totalBlocks != null &&
-												" · "}
-											{indexingStatus.totalBlocks != null &&
-												t("settings:codeIndex.indexedBlocksCount", {
-													count: indexingStatus.totalBlocks,
-												})}
-										</div>
-									)}
-
-								{indexingStatus.systemStatus === "Indexing" && (
-									<div className="mt-4 space-y-3">
-										<div className="grid gap-2 text-[11px] text-vscode-descriptionForeground/85 sm:grid-cols-[minmax(128px,auto)_minmax(168px,1fr)_minmax(140px,auto)]">
-											{indexingStatus.phase && (
-												<span
-													className={cn(stableChipClass, "justify-center sm:justify-start")}>
-													{indexingStatus.phase === "scanning"
-														? "Workspace pass"
-														: "Embedding pass"}
-												</span>
-											)}
-											{progressCaption && (
+									{indexingStatus.systemStatus === "Indexing" && (
+										<div className="mt-4 space-y-3">
+											<div className="grid gap-2 text-[11px] text-vscode-descriptionForeground/85 sm:grid-cols-[minmax(128px,auto)_minmax(168px,1fr)_minmax(140px,auto)]">
+												{indexingStatus.phase && (
+													<span
+														className={cn(
+															stableChipClass,
+															"justify-center text-center sm:justify-start sm:text-left",
+														)}>
+														{indexingStatus.phase === "scanning"
+															? "Workspace pass"
+															: "Embedding pass"}
+													</span>
+												)}
+												{progressCaption && (
+													<span
+														className={cn(
+															stableChipClass,
+															indexingStatus.phase === "embedding"
+																? cn(
+																		"justify-between gap-3 sm:min-w-[168px]",
+																		"tabular-nums [font-variant-numeric:tabular-nums]",
+																	)
+																: "min-w-0 justify-start whitespace-normal break-words text-left leading-4",
+														)}>
+														{progressCaption}
+													</span>
+												)}
+												{indexingStatus.estimatedTimeRemainingMs != null && (
+													<span
+														className={cn(
+															stableChipClass,
+															"justify-center sm:justify-end",
+															numericTextClass,
+														)}>
+														{formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}
+													</span>
+												)}
+											</div>
+											<div className="flex items-center gap-2">
+												<ProgressPrimitive.Root
+													className="relative h-2.5 w-full min-w-[80px] overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]"
+													value={progressPercentage}>
+													<ProgressPrimitive.Indicator
+														className={cn(
+															"h-full w-full flex-1 bg-[linear-gradient(90deg,rgba(80,168,255,0.9),rgba(128,203,255,0.92))] transition-transform duration-300 ease-in-out",
+															isIndeterminateEmbeddingProgress &&
+																"animate-pulse opacity-75",
+														)}
+														style={{
+															transform: isIndeterminateEmbeddingProgress
+																? "translateX(-72%)"
+																: transformStyleString,
+														}}
+													/>
+												</ProgressPrimitive.Root>
 												<span
 													className={cn(
-														stableChipClass,
-														indexingStatus.phase === "embedding"
-															? cn(
-																	"justify-between gap-3 sm:min-w-[168px]",
-																	numericTextClass,
-																)
-															: "min-w-0 justify-start whitespace-normal break-words text-left leading-4",
-													)}>
-													{progressCaption}
-												</span>
-											)}
-											{indexingStatus.estimatedTimeRemainingMs != null && (
-												<span
-													className={cn(
-														stableChipClass,
-														"justify-center sm:justify-end",
+														"min-w-[3.75rem] text-xs font-medium text-vscode-descriptionForeground",
 														numericTextClass,
 													)}>
-													{formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}
+													{isIndeterminateEmbeddingProgress
+														? "..."
+														: `${progressPercentage}%`}
 												</span>
+											</div>
+										</div>
+									)}
+								</div>
+							</div>
+
+							{(displayedOversizedCount > 0 ||
+								oversizedDetailsState.total > 0 ||
+								oversizedDetailsState.loading) && (
+								<div className={`${surfaceCardClass} mt-5 p-3`}>
+									<div className="flex items-start justify-between gap-3">
+										<div>
+											<div className={sectionLabelClass}>Skipped Oversized Files</div>
+											<div className="mt-1 text-[15px] font-semibold tracking-[-0.01em]">
+												{displayedOversizedCount.toLocaleString()} actionable
+											</div>
+											<div className="mt-1 text-[11px] leading-4 text-vscode-descriptionForeground">
+												Review tracked oversized files, approve the important ones, and revisit
+												them later without losing the list.
+											</div>
+											{oversizedDetailsState.total > 0 && (
+												<div className="mt-1 text-[10px] leading-4 text-vscode-descriptionForeground/85">
+													{oversizedDetailsState.total.toLocaleString()} tracked file
+													{oversizedDetailsState.total === 1 ? "" : "s"} in the persistent
+													review list
+												</div>
 											)}
 										</div>
-										<div className="flex items-center gap-2">
-											<ProgressPrimitive.Root
-												className="relative h-2.5 w-full min-w-[80px] overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]"
-												value={progressPercentage}>
-												<ProgressPrimitive.Indicator
-													className={cn(
-														"h-full w-full flex-1 bg-[linear-gradient(90deg,rgba(80,168,255,0.9),rgba(128,203,255,0.92))] transition-transform duration-300 ease-in-out",
-														isIndeterminateEmbeddingProgress && "animate-pulse opacity-75",
-													)}
-													style={{
-														transform: isIndeterminateEmbeddingProgress
-															? "translateX(-72%)"
-															: transformStyleString,
-													}}
-												/>
-											</ProgressPrimitive.Root>
-											<span
-												className={cn(
-													"min-w-[3.75rem] text-xs font-medium text-vscode-descriptionForeground",
-													numericTextClass,
-												)}>
-												{isIndeterminateEmbeddingProgress ? "..." : `${progressPercentage}%`}
-											</span>
+										<div className="flex shrink-0 flex-col items-end gap-2">
+											<div className="rounded-full border border-vscode-dropdown-border/70 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-vscode-descriptionForeground">
+												Limit {currentSettings.codebaseIndexMaxFileSizeMb ?? 1} MB
+											</div>
+											<Button
+												type="button"
+												variant="outline"
+												size="sm"
+												onClick={() => {
+													setIsOversizedReviewOpen((prev) => !prev)
+													if (!oversizedDetailsBootstrapped) {
+														requestOversizedDetails(0, 20)
+													}
+												}}>
+												{isOversizedReviewOpen ? "Hide Review List" : "Review Skipped Files"}
+											</Button>
 										</div>
 									</div>
-								)}
-							</div>
-						</div>
 
-						{/* Enable/Disable Toggle */}
-						<div className={`${surfaceCardClass} mt-5 p-3`}>
-							<div className="flex items-start justify-between gap-2.5">
-								<div className="space-y-0.5">
-									<div className={sectionLabelClass}>Indexer</div>
-									<div className="text-[13px] font-medium leading-5">
-										{t("settings:codeIndex.enableLabel")}
-									</div>
-									<div className="max-w-[32ch] text-[11px] leading-4 text-vscode-descriptionForeground">
-										Turn semantic code search on for this workspace.
-									</div>
+									{isOversizedReviewOpen && (
+										<div className="mt-3 space-y-2">
+											{oversizedDetails.length > 0 ? (
+												oversizedDetails.map((detail) => {
+													const approval = oversizedApprovalMap.get(detail.relativePath)
+													const modifiedLabel = formatModifiedTime(detail.lastModifiedMtimeMs)
+													const recommendationTone =
+														detail.recommendation === "likely_useful"
+															? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+															: detail.recommendation === "probably_skip"
+																? "border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground"
+																: "border-amber-500/30 bg-amber-500/10 text-amber-200"
+
+													return (
+														<div
+															key={detail.relativePath}
+															className="rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] p-3">
+															<div className="flex flex-wrap items-start justify-between gap-3">
+																<div className="min-w-0 flex-1">
+																	<div
+																		title={detail.relativePath}
+																		className="break-all text-[12px] font-medium leading-4 text-vscode-foreground">
+																		{detail.relativePath}
+																	</div>
+																	<div className="mt-1 flex flex-wrap gap-2 text-[10px] uppercase tracking-[0.08em] text-vscode-descriptionForeground">
+																		<span>{formatBytes(detail.sizeBytes)}</span>
+																		<span>{detail.status.replace(/_/g, " ")}</span>
+																		{modifiedLabel && (
+																			<span className="normal-case tracking-normal">
+																				{modifiedLabel}
+																			</span>
+																		)}
+																		{detail.status === "needs_reapproval" && (
+																			<span className="text-amber-300">
+																				Needs reapproval
+																			</span>
+																		)}
+																	</div>
+																	<p className="mt-2 mb-0 text-[11px] leading-4 text-vscode-descriptionForeground">
+																		{detail.reason}
+																	</p>
+																</div>
+																<div className="flex shrink-0 flex-col items-end gap-2">
+																	<div
+																		className={`rounded-full border px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.08em] ${recommendationTone}`}>
+																		{detail.recommendation === "likely_useful"
+																			? "Likely useful"
+																			: detail.recommendation === "probably_skip"
+																				? "Probably skip"
+																				: "Review manually"}
+																	</div>
+																	{approval ? (
+																		<div className="text-right text-[10px] leading-4 text-vscode-descriptionForeground">
+																			Approved up to{" "}
+																			{formatBytes(approval.approvedMaxBytes)}
+																		</div>
+																	) : detail.status === "skipped" ||
+																	  detail.status === "needs_reapproval" ? (
+																		<Button
+																			type="button"
+																			variant="outline"
+																			size="sm"
+																			onClick={() =>
+																				approveOversizedFile(
+																					detail.relativePath,
+																					detail.sizeBytes,
+																				)
+																			}>
+																			Approve For Indexing
+																		</Button>
+																	) : (
+																		<div className="text-right text-[10px] leading-4 text-vscode-descriptionForeground">
+																			{detail.status === "eligible"
+																				? "Now within limit"
+																				: detail.status === "missing"
+																					? "File missing"
+																					: "Tracked approval"}
+																		</div>
+																	)}
+																</div>
+															</div>
+														</div>
+													)
+												})
+											) : (
+												<div className="rounded-xl border border-dashed border-vscode-dropdown-border/60 px-3 py-3 text-[11px] leading-4 text-vscode-descriptionForeground">
+													{oversizedDetailsState.loading
+														? "Loading tracked oversized files..."
+														: "No tracked oversized files are available yet."}
+												</div>
+											)}
+											{oversizedDetailsState.hasMore && (
+												<button
+													type="button"
+													onClick={() => requestOversizedDetails(oversizedDetails.length, 20)}
+													disabled={oversizedDetailsState.loading}
+													className="w-full rounded-lg border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-3 py-2 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(255,255,255,0.08)] disabled:cursor-default disabled:opacity-60">
+													{oversizedDetailsState.loading
+														? "Loading tracked files..."
+														: "Load more tracked files"}
+												</button>
+											)}
+										</div>
+									)}
 								</div>
-								<div className="flex items-center gap-2">
-									<StandardTooltip content={t("settings:codeIndex.enableDescription")}>
-										<span className="codicon codicon-info cursor-help text-xs text-vscode-descriptionForeground" />
-									</StandardTooltip>
+							)}
+
+							{/* Enable/Disable Toggle */}
+							<div className={`${surfaceCardClass} mt-5 p-3`}>
+								<div className="flex items-start justify-between gap-2.5">
+									<div className="space-y-0.5">
+										<div className={sectionLabelClass}>Indexer</div>
+										<div className="text-[13px] font-medium leading-5">
+											{t("settings:codeIndex.enableLabel")}
+										</div>
+										<div className="max-w-[32ch] text-[11px] leading-4 text-vscode-descriptionForeground">
+											Turn semantic code search on for this workspace.
+										</div>
+									</div>
+									<div className="flex items-center gap-2">
+										<StandardTooltip content={t("settings:codeIndex.enableDescription")}>
+											<span className="codicon codicon-info cursor-help text-xs text-vscode-descriptionForeground" />
+										</StandardTooltip>
+									</div>
 								</div>
 							</div>
 							<div className="mt-2.5 rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.016)] px-3 py-2.5">
@@ -2772,6 +3185,30 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 										<div className={fieldGroupClass}>
 											<div className="flex items-center gap-2">
 												<label className="text-sm font-medium">
+													Max indexed file size (MB)
+												</label>
+												<StandardTooltip content="Files larger than this are skipped unless you explicitly approve them below.">
+													<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
+												</StandardTooltip>
+											</div>
+											<VSCodeTextField
+												value={currentSettings.codebaseIndexMaxFileSizeMb?.toString() || ""}
+												onInput={(e: any) =>
+													updateSetting(
+														"codebaseIndexMaxFileSizeMb",
+														e.target.value
+															? parseInt(e.target.value, 10) || undefined
+															: undefined,
+													)
+												}
+												placeholder="1"
+												className="w-full"
+											/>
+										</div>
+
+										<div className={fieldGroupClass}>
+											<div className="flex items-center gap-2">
+												<label className="text-sm font-medium">
 													{t("settings:codeIndex.embeddingBatchSizeLabel")}
 												</label>
 												<StandardTooltip
@@ -2917,8 +3354,8 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 
 					{/* Sticky Action Footer */}
 					<div className="flex-shrink-0 border-t border-vscode-dropdown-border/80 bg-[linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.012))] px-5 py-4 backdrop-blur-md">
-						<div className="flex flex-wrap items-center justify-between gap-3">
-							<div className="flex flex-wrap gap-2">
+						<div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+							<div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap">
 								{shouldShowStartAction && (
 									<Button
 										variant="outline"
@@ -2933,7 +3370,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 									<Button
 										variant="outline"
 										className={footerSecondaryButtonClass}
-										onClick={() => vscode.postMessage({ type: "startIndexing" })}
+										onClick={() => vscode.postMessage({ type: "fullRefreshIndexData" })}
 										disabled={saveStatus === "saving" || hasUnsavedChanges}>
 										{isCurrentStandby
 											? t("settings:codeIndex.refreshIndexButton")
@@ -2957,9 +3394,8 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 								)}
 
 								{currentSettings.codebaseIndexEnabled &&
-									(indexingStatus.systemStatus === "Indexed" ||
-										isCurrentStandby ||
-										indexingStatus.systemStatus === "Error") && (
+									indexingStatus.systemStatus !== "Indexing" &&
+									indexingStatus.systemStatus !== "Stopping" && (
 										<AlertDialog>
 											<AlertDialogTrigger asChild>
 												<Button variant="secondary" className={footerDestructiveButtonClass}>

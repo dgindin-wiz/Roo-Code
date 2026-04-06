@@ -156,6 +156,11 @@
 				"category": "%configuration.title%"
 			},
 			{
+				"command": "roo-cline.runCodeIndexEval",
+				"title": "%command.runCodeIndexEval.title%",
+				"category": "%configuration.title%"
+			},
+			{
 				"command": "roo-cline.focusInput",
 				"title": "%command.focusInput.title%",
 				"category": "%configuration.title%"
@@ -425,6 +430,11 @@
 					"type": "boolean",
 					"default": false,
 					"description": "%settings.codeIndex.debugLogging.description%"
+				},
+				"roo-cline.codeIndex.respectGitIgnore": {
+					"type": "boolean",
+					"default": true,
+					"description": "%settings.codeIndex.respectGitIgnore.description%"
 				},
 				"roo-cline.debug": {
 					"type": "boolean",

@@ -127,6 +127,8 @@ export interface FileProcessingResult {
 export interface CodeBlock {
 	file_path: string
 	identifier: string | null
+	parentIdentifier?: string | null
+	parentChunkFingerprint?: string | null
 	type: string
 	start_line: number
 	end_line: number

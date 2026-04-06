@@ -2525,6 +2525,7 @@ export const webviewMessageHandler = async (
 					...currentConfig,
 					codebaseIndexEnabled: settings.codebaseIndexEnabled,
 					codebaseIndexQdrantUrl: settings.codebaseIndexQdrantUrl,
+					codebaseIndexMaxFileSizeMb: settings.codebaseIndexMaxFileSizeMb,
 					codebaseIndexEmbedderProvider: settings.codebaseIndexEmbedderProvider,
 					codebaseIndexEmbedderBaseUrl: settings.codebaseIndexEmbedderBaseUrl,
 					codebaseIndexEmbedderModelId: settings.codebaseIndexEmbedderModelId,
@@ -2535,6 +2536,7 @@ export const webviewMessageHandler = async (
 					codebaseIndexSearchMaxResults: settings.codebaseIndexSearchMaxResults,
 					codebaseIndexSearchMinScore: settings.codebaseIndexSearchMinScore,
 					codebaseIndexOpenRouterSpecificProvider: settings.codebaseIndexOpenRouterSpecificProvider,
+					codebaseIndexOversizedFileApprovals: settings.codebaseIndexOversizedFileApprovals,
 				}
 
 				// Save global state first
@@ -2755,6 +2757,41 @@ export const webviewMessageHandler = async (
 			})
 			break
 		}
+		case "requestIndexingOversizedFilesDetails": {
+			const manager = provider.getCurrentWorkspaceCodeIndexManager()
+			if (!manager) {
+				provider.postMessageToWebview({
+					type: "indexingOversizedFilesDetails",
+					values: {
+						workspacePath: undefined,
+						offset: message.values?.offset ?? 0,
+						limit: message.values?.limit ?? 20,
+						total: 0,
+						actionable: 0,
+						items: [],
+						hasMore: false,
+					},
+				})
+				break
+			}
+
+			const offset = Math.max(0, Number(message.values?.offset ?? 0))
+			const limit = Math.max(1, Math.min(50, Number(message.values?.limit ?? 20)))
+			const details = await manager.getOversizedFileDetails?.(offset, limit)
+			provider.postMessageToWebview({
+				type: "indexingOversizedFilesDetails",
+				values: {
+					workspacePath: manager.getCurrentStatus().workspacePath,
+					offset,
+					limit,
+					total: details?.total ?? 0,
+					actionable: details?.actionable ?? 0,
+					items: details?.items ?? [],
+					hasMore: offset + (details?.items.length ?? 0) < (details?.total ?? 0),
+				},
+			})
+			break
+		}
 		case "retryIndexingWarnings": {
 			const manager = provider.getCurrentWorkspaceCodeIndexManager()
 			if (!manager) {
@@ -2868,6 +2905,37 @@ export const webviewMessageHandler = async (
 			provider.postMessageToWebview({
 				type: "indexingStatusUpdate",
 				values: startManager.getCurrentStatus(),
+			})
+			break
+		}
+		case "fullRefreshIndexData": {
+			const refreshManager = provider.getCurrentWorkspaceCodeIndexManager()
+			if (!refreshManager) {
+				provider.postMessageToWebview({
+					type: "indexingStatusUpdate",
+					values: {
+						systemStatus: "Error",
+						message: t("embeddings:orchestrator.indexingRequiresWorkspace"),
+						processedItems: 0,
+						totalItems: 0,
+						currentItemUnit: "items",
+					},
+				})
+				provider.log("Cannot refresh indexing: No workspace folder open")
+				break
+			}
+			try {
+				await refreshManager.setWorkspaceEnabled(true)
+				if (refreshManager.isFeatureEnabled && refreshManager.isFeatureConfigured) {
+					await refreshManager.initialize(provider.contextProxy)
+					await refreshManager.refreshAllIndexData?.()
+				}
+			} catch (error) {
+				provider.log(`Error refreshing indexing: ${error instanceof Error ? error.message : String(error)}`)
+			}
+			provider.postMessageToWebview({
+				type: "indexingStatusUpdate",
+				values: refreshManager.getCurrentStatus(),
 			})
 			break
 		}

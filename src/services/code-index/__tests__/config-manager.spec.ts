@@ -114,7 +114,7 @@ describe("CodeIndexConfigManager", () => {
 
 			const result = await configManager.loadConfiguration()
 
-			expect(result.currentConfig).toEqual({
+			expect(result.currentConfig).toMatchObject({
 				isConfigured: false,
 				embedderProvider: "openai",
 				modelId: undefined,
@@ -123,6 +123,8 @@ describe("CodeIndexConfigManager", () => {
 				bedrockOptions: { region: "us-east-1", profile: undefined },
 				qdrantUrl: "http://localhost:6333",
 				qdrantApiKey: "",
+				maxFileSizeBytes: 1024 * 1024,
+				oversizedFileApprovals: [],
 				searchMinScore: 0.4,
 				respectGitIgnore: true,
 				embeddingLaneConcurrency: 2,

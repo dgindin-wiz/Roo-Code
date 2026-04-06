@@ -23,6 +23,7 @@ export class ParseChunkService {
 		private readonly metadataStore: MetadataStore,
 		private readonly workspaceAdapter: WorkspaceAdapter,
 		private readonly parserAdapter: ParserAdapter,
+		private readonly resolveMaxFileSizeBytes?: (relativePath: string) => number,
 	) {}
 
 	async run(
@@ -129,18 +130,30 @@ export class ParseChunkService {
 				const chunks = await this.parserAdapter.parseFile({
 					filePath: revision.normalizedPath,
 					content,
+					maxFileSizeBytes: this.resolveMaxFileSizeBytes?.(revision.relativePath),
 				})
 
-				await this.metadataStore.upsertChunks(
+				const insertedChunks = await this.metadataStore.upsertChunks(
 					chunks.map((chunk) => ({
 						revisionId: revision.revisionId,
 						chunkFingerprint: chunk.chunkFingerprint,
 						startLine: chunk.startLine,
 						endLine: chunk.endLine,
+						language: chunk.language ?? null,
+						chunkKind: chunk.chunkKind ?? null,
+						symbolName: chunk.symbolName ?? null,
+						symbolQualifiedName: chunk.symbolQualifiedName ?? null,
+						parentSymbolName: chunk.parentSymbolName ?? null,
+						parentChunkFingerprint: chunk.parentChunkFingerprint ?? null,
+						summary: chunk.summary ?? null,
+						searchText: chunk.searchText ?? chunk.content,
 						content: chunk.content,
 						contentHash: createHash("sha256").update(chunk.content).digest("hex"),
 						state: "parsed",
 					})),
+				)
+				await this.metadataStore.upsertChunkVariants(
+					insertedChunks.flatMap((chunk) => this.buildChunkVariants(chunk, revision.relativePath)),
 				)
 				await this.metadataStore.markRevisionState(revision.revisionId, "parsed")
 
@@ -191,6 +204,59 @@ export class ParseChunkService {
 			parsedChunks: 0,
 			retriesScheduled,
 		}
+	}
+
+	private buildChunkVariants(
+		chunk: Awaited<ReturnType<MetadataStore["upsertChunks"]>>[number],
+		relativePath: string,
+	): Parameters<MetadataStore["upsertChunkVariants"]>[0] {
+		const variants: Parameters<MetadataStore["upsertChunkVariants"]>[0] = [
+			{
+				chunkId: chunk.chunkId,
+				variantType: "raw_code",
+				content: chunk.searchText ?? chunk.content,
+				contentHash: createHash("sha256")
+					.update(chunk.searchText ?? chunk.content)
+					.digest("hex"),
+				tokenEstimate: chunk.tokenEstimate ?? null,
+				state: "parsed",
+			},
+		]
+
+		const signature = this.buildSymbolSignatureVariant(chunk, relativePath)
+		if (signature) {
+			variants.push({
+				chunkId: chunk.chunkId,
+				variantType: "symbol_signature",
+				content: signature,
+				contentHash: createHash("sha256").update(signature).digest("hex"),
+				state: "parsed",
+			})
+		}
+
+		return variants
+	}
+
+	private buildSymbolSignatureVariant(
+		chunk: Awaited<ReturnType<MetadataStore["upsertChunks"]>>[number],
+		relativePath: string,
+	): string | null {
+		const symbolName = chunk.symbolQualifiedName ?? chunk.symbolName
+		if (!symbolName) {
+			return null
+		}
+
+		const parts = [
+			chunk.language ?? "unknown",
+			chunk.chunkKind ?? "chunk",
+			symbolName,
+			`path ${relativePath}`,
+			`lines ${chunk.startLine}-${chunk.endLine}`,
+		]
+		if (chunk.parentSymbolName && chunk.parentSymbolName !== symbolName) {
+			parts.push(`parent ${chunk.parentSymbolName}`)
+		}
+		return parts.join(" | ")
 	}
 
 	private isMissingFileError(error: unknown): boolean {

@@ -277,7 +277,10 @@ export class CodeIndexManager {
 			try {
 				await this._engineV2.start()
 				const status = await this._engineV2.getStatus()
-				this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
+				const latestState = this._stateManager.getCurrentStatus()?.systemStatus
+				if (latestState !== "Indexed") {
+					this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
+				}
 			} catch (error) {
 				if (this.isUserStopAbort(error)) {
 					this._stateManager.setSystemState("Standby", "Indexing stopped.")
@@ -351,7 +354,10 @@ export class CodeIndexManager {
 			try {
 				await this._engineV2!.start()
 				const status = await this._engineV2!.getStatus()
-				this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
+				const latestState = this._stateManager.getCurrentStatus()?.systemStatus
+				if (latestState !== "Indexed") {
+					this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
+				}
 			} catch (error) {
 				if (this.isUserStopAbort(error)) {
 					this._stateManager.setSystemState("Standby", "Indexing stopped.")
@@ -380,6 +386,47 @@ export class CodeIndexManager {
 
 		this.assertInitialized()
 		await this._orchestrator!.startIndexing()
+	}
+
+	public async refreshAllIndexData(): Promise<void> {
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			if (!this.isInitialized) {
+				if (!this._contextProxy) {
+					throw new Error("CodeIndexManager not initialized. Call initialize() first.")
+				}
+				await this.initialize(this._contextProxy)
+			}
+			if (!this.isFeatureEnabled || !this.isWorkspaceEnabled) {
+				return
+			}
+			this.assertInitialized()
+			this._stateManager.setSystemState("Indexing", "Refreshing the workspace index...")
+			try {
+				await this._engineV2!.refreshAll()
+				const status = await this._engineV2!.getStatus()
+				const latestState = this._stateManager.getCurrentStatus()?.systemStatus
+				if (latestState !== "Indexed") {
+					this._stateManager.setSystemState("Standby", status.message ?? "Workspace index refresh complete")
+				}
+			} catch (error) {
+				if (this.isUserStopAbort(error)) {
+					this._stateManager.setSystemState("Standby", "Index refresh stopped.")
+					return
+				}
+				this._stateManager.setSystemState(
+					"Error",
+					error instanceof Error ? error.message : "Workspace index refresh failed",
+				)
+				throw error
+			}
+			return
+		}
+
+		if (!this.isFeatureEnabled || !this.isWorkspaceEnabled) {
+			return
+		}
+
+		await this.startIndexing()
 	}
 
 	/**
@@ -536,6 +583,35 @@ export class CodeIndexManager {
 		return this._engineV2.getWarningDetails(offset, limit, filter, sort)
 	}
 
+	public async getOversizedFileDetails(
+		offset: number,
+		limit: number,
+	): Promise<{
+		total: number
+		actionable: number
+		items: Array<{
+			relativePath: string
+			normalizedPath: string
+			status: "skipped" | "needs_reapproval" | "approved" | "eligible" | "missing"
+			sizeBytes: number
+			lastModifiedMtimeMs: number | null
+			recommendation: "likely_useful" | "review_manually" | "probably_skip"
+			reason: string
+			approvedMaxBytes: number | null
+			lastEvaluatedAt: number
+		}>
+	}> {
+		if (this.selectedEngine !== CODE_INDEX_V2_ENGINE_ID || !this._engineV2) {
+			return {
+				total: 0,
+				actionable: 0,
+				items: [],
+			}
+		}
+
+		return this._engineV2.getOversizedFileDetails(offset, limit)
+	}
+
 	public async retryIndexWarningFiles(
 		filter: "all" | "parser_failed" | "failed" | "degraded",
 		relativePaths?: string[],
@@ -547,16 +623,23 @@ export class CodeIndexManager {
 		return this._engineV2.retryWarningFiles(filter, relativePaths)
 	}
 
-	public async searchIndex(query: string, directoryPrefix?: string): Promise<VectorStoreSearchResult[]> {
+	public async searchIndex(query: string, directoryPrefix?: string): Promise<VectorStoreSearchResult[]>
+	public async searchIndex(query: string, limit?: number): Promise<VectorStoreSearchResult[]>
+	public async searchIndex(
+		query: string,
+		directoryPrefixOrLimit?: string | number,
+	): Promise<VectorStoreSearchResult[]> {
 		if (!this.isFeatureEnabled) {
 			return []
 		}
 		this.assertInitialized()
 
 		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
-			return this._engineV2!.search(query, 50)
+			const limit = typeof directoryPrefixOrLimit === "number" ? directoryPrefixOrLimit : 50
+			return this._engineV2!.search(query, limit)
 		}
 
+		const directoryPrefix = typeof directoryPrefixOrLimit === "string" ? directoryPrefixOrLimit : undefined
 		return this._searchService!.searchIndex(query, directoryPrefix)
 	}
 

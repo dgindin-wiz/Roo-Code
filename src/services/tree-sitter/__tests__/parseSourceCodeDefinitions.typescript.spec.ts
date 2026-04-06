@@ -34,6 +34,20 @@ describe("TypeScript Source Code Definition Tests", () => {
 		expect(parseResult).toMatch(/\d+--\d+ \|\s*enum TestEnumDefinition/)
 	})
 
+	it("should parse top-level constant declarations", () => {
+		const constantSample = `
+export const TEST_TYPED_SCHEMA_DEFINITION = {
+    tableName: "typed_records",
+    primaryKey: "id",
+    timestamps: true,
+}
+`
+
+		return expect(testParseSourceCodeDefinitions("constants.ts", constantSample, testOptions)).resolves.toMatch(
+			/\d+--\d+ \|\s*export const TEST_TYPED_SCHEMA_DEFINITION =/,
+		)
+	})
+
 	it("should parse namespace declarations", () => {
 		expect(parseResult).toMatch(/\d+--\d+ \|\s*namespace TestNamespaceDefinition/)
 	})

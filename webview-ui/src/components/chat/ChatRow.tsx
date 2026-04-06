@@ -1372,8 +1372,17 @@ export const ChatRowContent = ({
 							results: Array<{
 								filePath: string
 								score: number
+								rerankScore?: number
 								startLine: number
 								endLine: number
+								language?: string
+								chunkKind?: string
+								symbolName?: string
+								symbolQualifiedName?: string
+								parentSymbolName?: string
+								summary?: string
+								matchLabel?: string
+								matchReasons?: string[]
 								codeChunk: string
 							}>
 						}

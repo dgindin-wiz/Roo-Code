@@ -11,6 +11,13 @@ import { ContextProxy } from "../core/config/ContextProxy"
 import { focusPanel } from "../utils/focusPanel"
 import { handleNewTask } from "./handleTask"
 import { CodeIndexManager } from "../services/code-index/manager"
+import { CODE_INDEX_V2_ENGINE_ID } from "../services/code-index-v2/shared/constants"
+import {
+	CodeIndexEvalRunner,
+	formatRetrievalEvalReport,
+	rooCodeBenchmarkFixtures,
+	sampleCodeIndexEvalFixtures,
+} from "../services/code-index-v2/eval"
 import { importSettingsWithFeedback } from "../core/config/importExport"
 import { MdmService } from "../services/mdm/MdmService"
 import { t } from "../i18n"
@@ -59,6 +66,82 @@ export type RegisterCommandOptions = {
 	context: vscode.ExtensionContext
 	outputChannel: vscode.OutputChannel
 	provider: ClineProvider
+}
+
+export async function runCodeIndexEvalForCurrentWorkspace({
+	context,
+	outputChannel,
+	provider,
+}: RegisterCommandOptions): Promise<void> {
+	const manager = CodeIndexManager.getInstance(context)
+	if (!manager) {
+		outputChannel.appendLine("[CodeIndexEval] No workspace manager is available.")
+		outputChannel.show(true)
+		return
+	}
+
+	if (!manager.isInitialized) {
+		await manager.initialize(provider.contextProxy)
+	}
+
+	if (!manager.isFeatureEnabled) {
+		outputChannel.appendLine("[CodeIndexEval] Code indexing is disabled for the current workspace.")
+		outputChannel.show(true)
+		return
+	}
+
+	if (!manager.isFeatureConfigured) {
+		outputChannel.appendLine("[CodeIndexEval] Code indexing is not configured for the current workspace.")
+		outputChannel.show(true)
+		return
+	}
+
+	if (manager.selectedEngine !== CODE_INDEX_V2_ENGINE_ID) {
+		outputChannel.appendLine(
+			`[CodeIndexEval] The active code index engine is '${manager.selectedEngine}'. Switch to '${CODE_INDEX_V2_ENGINE_ID}' to run the V2 retrieval eval.`,
+		)
+		outputChannel.show(true)
+		return
+	}
+
+	if (!manager.isInitialized) {
+		outputChannel.appendLine("[CodeIndexEval] Code indexing is not initialized for the current workspace.")
+		outputChannel.show(true)
+		return
+	}
+
+	outputChannel.appendLine(
+		`[CodeIndexEval] Running Roo Code retrieval benchmark against the current workspace index (${rooCodeBenchmarkFixtures.length} queries)...`,
+	)
+	outputChannel.show(true)
+
+	const runner = new CodeIndexEvalRunner({
+		engine: CODE_INDEX_V2_ENGINE_ID,
+		start: async () => {},
+		refreshAll: async () => {},
+		stop: async () => {},
+		clear: async () => {},
+		search: (query, limit) => manager.searchIndex(query, limit),
+		enqueuePathsChanged: async () => {},
+		getStatus: async () => ({
+			engine: CODE_INDEX_V2_ENGINE_ID,
+			state: "idle",
+			message: "Eval adapter",
+		}),
+		getWarningDetails: async () => ({ total: 0, items: [] }),
+		getOversizedFileDetails: async () => ({ total: 0, actionable: 0, items: [] }),
+		retryWarningFiles: async () => ({ retriedFiles: 0 }),
+	})
+
+	try {
+		const report = await runner.run(rooCodeBenchmarkFixtures)
+		outputChannel.appendLine(formatRetrievalEvalReport(report))
+	} catch (error) {
+		outputChannel.appendLine(
+			`[CodeIndexEval] Failed to run retrieval eval: ${error instanceof Error ? error.message : String(error)}`,
+		)
+		throw error
+	}
 }
 
 export const registerCommands = (options: RegisterCommandOptions) => {
@@ -154,6 +237,9 @@ const getCommandsMap = ({ context, outputChannel, provider }: RegisterCommandOpt
 			},
 			filePath,
 		)
+	},
+	runCodeIndexEval: async () => {
+		await runCodeIndexEvalForCurrentWorkspace({ context, outputChannel, provider })
 	},
 	focusInput: async () => {
 		try {

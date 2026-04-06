@@ -75,6 +75,7 @@ export interface ExtensionMessage {
 		| "rooCreditBalance"
 		| "indexingStatusUpdate"
 		| "indexingWarningDetails"
+		| "indexingOversizedFilesDetails"
 		| "indexCleared"
 		| "codebaseIndexConfig"
 		| "marketplaceInstallResult"
@@ -512,8 +513,10 @@ export interface WebviewMessage {
 		| "condenseTaskContextRequest"
 		| "requestIndexingStatus"
 		| "requestIndexingWarningDetails"
+		| "requestIndexingOversizedFilesDetails"
 		| "retryIndexingWarnings"
 		| "startIndexing"
+		| "fullRefreshIndexData"
 		| "stopIndexing"
 		| "clearIndexData"
 		| "indexingStatusUpdate"
@@ -655,6 +658,7 @@ export interface WebviewMessage {
 		// Global state settings
 		codebaseIndexEnabled: boolean
 		codebaseIndexQdrantUrl: string
+		codebaseIndexMaxFileSizeMb?: number
 		codebaseIndexEmbedderProvider:
 			| "openai"
 			| "ollama"
@@ -673,6 +677,13 @@ export interface WebviewMessage {
 		codebaseIndexSearchMaxResults?: number
 		codebaseIndexSearchMinScore?: number
 		codebaseIndexOpenRouterSpecificProvider?: string // OpenRouter provider routing
+		codebaseIndexOversizedFileApprovals?: Array<{
+			workspacePath: string
+			relativePath: string
+			sizeAtApprovalBytes: number
+			approvedMaxBytes: number
+			approvedAt: number
+		}>
 
 		// Secret settings
 		codeIndexOpenAiKey?: string
@@ -776,6 +787,14 @@ export interface IndexingStatus {
 	changedFiles?: number
 	unchangedFiles?: number
 	oversizedFiles?: number
+	oversizedDetails?: Array<{
+		relativePath: string
+		sizeBytes: number
+		recommendation: "likely_useful" | "review_manually" | "probably_skip"
+		reason: string
+		needsReapproval?: boolean
+		approvedMaxBytes?: number
+	}>
 	missingFiles?: number
 	estimatedTimeRemainingMs?: number | null
 	isEstimatedTotal?: boolean
@@ -817,6 +836,29 @@ export interface IndexingWarningDetailsMessage {
 		sort: "severity" | "recent" | "path"
 		total: number
 		items: NonNullable<IndexingStatus["warningDetails"]>
+		hasMore: boolean
+	}
+}
+
+export interface IndexingOversizedFilesDetailsMessage {
+	type: "indexingOversizedFilesDetails"
+	values: {
+		workspacePath?: string
+		offset: number
+		limit: number
+		total: number
+		actionable: number
+		items: Array<{
+			relativePath: string
+			normalizedPath: string
+			status: "skipped" | "needs_reapproval" | "approved" | "eligible" | "missing"
+			sizeBytes: number
+			lastModifiedMtimeMs: number | null
+			recommendation: "likely_useful" | "review_manually" | "probably_skip"
+			reason: string
+			approvedMaxBytes: number | null
+			lastEvaluatedAt: number
+		}>
 		hasMore: boolean
 	}
 }

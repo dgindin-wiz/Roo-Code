@@ -15,6 +15,38 @@ interface CodebaseSearchParams {
 	path?: string
 }
 
+function summarizeMatchReasons(matchReasons?: string[]): string | undefined {
+	if (!matchReasons || matchReasons.length === 0) {
+		return undefined
+	}
+
+	if (matchReasons.includes("exact hinted symbol match") || matchReasons.includes("exact qualified symbol match")) {
+		return "Exact symbol hit"
+	}
+	if (matchReasons.includes("exact hinted path match")) {
+		return "Exact file-path hit"
+	}
+	if (matchReasons.includes("hinted symbol match") || matchReasons.includes("symbol name match")) {
+		return "Symbol match"
+	}
+	if (matchReasons.includes("hinted path match") || matchReasons.includes("path match")) {
+		return "Path match"
+	}
+	if (matchReasons.includes("expanded parent context")) {
+		return "Parent context"
+	}
+	if (matchReasons.includes("expanded sibling context")) {
+		return "Sibling context"
+	}
+	if (matchReasons.includes("lexical match")) {
+		return "Keyword match"
+	}
+	if (matchReasons.includes("chunk kind match")) {
+		return "Kind-aware match"
+	}
+	return "Related match"
+}
+
 export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 	readonly name = "codebase_search" as const
 
@@ -85,8 +117,17 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				results: Array<{
 					filePath: string
 					score: number
+					rerankScore?: number
 					startLine: number
 					endLine: number
+					language?: string
+					chunkKind?: string
+					symbolName?: string
+					symbolQualifiedName?: string
+					parentSymbolName?: string
+					summary?: string
+					matchLabel?: string
+					matchReasons?: string[]
 					codeChunk: string
 				}>
 			}
@@ -100,8 +141,23 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				jsonResult.results.push({
 					filePath: relativePath,
 					score: result.score,
+					rerankScore: result.rerankScore,
 					startLine: result.payload.startLine,
 					endLine: result.payload.endLine,
+					language: typeof result.payload.language === "string" ? result.payload.language : undefined,
+					chunkKind: typeof result.payload.chunkKind === "string" ? result.payload.chunkKind : undefined,
+					symbolName: typeof result.payload.symbolName === "string" ? result.payload.symbolName : undefined,
+					symbolQualifiedName:
+						typeof result.payload.symbolQualifiedName === "string"
+							? result.payload.symbolQualifiedName
+							: undefined,
+					parentSymbolName:
+						typeof result.payload.parentSymbolName === "string"
+							? result.payload.parentSymbolName
+							: undefined,
+					summary: typeof result.payload.summary === "string" ? result.payload.summary : undefined,
+					matchLabel: summarizeMatchReasons(result.matchReasons),
+					matchReasons: Array.isArray(result.matchReasons) ? result.matchReasons : undefined,
 					codeChunk: result.payload.codeChunk.trim(),
 				})
 			})
@@ -114,9 +170,13 @@ Results:
 
 ${jsonResult.results
 	.map(
-		(result) => `File path: ${result.filePath}
+		(result) => `${result.symbolQualifiedName ? `Symbol: ${result.symbolQualifiedName}\n` : ""}${
+			result.chunkKind ? `Kind: ${result.chunkKind}\n` : ""
+		}${result.matchLabel ? `Match: ${result.matchLabel}\n` : ""}${
+			result.matchReasons?.length ? `Match Reasons: ${result.matchReasons.join(", ")}\n` : ""
+		}File path: ${result.filePath}
 Score: ${result.score}
-Lines: ${result.startLine}-${result.endLine}
+${result.rerankScore !== undefined ? `Rerank Score: ${result.rerankScore}\n` : ""}Lines: ${result.startLine}-${result.endLine}
 Code Chunk: ${result.codeChunk}
 `,
 	)

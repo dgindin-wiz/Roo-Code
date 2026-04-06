@@ -31,6 +31,9 @@ const mocks = vi.hoisted(() => {
 		getFileRecordByWorkspacePathOptional: vi.fn().mockResolvedValue(undefined),
 		getActiveRevisionForFile: vi.fn().mockResolvedValue(undefined),
 		getChunksForRevision: vi.fn().mockResolvedValue([]),
+		getActiveChunksByFingerprints: vi.fn().mockResolvedValue([]),
+		getActiveChunksByRelativePaths: vi.fn().mockResolvedValue([]),
+		searchActiveChunksLexically: vi.fn().mockResolvedValue([]),
 		enqueueJobs: vi.fn().mockResolvedValue(undefined),
 		markFileTombstoned: vi.fn().mockResolvedValue(undefined),
 		markRunComplete: vi.fn().mockResolvedValue(undefined),
@@ -175,6 +178,7 @@ const mocks = vi.hoisted(() => {
 		reportHeartbeat: vi.fn(),
 		setActivityDetail: vi.fn(),
 		setResilienceStats: vi.fn(),
+		setOversizedDetails: vi.fn(),
 		setRecoveryContext: vi.fn(),
 		setSystemState: vi.fn(),
 		resetIndexingState: vi.fn(),
@@ -302,6 +306,9 @@ describe("CodeIndexEngineV2 smoke", () => {
 		currentModelId: "text-embedding-3-small",
 		currentModelDimension: 1536,
 		currentSearchMinScore: 0.4,
+		currentMaxFileSizeBytes: 1024 * 1024,
+		getEffectiveMaxFileSizeBytes: vi.fn(() => 1024 * 1024),
+		getOversizedFileApproval: vi.fn(() => undefined),
 		getConfig: vi.fn(() => ({
 			openAiCompatibleOptions: undefined,
 		})),
@@ -452,7 +459,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.vectorStore.initialize).toHaveBeenCalled()
 		expect(mocks.vectorStore.hasIndexedPoints).toHaveBeenCalled()
 		expect(mocks.embeddingAdapter.createEmbeddings).toHaveBeenCalledWith(["find value"], { isQuery: true })
-		expect(mocks.vectorStore.search).toHaveBeenCalledWith([0.1, 0.2, 0.3], 5, 0.4)
+		expect(mocks.vectorStore.search).toHaveBeenCalledWith([0.1, 0.2, 0.3], 15, 0.4)
 		expect(searchResults).toHaveLength(1)
 
 		await vi.advanceTimersByTimeAsync(5 * 60 * 1000)
@@ -513,6 +520,679 @@ describe("CodeIndexEngineV2 smoke", () => {
 		const status = await engine.getStatus()
 		expect(status.state).toBe("idle")
 		expect(status.message).toBe("V2 is current across 2,335 files")
+	})
+
+	it("refreshAll reruns the full pipeline without clearing the index", async () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+
+		await engine.start()
+		vi.clearAllMocks()
+
+		mocks.discoveryService.runWorkspaceDiscoveryWithProgress.mockImplementationOnce(
+			async (_triggerType, _signal, onProgress) => {
+				onProgress?.({ discoveredFiles: 3 })
+				return {
+					runId: "run-refresh",
+					discoveredFiles: 3,
+					isPartial: false,
+				}
+			},
+		)
+		mocks.statHashService.run.mockResolvedValueOnce({
+			runId: "run-refresh",
+			checkedFiles: 3,
+			skippedFiles: 0,
+			changedFiles: 1,
+			unchangedFiles: 2,
+			oversizedFiles: 1,
+			oversizedDetails: [
+				{
+					relativePath: "src/huge.ts",
+					sizeBytes: 2_000_000,
+					recommendation: "review_manually",
+					reason: "Large source file",
+				},
+			],
+			missingFiles: 0,
+			reusedParsedRevisionIds: [],
+		})
+		mocks.parseChunkService.run.mockResolvedValueOnce({
+			runId: "run-refresh",
+			attemptedRevisions: 1,
+			parsedRevisions: 1,
+			parsedChunks: 2,
+			parsedRevisionIds: ["revision-refresh"],
+			retryingRevisions: 0,
+			terminalFailedRevisions: 0,
+		})
+		mocks.diffPlanner.run.mockResolvedValueOnce({
+			runId: "run-refresh",
+			plannedRevisions: 1,
+			upsertJobs: 2,
+			deleteJobs: 0,
+		})
+		mocks.embedUpsertWorker.run.mockResolvedValueOnce({
+			runId: "run-refresh",
+			upsertedChunks: 2,
+			deletedChunks: 0,
+			committedRevisions: 1,
+		})
+
+		await engine.refreshAll()
+
+		expect(mocks.discoveryService.runWorkspaceDiscoveryWithProgress).toHaveBeenCalledTimes(1)
+		expect(mocks.vectorStore.deleteCollection).not.toHaveBeenCalled()
+		expect(mocks.metadataStore.clearStorage).not.toHaveBeenCalled()
+		expect(mocks.stateManager.setOversizedDetails).toHaveBeenCalledWith([
+			expect.objectContaining({
+				relativePath: "src/huge.ts",
+			}),
+		])
+
+		const status = await engine.getStatus()
+		expect(status.state).toBe("idle")
+		expect(status.message).toContain("V2 refresh re-evaluated 3 files")
+	})
+
+	it("reranks search results using symbol, path, and summary metadata", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-generic",
+				score: 0.91,
+				payload: {
+					filePath: "src/auth/helpers.ts",
+					chunkFingerprint: "child-generic",
+					codeChunk: "export const helper = true",
+					startLine: 1,
+					endLine: 1,
+					summary: "ts function helper in src/auth/helpers.ts:1-1",
+				},
+			},
+			{
+				id: "point-symbol",
+				score: 0.82,
+				payload: {
+					filePath: "src/auth/AssumeRoleWithWebIdentity.ts",
+					chunkFingerprint: "child-symbol",
+					codeChunk: "export function AssumeRoleWithWebIdentity() {}",
+					startLine: 10,
+					endLine: 12,
+					chunkKind: "function",
+					symbolName: "AssumeRoleWithWebIdentity",
+					symbolQualifiedName: "Auth.AssumeRoleWithWebIdentity",
+					parentSymbolName: "Auth",
+					summary:
+						"ts function AssumeRoleWithWebIdentity in Auth at src/auth/AssumeRoleWithWebIdentity.ts:10-12",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("AssumeRoleWithWebIdentity function", 5)
+
+		expect(results).toHaveLength(2)
+		expect(results[0].id).toBe("point-symbol")
+		expect(results[0].rerankScore).toBeGreaterThan(results[0].score)
+		expect(results[0].matchReasons).toContain("symbol token overlap")
+		expect(results[0].matchReasons).toContain("path token overlap")
+		expect(results[0].matchReasons).toContain("chunk kind match")
+	})
+
+	it("boosts path-like query hints ahead of generic token overlap", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-generic",
+				score: 0.9,
+				payload: {
+					filePath: "src/services/helpers.ts",
+					chunkFingerprint: "generic-fp",
+					codeChunk: "export const helper = true",
+					startLine: 1,
+					endLine: 1,
+				},
+			},
+			{
+				id: "point-path",
+				score: 0.76,
+				payload: {
+					filePath: "src/services/auth/validate.ts",
+					chunkFingerprint: "path-fp",
+					codeChunk: "export function validateToken() {}",
+					startLine: 10,
+					endLine: 14,
+					symbolName: "validateToken",
+					symbolQualifiedName: "Auth.validateToken",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("src/services/auth/validate.ts", 5)
+
+		expect(results[0].id).toBe("point-path")
+		expect(results[0].matchReasons).toContain("exact hinted path match")
+	})
+
+	it("boosts symbol-like query hints ahead of generic token overlap", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-generic",
+				score: 0.89,
+				payload: {
+					filePath: "src/auth.ts",
+					chunkFingerprint: "generic-symbol-fp",
+					codeChunk: "validate token helper",
+					startLine: 1,
+					endLine: 3,
+				},
+			},
+			{
+				id: "point-symbol",
+				score: 0.77,
+				payload: {
+					filePath: "src/auth.ts",
+					chunkFingerprint: "exact-symbol-fp",
+					codeChunk: "export function AssumeRoleWithWebIdentity() {}",
+					startLine: 10,
+					endLine: 14,
+					symbolName: "AssumeRoleWithWebIdentity",
+					symbolQualifiedName: "Auth.AssumeRoleWithWebIdentity",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("Auth.AssumeRoleWithWebIdentity", 5)
+
+		expect(results[0].id).toBe("point-symbol")
+		expect(results[0].matchReasons).toContain("exact hinted symbol match")
+	})
+
+	it("returns lexical candidates even when no query embedding is available", async () => {
+		mocks.embeddingAdapter.createEmbeddings
+			.mockResolvedValueOnce({
+				embeddings: [[0.1, 0.2, 0.3]],
+			})
+			.mockResolvedValueOnce({
+				embeddings: [],
+			})
+		mocks.metadataStore.searchActiveChunksLexically.mockResolvedValueOnce([
+			{
+				chunkId: "chunk-lexical",
+				revisionId: "revision-1",
+				chunkFingerprint: "lexical-fp",
+				startLine: 15,
+				endLine: 19,
+				language: "ts",
+				chunkKind: "function",
+				symbolName: "AssumeRoleWithWebIdentity",
+				symbolQualifiedName: "Auth.AssumeRoleWithWebIdentity",
+				parentSymbolName: "Auth",
+				parentChunkFingerprint: null,
+				summary: "ts function AssumeRoleWithWebIdentity in Auth at src/auth.ts:15-19",
+				searchText: "AssumeRoleWithWebIdentity function",
+				content: "export function AssumeRoleWithWebIdentity() {}",
+				contentHash: "hash-lexical",
+				tokenEstimate: 12,
+				embeddingModel: null,
+				vectorPointId: "vector-lexical",
+				state: "upserted",
+				createdAt: 1,
+				updatedAt: 1,
+				fileId: "file-1",
+				workspaceId: "workspace-1",
+				relativePath: "src/auth.ts",
+				normalizedPath: "/workspace/src/auth.ts",
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+				lexicalScore: 18,
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("AssumeRoleWithWebIdentity", 5)
+
+		expect(results).toHaveLength(1)
+		expect(mocks.vectorStore.search).not.toHaveBeenCalled()
+		expect(results[0].payload?.symbolQualifiedName).toBe("Auth.AssumeRoleWithWebIdentity")
+		expect(results[0].matchReasons).toContain("lexical match")
+	})
+
+	it("boosts exact filename-style path hints during reranking", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "schema-point",
+				score: 0.72,
+				payload: {
+					filePath: "src/services/code-index-v2/store/schema.ts",
+					chunkFingerprint: "schema-fp",
+					codeChunk: "CREATE TABLE IF NOT EXISTS chunk_variants (...)",
+					startLine: 1,
+					endLine: 10,
+					chunkKind: "module",
+				},
+			},
+			{
+				id: "other-point",
+				score: 0.74,
+				payload: {
+					filePath: "src/services/code-index-v2/store/types.ts",
+					chunkFingerprint: "types-fp",
+					codeChunk: "export type ChunkVariantType = ...",
+					startLine: 1,
+					endLine: 10,
+					chunkKind: "type",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("schema.ts CREATE TABLE chunk_variants", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/store/schema.ts")
+		expect(results[0].matchReasons).toContain("exact hinted filename match")
+	})
+
+	it("merges lexical and vector candidates for the same chunk", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-vector",
+				score: 0.72,
+				payload: {
+					filePath: "src/auth.ts",
+					chunkFingerprint: "shared-fp",
+					codeChunk: "export function validateToken() {}",
+					startLine: 10,
+					endLine: 14,
+					chunkKind: "function",
+					symbolName: "validateToken",
+					symbolQualifiedName: "Auth.validateToken",
+					summary: "ts function validateToken in src/auth.ts:10-14",
+				},
+			},
+		])
+		mocks.metadataStore.searchActiveChunksLexically.mockResolvedValueOnce([
+			{
+				chunkId: "chunk-shared",
+				revisionId: "revision-1",
+				chunkFingerprint: "shared-fp",
+				startLine: 10,
+				endLine: 14,
+				language: "ts",
+				chunkKind: "function",
+				symbolName: "validateToken",
+				symbolQualifiedName: "Auth.validateToken",
+				parentSymbolName: "Auth",
+				parentChunkFingerprint: null,
+				summary: "ts function validateToken in Auth at src/auth.ts:10-14",
+				searchText: "validateToken function",
+				content: "export function validateToken() {}",
+				contentHash: "hash-shared",
+				tokenEstimate: 12,
+				embeddingModel: null,
+				vectorPointId: "point-vector",
+				state: "upserted",
+				createdAt: 1,
+				updatedAt: 1,
+				fileId: "file-1",
+				workspaceId: "workspace-1",
+				relativePath: "src/auth.ts",
+				normalizedPath: "/workspace/src/auth.ts",
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+				lexicalScore: 18,
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("validateToken", 5)
+
+		expect(results).toHaveLength(1)
+		expect(results[0].payload?.chunkFingerprint).toBe("shared-fp")
+		expect(results[0].matchReasons).toContain("lexical match")
+		expect(results[0].matchReasons).toContain("symbol token overlap")
+	})
+
+	it("collapses multi-variant hits back to the raw-code payload", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-summary",
+				score: 0.83,
+				payload: {
+					filePath: "src/auth.ts",
+					chunkFingerprint: "shared-fp",
+					variantType: "summary",
+					codeChunk: "export function validateToken() {}",
+					startLine: 10,
+					endLine: 14,
+					chunkKind: "function",
+					symbolName: "validateToken",
+					symbolQualifiedName: "Auth.validateToken",
+					summary: "ts function validateToken in Auth at src/auth.ts:10-14",
+				},
+			},
+			{
+				id: "point-raw",
+				score: 0.79,
+				payload: {
+					filePath: "src/auth.ts",
+					chunkFingerprint: "shared-fp",
+					variantType: "raw_code",
+					codeChunk: "export function validateToken() { return true }",
+					startLine: 10,
+					endLine: 14,
+					chunkKind: "function",
+					symbolName: "validateToken",
+					symbolQualifiedName: "Auth.validateToken",
+					summary: "ts function validateToken in Auth at src/auth.ts:10-14",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("where do we validate the token", 5)
+
+		expect(results).toHaveLength(1)
+		expect(results[0].payload?.variantType).toBe("raw_code")
+		expect(results[0].payload?.codeChunk).toBe("export function validateToken() { return true }")
+		expect(results[0].matchReasons).toContain("summary variant match")
+		expect(results[0].matchReasons).toContain("raw code grounding")
+	})
+
+	it("boosts symbol signature variants for symbol-oriented queries while grounding to raw code", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-signature",
+				score: 0.8,
+				payload: {
+					filePath: "src/auth.ts",
+					chunkFingerprint: "sig-fp",
+					variantType: "symbol_signature",
+					codeChunk: "export function AssumeRoleWithWebIdentity() {}",
+					startLine: 20,
+					endLine: 24,
+					chunkKind: "function",
+					symbolName: "AssumeRoleWithWebIdentity",
+					symbolQualifiedName: "Auth.AssumeRoleWithWebIdentity",
+				},
+			},
+			{
+				id: "point-raw",
+				score: 0.74,
+				payload: {
+					filePath: "src/auth.ts",
+					chunkFingerprint: "sig-fp",
+					variantType: "raw_code",
+					codeChunk: "export function AssumeRoleWithWebIdentity() { return true }",
+					startLine: 20,
+					endLine: 24,
+					chunkKind: "function",
+					symbolName: "AssumeRoleWithWebIdentity",
+					symbolQualifiedName: "Auth.AssumeRoleWithWebIdentity",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("Auth.AssumeRoleWithWebIdentity", 5)
+
+		expect(results).toHaveLength(1)
+		expect(results[0].payload?.variantType).toBe("raw_code")
+		expect(results[0].matchReasons).toContain("symbol signature variant match")
+		expect(results[0].matchReasons).toContain("raw code grounding")
+	})
+
+	it("expands parent chunks after strong child hits", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-method",
+				score: 0.88,
+				payload: {
+					filePath: "src/services/auth.ts",
+					chunkFingerprint: "child-method-fp",
+					codeChunk: "validateToken(token: string) { return token.length > 0 }",
+					startLine: 20,
+					endLine: 24,
+					chunkKind: "method",
+					symbolName: "validateToken",
+					symbolQualifiedName: "AuthService.validateToken",
+					parentSymbolName: "AuthService",
+					parentChunkFingerprint: "parent-class-fp",
+					summary: "ts method validateToken in AuthService at src/services/auth.ts:20-24",
+				},
+			},
+			{
+				id: "point-other",
+				score: 0.7,
+				payload: {
+					filePath: "src/services/other.ts",
+					chunkFingerprint: "child-other-fp",
+					codeChunk: "other helper",
+					startLine: 1,
+					endLine: 2,
+				},
+			},
+		])
+		mocks.metadataStore.getActiveChunksByFingerprints.mockResolvedValueOnce([
+			{
+				chunkId: "chunk-parent",
+				revisionId: "revision-1",
+				chunkFingerprint: "parent-class-fp",
+				startLine: 1,
+				endLine: 40,
+				language: "ts",
+				chunkKind: "class",
+				symbolName: "AuthService",
+				symbolQualifiedName: "AuthService",
+				parentSymbolName: null,
+				parentChunkFingerprint: null,
+				summary: "ts class AuthService in src/services/auth.ts:1-40",
+				searchText: "AuthService class definition",
+				content: "class AuthService { validateToken() {} }",
+				contentHash: "hash-parent",
+				tokenEstimate: 25,
+				embeddingModel: null,
+				vectorPointId: "vector-parent",
+				state: "upserted",
+				createdAt: 1,
+				updatedAt: 1,
+				fileId: "file-1",
+				workspaceId: "workspace-1",
+				relativePath: "src/services/auth.ts",
+				normalizedPath: "/workspace/src/services/auth.ts",
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("validateToken method", 3)
+
+		expect(mocks.metadataStore.getActiveChunksByFingerprints).toHaveBeenCalledWith([
+			{
+				relativePath: "src/services/auth.ts",
+				chunkFingerprint: "parent-class-fp",
+			},
+		])
+		expect(results).toHaveLength(3)
+		expect(results[0].payload?.symbolQualifiedName).toBe("AuthService.validateToken")
+		expect(results[1].payload?.symbolQualifiedName).toBe("AuthService")
+		expect(results[1].matchReasons).toContain("expanded parent context")
+		expect(results[1].payload?.chunkKind).toBe("class")
+		expect(results[2].id).toBe("point-other")
+	})
+
+	it("collapses duplicate child hits from the same parent and adds one sibling context", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-method-1",
+				score: 0.89,
+				payload: {
+					filePath: "src/services/auth.ts",
+					chunkFingerprint: "child-method-a",
+					codeChunk: "validateToken(token: string) {}",
+					startLine: 20,
+					endLine: 24,
+					chunkKind: "method",
+					symbolName: "validateToken",
+					symbolQualifiedName: "AuthService.validateToken",
+					parentSymbolName: "AuthService",
+					parentChunkFingerprint: "parent-class-fp",
+					summary: "ts method validateToken in AuthService at src/services/auth.ts:20-24",
+				},
+			},
+			{
+				id: "point-method-2",
+				score: 0.87,
+				payload: {
+					filePath: "src/services/auth.ts",
+					chunkFingerprint: "child-method-b",
+					codeChunk: "refreshToken(token: string) {}",
+					startLine: 30,
+					endLine: 34,
+					chunkKind: "method",
+					symbolName: "refreshToken",
+					symbolQualifiedName: "AuthService.refreshToken",
+					parentSymbolName: "AuthService",
+					parentChunkFingerprint: "parent-class-fp",
+					summary: "ts method refreshToken in AuthService at src/services/auth.ts:30-34",
+				},
+			},
+			{
+				id: "point-other",
+				score: 0.7,
+				payload: {
+					filePath: "src/services/other.ts",
+					chunkFingerprint: "child-other-fp",
+					codeChunk: "other helper",
+					startLine: 1,
+					endLine: 2,
+				},
+			},
+		])
+		mocks.metadataStore.getActiveChunksByFingerprints.mockResolvedValueOnce([
+			{
+				chunkId: "chunk-parent",
+				revisionId: "revision-1",
+				chunkFingerprint: "parent-class-fp",
+				startLine: 1,
+				endLine: 40,
+				language: "ts",
+				chunkKind: "class",
+				symbolName: "AuthService",
+				symbolQualifiedName: "AuthService",
+				parentSymbolName: null,
+				parentChunkFingerprint: null,
+				summary: "ts class AuthService in src/services/auth.ts:1-40",
+				searchText: "AuthService class definition",
+				content: "class AuthService { validateToken() {} refreshToken() {} }",
+				contentHash: "hash-parent",
+				tokenEstimate: 25,
+				embeddingModel: null,
+				vectorPointId: "vector-parent",
+				state: "upserted",
+				createdAt: 1,
+				updatedAt: 1,
+				fileId: "file-1",
+				workspaceId: "workspace-1",
+				relativePath: "src/services/auth.ts",
+				normalizedPath: "/workspace/src/services/auth.ts",
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+			},
+		])
+		mocks.metadataStore.getActiveChunksByRelativePaths.mockResolvedValueOnce([
+			{
+				chunkId: "chunk-method-a",
+				revisionId: "revision-1",
+				chunkFingerprint: "child-method-a",
+				startLine: 20,
+				endLine: 24,
+				language: "ts",
+				chunkKind: "method",
+				symbolName: "validateToken",
+				symbolQualifiedName: "AuthService.validateToken",
+				parentSymbolName: "AuthService",
+				parentChunkFingerprint: "parent-class-fp",
+				summary: "ts method validateToken in AuthService at src/services/auth.ts:20-24",
+				searchText: "validateToken method",
+				content: "validateToken(token: string) {}",
+				contentHash: "hash-a",
+				tokenEstimate: 10,
+				embeddingModel: null,
+				vectorPointId: "vector-method-a",
+				state: "upserted",
+				createdAt: 1,
+				updatedAt: 1,
+				fileId: "file-1",
+				workspaceId: "workspace-1",
+				relativePath: "src/services/auth.ts",
+				normalizedPath: "/workspace/src/services/auth.ts",
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+			},
+			{
+				chunkId: "chunk-method-b",
+				revisionId: "revision-1",
+				chunkFingerprint: "child-method-b",
+				startLine: 30,
+				endLine: 34,
+				language: "ts",
+				chunkKind: "method",
+				symbolName: "refreshToken",
+				symbolQualifiedName: "AuthService.refreshToken",
+				parentSymbolName: "AuthService",
+				parentChunkFingerprint: "parent-class-fp",
+				summary: "ts method refreshToken in AuthService at src/services/auth.ts:30-34",
+				searchText: "refreshToken method",
+				content: "refreshToken(token: string) {}",
+				contentHash: "hash-b",
+				tokenEstimate: 10,
+				embeddingModel: null,
+				vectorPointId: "vector-method-b",
+				state: "upserted",
+				createdAt: 1,
+				updatedAt: 1,
+				fileId: "file-1",
+				workspaceId: "workspace-1",
+				relativePath: "src/services/auth.ts",
+				normalizedPath: "/workspace/src/services/auth.ts",
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("token method", 4)
+
+		expect(results).toHaveLength(4)
+		expect(results[0].payload?.symbolQualifiedName).toBe("AuthService.validateToken")
+		expect(results[1].payload?.symbolQualifiedName).toBe("AuthService")
+		expect(results[1].matchReasons).toContain("expanded parent context")
+		expect(results[2].payload?.symbolQualifiedName).toBe("AuthService.refreshToken")
+		expect(results[2].matchReasons).toContain("expanded sibling context")
+		expect(results[3].id).toBe("point-other")
+		expect(results.filter((result) => result.id === "point-method-2")).toHaveLength(0)
 	})
 
 	it("uses hashing_initial and explicit oversized counts on a fresh run without a baseline", async () => {
@@ -701,10 +1381,9 @@ describe("CodeIndexEngineV2 smoke", () => {
 
 		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
 		const startPromise = engine.start()
-		for (let i = 0; i < 10; i++) {
-			await Promise.resolve()
-		}
-		expect(mocks.statHashService.run).toHaveBeenCalledTimes(1)
+		await vi.waitFor(() => {
+			expect(mocks.statHashService.run).toHaveBeenCalledTimes(1)
+		})
 
 		await expect(engine.stop()).resolves.toBeUndefined()
 		await expect(startPromise).resolves.toBeUndefined()

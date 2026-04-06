@@ -9,6 +9,9 @@ import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { CODE_INDEX_V2_SCHEMA, getCodeIndexV2SchemaVersion } from "./schema"
 import {
 	ChunkInput,
+	ChunkVariantInput,
+	ChunkVariantRecord,
+	LexicalChunkSearchRecord,
 	ChunkRecord,
 	ChunkWithRevisionRecord,
 	FileRecord,
@@ -19,6 +22,9 @@ import {
 	FileRevisionWithFileRecord,
 	JobInput,
 	JobRecord,
+	OversizedTrackedFileInput,
+	OversizedTrackedFileRecord,
+	PaginatedOversizedTrackedFiles,
 	PaginatedRevisionWarningDetails,
 	RevisionQueryOptions,
 	RevisionJobResolution,
@@ -997,6 +1003,158 @@ export class MetadataStore {
 		return rows.map((row) => row.relativePath)
 	}
 
+	async replaceTrackedOversizedFiles(
+		workspaceId: string,
+		entries: OversizedTrackedFileInput[],
+	): Promise<PaginatedOversizedTrackedFiles> {
+		const now = Date.now()
+		const normalizedEntries = Array.from(
+			new Map(
+				entries.map((entry) => [
+					entry.relativePath,
+					{
+						...entry,
+						lastEvaluatedAt: entry.lastEvaluatedAt ?? now,
+					},
+				]),
+			).values(),
+		)
+
+		const deleteAllStatement = this.db().prepare(`DELETE FROM oversized_file_tracking WHERE workspace_id = ?`)
+		const deleteAllExceptStatement = this.db().prepare(
+			`DELETE FROM oversized_file_tracking WHERE workspace_id = ? AND relative_path NOT IN (${normalizedEntries
+				.map(() => "?")
+				.join(", ")})`,
+		)
+		const upsertStatement = this.db().prepare(
+			`INSERT INTO oversized_file_tracking (
+				workspace_id,
+				relative_path,
+				normalized_path,
+				status,
+				size_bytes,
+				last_modified_mtime_ms,
+				recommendation,
+				reason,
+				approved_max_bytes,
+				source_run_id,
+				last_evaluated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(workspace_id, relative_path)
+			DO UPDATE SET
+				normalized_path = excluded.normalized_path,
+				status = excluded.status,
+				size_bytes = excluded.size_bytes,
+				last_modified_mtime_ms = excluded.last_modified_mtime_ms,
+				recommendation = excluded.recommendation,
+				reason = excluded.reason,
+				approved_max_bytes = excluded.approved_max_bytes,
+				source_run_id = excluded.source_run_id,
+				last_evaluated_at = excluded.last_evaluated_at`,
+		)
+
+		this.db().exec("BEGIN")
+		try {
+			if (normalizedEntries.length === 0) {
+				deleteAllStatement.run(workspaceId)
+			} else {
+				deleteAllExceptStatement.run(workspaceId, ...normalizedEntries.map((entry) => entry.relativePath))
+				for (const entry of normalizedEntries) {
+					upsertStatement.run(
+						workspaceId,
+						entry.relativePath,
+						entry.normalizedPath,
+						entry.status,
+						entry.sizeBytes,
+						entry.lastModifiedMtimeMs ?? null,
+						entry.recommendation,
+						entry.reason,
+						entry.approvedMaxBytes ?? null,
+						entry.sourceRunId ?? null,
+						entry.lastEvaluatedAt,
+					)
+				}
+			}
+			this.db().exec("COMMIT")
+		} catch (error) {
+			this.db().exec("ROLLBACK")
+			throw error
+		}
+
+		return this.listTrackedOversizedFiles(workspaceId, 20, 0)
+	}
+
+	async listTrackedOversizedRelativePaths(workspaceId: string): Promise<string[]> {
+		const rows = this.db()
+			.prepare(
+				`SELECT relative_path AS relativePath
+				FROM oversized_file_tracking
+				WHERE workspace_id = ?
+				ORDER BY relative_path COLLATE NOCASE ASC`,
+			)
+			.all(workspaceId) as Array<{ relativePath: string }>
+
+		return rows.map((row) => row.relativePath)
+	}
+
+	async listTrackedOversizedFiles(
+		workspaceId: string,
+		limit = 20,
+		offset = 0,
+	): Promise<PaginatedOversizedTrackedFiles> {
+		const totalRow = this.db()
+			.prepare(
+				`SELECT
+					COUNT(*) AS total,
+					SUM(CASE WHEN status IN ('skipped', 'needs_reapproval') THEN 1 ELSE 0 END) AS actionable
+				FROM oversized_file_tracking
+				WHERE workspace_id = ?`,
+			)
+			.get(workspaceId) as { total?: number; actionable?: number } | undefined
+
+		const items = this.db()
+			.prepare(
+				`SELECT
+					workspace_id AS workspaceId,
+					relative_path AS relativePath,
+					normalized_path AS normalizedPath,
+					status,
+					size_bytes AS sizeBytes,
+					last_modified_mtime_ms AS lastModifiedMtimeMs,
+					recommendation,
+					reason,
+					approved_max_bytes AS approvedMaxBytes,
+					source_run_id AS sourceRunId,
+					last_evaluated_at AS lastEvaluatedAt
+				FROM oversized_file_tracking
+				WHERE workspace_id = ?
+				ORDER BY
+					CASE status
+						WHEN 'needs_reapproval' THEN 0
+						WHEN 'skipped' THEN 1
+						WHEN 'approved' THEN 2
+						WHEN 'eligible' THEN 3
+						WHEN 'missing' THEN 4
+						ELSE 5
+					END,
+					CASE recommendation
+						WHEN 'likely_useful' THEN 0
+						WHEN 'review_manually' THEN 1
+						ELSE 2
+					END,
+					size_bytes ASC,
+					relative_path COLLATE NOCASE ASC
+				LIMIT ? OFFSET ?`,
+			)
+			.all(workspaceId, Math.max(1, limit), Math.max(0, offset)) as OversizedTrackedFileRecord[]
+
+		return {
+			total: totalRow?.total ?? 0,
+			actionable: totalRow?.actionable ?? 0,
+			items,
+		}
+	}
+
 	async getPreviousCommittedRevision(
 		fileId: string,
 		excludingRevisionId: string,
@@ -1094,33 +1252,116 @@ export class MetadataStore {
 		this.db().prepare(`UPDATE file_revisions SET run_id = ? WHERE revision_id = ?`).run(runId, revisionId)
 	}
 
-	async upsertChunks(chunks: ChunkInput[]): Promise<void> {
+	async upsertChunks(chunks: ChunkInput[]): Promise<ChunkRecord[]> {
 		const now = Date.now()
 		const statement = this.db().prepare(
 			`INSERT INTO chunks (
 				chunk_id, revision_id, chunk_fingerprint, start_line, end_line,
+				language, chunk_kind, symbol_name, symbol_qualified_name, parent_symbol_name, parent_chunk_fingerprint, summary, search_text,
 				content, content_hash, token_estimate, embedding_model, vector_point_id,
 				state, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
+		const insertedChunks: ChunkRecord[] = []
 
 		for (const chunk of chunks) {
+			const chunkId = uuidv4()
 			statement.run(
-				uuidv4(),
+				chunkId,
 				chunk.revisionId,
 				chunk.chunkFingerprint,
 				chunk.startLine,
 				chunk.endLine,
+				chunk.language ?? null,
+				chunk.chunkKind ?? null,
+				chunk.symbolName ?? null,
+				chunk.symbolQualifiedName ?? null,
+				chunk.parentSymbolName ?? null,
+				chunk.parentChunkFingerprint ?? null,
+				chunk.summary ?? null,
+				chunk.searchText ?? null,
 				chunk.content,
 				chunk.contentHash,
 				chunk.tokenEstimate ?? null,
 				chunk.embeddingModel ?? null,
 				chunk.vectorPointId ?? null,
-				chunk.state ?? "pending",
+				chunk.state ?? "parsed",
 				now,
 				now,
 			)
+			insertedChunks.push({
+				chunkId,
+				revisionId: chunk.revisionId,
+				chunkFingerprint: chunk.chunkFingerprint,
+				startLine: chunk.startLine,
+				endLine: chunk.endLine,
+				language: chunk.language ?? null,
+				chunkKind: chunk.chunkKind ?? null,
+				symbolName: chunk.symbolName ?? null,
+				symbolQualifiedName: chunk.symbolQualifiedName ?? null,
+				parentSymbolName: chunk.parentSymbolName ?? null,
+				parentChunkFingerprint: chunk.parentChunkFingerprint ?? null,
+				summary: chunk.summary ?? null,
+				searchText: chunk.searchText ?? null,
+				content: chunk.content,
+				contentHash: chunk.contentHash,
+				tokenEstimate: chunk.tokenEstimate ?? null,
+				embeddingModel: chunk.embeddingModel ?? null,
+				vectorPointId: chunk.vectorPointId ?? null,
+				state: chunk.state ?? "parsed",
+				createdAt: now,
+				updatedAt: now,
+			})
 		}
+
+		return insertedChunks
+	}
+
+	async upsertChunkVariants(variants: ChunkVariantInput[]): Promise<ChunkVariantRecord[]> {
+		if (variants.length === 0) {
+			return []
+		}
+
+		const now = Date.now()
+		const statement = this.db().prepare(
+			`INSERT INTO chunk_variants (
+				variant_id, chunk_id, variant_type, content, content_hash, token_estimate,
+				embedding_model, vector_point_id, state, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		const insertedVariants: ChunkVariantRecord[] = []
+
+		for (const variant of variants) {
+			const variantId = uuidv4()
+			statement.run(
+				variantId,
+				variant.chunkId,
+				variant.variantType,
+				variant.content,
+				variant.contentHash,
+				variant.tokenEstimate ?? null,
+				variant.embeddingModel ?? null,
+				variant.vectorPointId ?? null,
+				variant.state ?? "parsed",
+				now,
+				now,
+			)
+			insertedVariants.push({
+				variantId,
+				chunkId: variant.chunkId,
+				variantType: variant.variantType,
+				content: variant.content,
+				contentHash: variant.contentHash,
+				tokenEstimate: variant.tokenEstimate ?? null,
+				embeddingModel: variant.embeddingModel ?? null,
+				vectorPointId: variant.vectorPointId ?? null,
+				state: variant.state ?? "parsed",
+				createdAt: now,
+				updatedAt: now,
+			})
+		}
+
+		return insertedVariants
 	}
 
 	async getChunksForRevision(revisionId: string): Promise<ChunkRecord[]> {
@@ -1132,6 +1373,14 @@ export class MetadataStore {
 					chunk_fingerprint AS chunkFingerprint,
 					start_line AS startLine,
 					end_line AS endLine,
+					language,
+					chunk_kind AS chunkKind,
+					symbol_name AS symbolName,
+					symbol_qualified_name AS symbolQualifiedName,
+					parent_symbol_name AS parentSymbolName,
+					parent_chunk_fingerprint AS parentChunkFingerprint,
+					summary,
+					search_text AS searchText,
 					content,
 					content_hash AS contentHash,
 					token_estimate AS tokenEstimate,
@@ -1160,6 +1409,14 @@ export class MetadataStore {
 					c.chunk_fingerprint AS chunkFingerprint,
 					c.start_line AS startLine,
 					c.end_line AS endLine,
+					c.language,
+					c.chunk_kind AS chunkKind,
+					c.symbol_name AS symbolName,
+					c.symbol_qualified_name AS symbolQualifiedName,
+					c.parent_symbol_name AS parentSymbolName,
+					c.parent_chunk_fingerprint AS parentChunkFingerprint,
+					c.summary,
+					c.search_text AS searchText,
 					c.content,
 					c.content_hash AS contentHash,
 					c.token_estimate AS tokenEstimate,
@@ -1180,6 +1437,277 @@ export class MetadataStore {
 				WHERE c.chunk_id IN (${placeholders})`,
 			)
 			.all(...chunkIds) as ChunkWithRevisionRecord[]
+	}
+
+	async getChunkVariantsByChunkIds(chunkIds: string[]): Promise<ChunkVariantRecord[]> {
+		if (chunkIds.length === 0) {
+			return []
+		}
+
+		const placeholders = chunkIds.map(() => "?").join(", ")
+		return this.db()
+			.prepare(
+				`SELECT
+					variant_id AS variantId,
+					chunk_id AS chunkId,
+					variant_type AS variantType,
+					content,
+					content_hash AS contentHash,
+					token_estimate AS tokenEstimate,
+					embedding_model AS embeddingModel,
+					vector_point_id AS vectorPointId,
+					state,
+					created_at AS createdAt,
+					updated_at AS updatedAt
+				FROM chunk_variants
+				WHERE chunk_id IN (${placeholders})
+				ORDER BY chunk_id ASC, variant_type ASC`,
+			)
+			.all(...chunkIds) as ChunkVariantRecord[]
+	}
+
+	async getActiveChunksByFingerprints(
+		references: Array<{ relativePath: string; chunkFingerprint: string }>,
+	): Promise<ChunkWithRevisionRecord[]> {
+		if (references.length === 0) {
+			return []
+		}
+
+		const uniqueReferences = Array.from(
+			new Map(
+				references
+					.filter((reference) => reference.relativePath && reference.chunkFingerprint)
+					.map((reference) => [
+						`${reference.relativePath}::${reference.chunkFingerprint}`,
+						{
+							relativePath: reference.relativePath,
+							chunkFingerprint: reference.chunkFingerprint,
+						},
+					]),
+			).values(),
+		)
+
+		if (uniqueReferences.length === 0) {
+			return []
+		}
+
+		const clauses = uniqueReferences.map(() => "(f.relative_path = ? AND c.chunk_fingerprint = ?)").join(" OR ")
+		const params = uniqueReferences.flatMap((reference) => [reference.relativePath, reference.chunkFingerprint])
+
+		return this.db()
+			.prepare(
+				`SELECT
+					c.chunk_id AS chunkId,
+					c.revision_id AS revisionId,
+					c.chunk_fingerprint AS chunkFingerprint,
+					c.start_line AS startLine,
+					c.end_line AS endLine,
+					c.language,
+					c.chunk_kind AS chunkKind,
+					c.symbol_name AS symbolName,
+					c.symbol_qualified_name AS symbolQualifiedName,
+					c.parent_symbol_name AS parentSymbolName,
+					c.parent_chunk_fingerprint AS parentChunkFingerprint,
+					c.summary,
+					c.search_text AS searchText,
+					c.content,
+					c.content_hash AS contentHash,
+					c.token_estimate AS tokenEstimate,
+					c.embedding_model AS embeddingModel,
+					c.vector_point_id AS vectorPointId,
+					c.state,
+					c.created_at AS createdAt,
+					c.updated_at AS updatedAt,
+					f.file_id AS fileId,
+					f.workspace_id AS workspaceId,
+					f.relative_path AS relativePath,
+					f.normalized_path AS normalizedPath,
+					fr.parser_version AS parserVersion,
+					fr.chunker_version AS chunkerVersion
+				FROM chunks c
+				INNER JOIN file_revisions fr ON fr.revision_id = c.revision_id
+				INNER JOIN files f ON f.active_revision_id = c.revision_id
+				WHERE f.workspace_id = ?
+					AND f.ignore_state = 'included'
+					AND f.tombstoned = 0
+					AND (${clauses})`,
+			)
+			.all(this.workspaceHash, ...params) as ChunkWithRevisionRecord[]
+	}
+
+	async getActiveChunksByRelativePaths(relativePaths: string[]): Promise<ChunkWithRevisionRecord[]> {
+		if (relativePaths.length === 0) {
+			return []
+		}
+
+		const uniqueRelativePaths = Array.from(new Set(relativePaths.filter(Boolean)))
+		if (uniqueRelativePaths.length === 0) {
+			return []
+		}
+
+		const placeholders = uniqueRelativePaths.map(() => "?").join(", ")
+
+		return this.db()
+			.prepare(
+				`SELECT
+					c.chunk_id AS chunkId,
+					c.revision_id AS revisionId,
+					c.chunk_fingerprint AS chunkFingerprint,
+					c.start_line AS startLine,
+					c.end_line AS endLine,
+					c.language,
+					c.chunk_kind AS chunkKind,
+					c.symbol_name AS symbolName,
+					c.symbol_qualified_name AS symbolQualifiedName,
+					c.parent_symbol_name AS parentSymbolName,
+					c.parent_chunk_fingerprint AS parentChunkFingerprint,
+					c.summary,
+					c.search_text AS searchText,
+					c.content,
+					c.content_hash AS contentHash,
+					c.token_estimate AS tokenEstimate,
+					c.embedding_model AS embeddingModel,
+					c.vector_point_id AS vectorPointId,
+					c.state,
+					c.created_at AS createdAt,
+					c.updated_at AS updatedAt,
+					f.file_id AS fileId,
+					f.workspace_id AS workspaceId,
+					f.relative_path AS relativePath,
+					f.normalized_path AS normalizedPath,
+					fr.parser_version AS parserVersion,
+					fr.chunker_version AS chunkerVersion
+				FROM chunks c
+				INNER JOIN file_revisions fr ON fr.revision_id = c.revision_id
+				INNER JOIN files f ON f.active_revision_id = c.revision_id
+				WHERE f.workspace_id = ?
+					AND f.ignore_state = 'included'
+					AND f.tombstoned = 0
+					AND f.relative_path IN (${placeholders})`,
+			)
+			.all(this.workspaceHash, ...uniqueRelativePaths) as ChunkWithRevisionRecord[]
+	}
+
+	async searchActiveChunksLexically(query: string, limit: number): Promise<LexicalChunkSearchRecord[]> {
+		const normalizedQuery = query.trim().toLowerCase()
+		if (!normalizedQuery || limit <= 0) {
+			return []
+		}
+
+		const tokens = Array.from(new Set(normalizedQuery.match(/[a-z0-9_./-]+/g) ?? [])).filter(
+			(token) => token.length > 1,
+		)
+		if (tokens.length === 0) {
+			return []
+		}
+
+		const scoreTerms: string[] = []
+		const whereTerms: string[] = []
+		const scoreParams: string[] = []
+		const whereParams: string[] = []
+
+		scoreTerms.push(
+			`CASE WHEN lower(f.relative_path) LIKE ? THEN 8 ELSE 0 END`,
+			`CASE WHEN lower(c.symbol_qualified_name) LIKE ? THEN 12 ELSE 0 END`,
+			`CASE WHEN lower(c.symbol_name) LIKE ? THEN 10 ELSE 0 END`,
+			`CASE WHEN lower(c.parent_symbol_name) LIKE ? THEN 6 ELSE 0 END`,
+			`CASE WHEN lower(c.summary) LIKE ? THEN 4 ELSE 0 END`,
+		)
+		whereTerms.push(
+			`lower(f.relative_path) LIKE ?`,
+			`lower(c.symbol_qualified_name) LIKE ?`,
+			`lower(c.symbol_name) LIKE ?`,
+			`lower(c.parent_symbol_name) LIKE ?`,
+			`lower(c.summary) LIKE ?`,
+		)
+		const exactPattern = `%${normalizedQuery}%`
+		for (let i = 0; i < 5; i++) {
+			scoreParams.push(exactPattern)
+		}
+		for (let i = 0; i < 5; i++) {
+			whereParams.push(exactPattern)
+		}
+
+		for (const token of tokens) {
+			scoreTerms.push(
+				`CASE WHEN lower(f.relative_path) LIKE ? THEN 3 ELSE 0 END`,
+				`CASE WHEN lower(c.symbol_qualified_name) LIKE ? THEN 5 ELSE 0 END`,
+				`CASE WHEN lower(c.symbol_name) LIKE ? THEN 4 ELSE 0 END`,
+				`CASE WHEN lower(c.parent_symbol_name) LIKE ? THEN 2 ELSE 0 END`,
+				`CASE WHEN lower(c.summary) LIKE ? THEN 2 ELSE 0 END`,
+				`CASE WHEN lower(c.search_text) LIKE ? THEN 1 ELSE 0 END`,
+			)
+			whereTerms.push(
+				`lower(f.relative_path) LIKE ?`,
+				`lower(c.symbol_qualified_name) LIKE ?`,
+				`lower(c.symbol_name) LIKE ?`,
+				`lower(c.parent_symbol_name) LIKE ?`,
+				`lower(c.summary) LIKE ?`,
+				`lower(c.search_text) LIKE ?`,
+			)
+			const pattern = `%${token}%`
+			for (let i = 0; i < 6; i++) {
+				scoreParams.push(pattern)
+			}
+			for (let i = 0; i < 6; i++) {
+				whereParams.push(pattern)
+			}
+
+			if (token.includes(".") || token.includes("/") || token.includes("\\")) {
+				scoreTerms.push(
+					`CASE WHEN lower(f.relative_path) = ? THEN 14 ELSE 0 END`,
+					`CASE WHEN lower(f.relative_path) LIKE ? THEN 10 ELSE 0 END`,
+				)
+				whereTerms.push(`lower(f.relative_path) = ?`, `lower(f.relative_path) LIKE ?`)
+				scoreParams.push(token.replace(/\\/g, "/"), `%/${token.replace(/\\/g, "/")}`)
+				whereParams.push(token.replace(/\\/g, "/"), `%/${token.replace(/\\/g, "/")}`)
+			}
+		}
+
+		const params: Array<string | number> = [...scoreParams, this.workspaceHash, ...whereParams, limit]
+
+		return this.db()
+			.prepare(
+				`SELECT
+					c.chunk_id AS chunkId,
+					c.revision_id AS revisionId,
+					c.chunk_fingerprint AS chunkFingerprint,
+					c.start_line AS startLine,
+					c.end_line AS endLine,
+					c.language,
+					c.chunk_kind AS chunkKind,
+					c.symbol_name AS symbolName,
+					c.symbol_qualified_name AS symbolQualifiedName,
+					c.parent_symbol_name AS parentSymbolName,
+					c.parent_chunk_fingerprint AS parentChunkFingerprint,
+					c.summary,
+					c.search_text AS searchText,
+					c.content,
+					c.content_hash AS contentHash,
+					c.token_estimate AS tokenEstimate,
+					c.embedding_model AS embeddingModel,
+					c.vector_point_id AS vectorPointId,
+					c.state,
+					c.created_at AS createdAt,
+					c.updated_at AS updatedAt,
+					f.file_id AS fileId,
+					f.workspace_id AS workspaceId,
+					f.relative_path AS relativePath,
+					f.normalized_path AS normalizedPath,
+					fr.parser_version AS parserVersion,
+					fr.chunker_version AS chunkerVersion,
+					(${scoreTerms.join(" + ")}) AS lexicalScore
+				FROM chunks c
+				INNER JOIN file_revisions fr ON fr.revision_id = c.revision_id
+				INNER JOIN files f ON f.active_revision_id = c.revision_id
+				WHERE f.workspace_id = ?
+					AND f.ignore_state = 'included'
+					AND f.tombstoned = 0
+					AND (${whereTerms.join(" OR ")})
+				ORDER BY lexicalScore DESC, f.relative_path ASC, c.start_line ASC
+				LIMIT ?`,
+			)
+			.all(...params) as LexicalChunkSearchRecord[]
 	}
 
 	async markChunkState(
@@ -1245,6 +1773,49 @@ export class MetadataStore {
 					update.clearContent ? 1 : 0,
 					now,
 					update.chunkId,
+				)
+			}
+			this.db().exec("COMMIT")
+		} catch (error) {
+			this.db().exec("ROLLBACK")
+			throw error
+		}
+	}
+
+	async markChunkVariantStates(
+		updates: Array<{
+			variantId: string
+			state: ChunkVariantRecord["state"]
+			embeddingModel?: string | null
+			vectorPointId?: string | null
+			clearContent?: boolean
+		}>,
+	): Promise<void> {
+		if (updates.length === 0) {
+			return
+		}
+
+		const now = Date.now()
+		const statement = this.db().prepare(
+			`UPDATE chunk_variants
+			 SET state = ?,
+				 embedding_model = COALESCE(?, embedding_model),
+				 vector_point_id = COALESCE(?, vector_point_id),
+				 content = CASE WHEN ? THEN '' ELSE content END,
+				 updated_at = ?
+			 WHERE variant_id = ?`,
+		)
+
+		this.db().exec("BEGIN")
+		try {
+			for (const update of updates) {
+				statement.run(
+					update.state,
+					update.embeddingModel ?? null,
+					update.vectorPointId ?? null,
+					update.clearContent ? 1 : 0,
+					now,
+					update.variantId,
 				)
 			}
 			this.db().exec("COMMIT")
@@ -1507,14 +2078,16 @@ export class MetadataStore {
 
 	private _initializeSchema(): void {
 		this.db().exec(CODE_INDEX_V2_SCHEMA)
-		try {
-			this.db().exec(`ALTER TABLE chunks ADD COLUMN content TEXT NOT NULL DEFAULT ''`)
-		} catch (error) {
-			const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase()
-			if (!message.includes("duplicate column")) {
-				throw error
-			}
-		}
+		this.ensureColumn("chunks", "content", `TEXT NOT NULL DEFAULT ''`)
+		this.ensureColumn("chunks", "language", "TEXT")
+		this.ensureColumn("chunks", "chunk_kind", "TEXT")
+		this.ensureColumn("chunks", "symbol_name", "TEXT")
+		this.ensureColumn("chunks", "symbol_qualified_name", "TEXT")
+		this.ensureColumn("chunks", "parent_symbol_name", "TEXT")
+		this.ensureColumn("chunks", "parent_chunk_fingerprint", "TEXT")
+		this.ensureColumn("chunks", "summary", "TEXT")
+		this.ensureColumn("chunks", "search_text", "TEXT")
+		this.ensureColumn("oversized_file_tracking", "last_modified_mtime_ms", "INTEGER")
 		this.db()
 			.prepare(
 				`INSERT INTO schema_meta (key, value)
@@ -1522,6 +2095,17 @@ export class MetadataStore {
 				 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 			)
 			.run(String(getCodeIndexV2SchemaVersion()))
+	}
+
+	private ensureColumn(tableName: string, columnName: string, definition: string): void {
+		try {
+			this.db().exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`)
+		} catch (error) {
+			const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase()
+			if (!message.includes("duplicate column")) {
+				throw error
+			}
+		}
 	}
 
 	private db(): SqliteDatabaseSync {

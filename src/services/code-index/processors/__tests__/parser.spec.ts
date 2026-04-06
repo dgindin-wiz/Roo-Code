@@ -122,8 +122,8 @@ describe("CodeParser", () => {
 
 		it("should use provided fileHash when available", async () => {
 			const content = `/* This is a long test content string that exceeds 100 characters to test fileHash behavior.
-			It includes multiple lines and various JavaScript constructs to simulate real-world code.
-			const items = [1, 2, 3];
+				It includes multiple lines and various JavaScript constructs to simulate real-world code.
+				const items = [1, 2, 3];
 			const sum = items.reduce((a, b) => a + b, 0);
 			function processItems(items) {
 				return items.map(item => item * 2);
@@ -132,6 +132,78 @@ describe("CodeParser", () => {
 			const fileHash = "test-hash"
 			const result = await parser.parseFile("test.js", { content, fileHash })
 			expect(result[0].fileHash).toBe(fileHash)
+		})
+
+		it("should chunk top-level JSON keys as semantic sections", async () => {
+			const jsonContent = JSON.stringify(
+				{
+					compilerOptions: {
+						target: "ES2022",
+						module: "NodeNext",
+						strict: true,
+						jsx: "react-jsx",
+					},
+					include: ["src", "webview-ui/src"],
+				},
+				null,
+				2,
+			)
+
+			const result = await parser.parseFile("tsconfig.json", { content: jsonContent })
+
+			expect(result.length).toBe(2)
+			expect(result.map((block) => block.identifier)).toEqual(["compilerOptions", "include"])
+			expect(result.every((block) => block.type === "json_key")).toBe(true)
+			expect(result[0]?.content).toContain('"compilerOptions"')
+		})
+
+		it("should chunk top-level YAML keys as semantic sections", async () => {
+			const yamlContent = `services:
+  api:
+    image: app:latest
+    environment:
+      NODE_ENV: production
+      LOG_LEVEL: debug
+    labels:
+      com.example.service: api
+      com.example.tier: backend
+volumes:
+  data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /tmp/data
+`
+
+			const result = await parser.parseFile("docker-compose.yaml", { content: yamlContent })
+
+			expect(result.length).toBe(2)
+			expect(result.map((block) => block.identifier)).toEqual(["services", "volumes"])
+			expect(result.every((block) => block.type === "yaml_key")).toBe(true)
+			expect(result[0]?.content).toContain("services:")
+		})
+
+		it("should chunk TOML tables as semantic sections", async () => {
+			const tomlContent = `[database]
+server = "db.internal"
+ports = [5432, 5433]
+pool_size = 15
+ssl_mode = "require"
+
+[cache]
+enabled = true
+ttl = 300
+backend = "redis"
+prefix = "app-cache"
+`
+
+			const result = await parser.parseFile("config.toml", { content: tomlContent })
+
+			expect(result.length).toBe(2)
+			expect(result.map((block) => block.identifier)).toEqual(["database", "cache"])
+			expect(result.every((block) => block.type === "toml_table")).toBe(true)
+			expect(result[0]?.content).toContain("[database]")
 		})
 	})
 
@@ -247,6 +319,36 @@ describe("CodeParser", () => {
 			const longResult = await parser["parseContent"]("test.js", longContent, "hash3")
 			expect(longResult.length).toBe(1)
 			expect(longResult[0].content).toBe(longContent)
+		})
+
+		it("should capture parent identifiers for nested symbols", async () => {
+			const classNode = {
+				type: "class_declaration",
+				childForFieldName: vi.fn((field: string) => (field === "name" ? { text: "ExampleService" } : null)),
+				children: [],
+				parent: null,
+			}
+			const methodContent =
+				"function nestedMethod() { const value = 1; return value + 2; } // enough content for indexing"
+			const methodNode = {
+				text: methodContent,
+				startPosition: { row: 4 },
+				endPosition: { row: 4 },
+				type: "method_definition",
+				childForFieldName: vi.fn((field: string) => (field === "name" ? { text: "nestedMethod" } : null)),
+				children: [],
+				parent: classNode,
+			}
+
+			mockLanguageParser.js.query.captures.mockReturnValue([
+				{ node: methodNode, name: "definition.method" } as any,
+			])
+			const result = await parser["parseContent"]("test.js", methodContent, "hash-parent")
+
+			expect(result).toHaveLength(1)
+			expect(result[0].identifier).toBe("nestedMethod")
+			expect(result[0].parentIdentifier).toBe("ExampleService")
+			expect(result[0].parentChunkFingerprint).toMatch(/^[a-f0-9]{64}$/)
 		})
 	})
 

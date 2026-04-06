@@ -1,5 +1,4 @@
 import { generateRelativeFilePath } from "../../code-index/shared/get-relative-path"
-import { MAX_FILE_SIZE_BYTES } from "../../code-index/constants"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { MetadataStore } from "../store/MetadataStore"
 import { WorkspaceAdapter } from "../adapters/WorkspaceAdapter"
@@ -13,6 +12,7 @@ export class ReconciliationService {
 	constructor(
 		private readonly metadataStore: MetadataStore,
 		private readonly workspaceAdapter: WorkspaceAdapter,
+		private readonly getEffectiveMaxFileSizeBytes: (relativePath: string) => number = () => 1024 * 1024,
 	) {}
 
 	async findMissingFiles(summary: DiscoverySummary): Promise<ReconciliationSummary> {
@@ -45,7 +45,7 @@ export class ReconciliationService {
 					return true
 				}
 
-				if ((file.lastSeenSize ?? 0) > MAX_FILE_SIZE_BYTES) {
+				if ((file.lastSeenSize ?? 0) > this.getEffectiveMaxFileSizeBytes(file.relativePath)) {
 					return true
 				}
 

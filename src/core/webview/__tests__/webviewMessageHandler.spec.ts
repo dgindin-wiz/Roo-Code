@@ -715,6 +715,41 @@ describe("webviewMessageHandler - indexing flows", () => {
 		})
 	})
 
+	it("runs a full refresh, enables the workspace, and posts the updated status", async () => {
+		const mockManager = {
+			setWorkspaceEnabled: vi.fn().mockResolvedValue(undefined),
+			initialize: vi.fn().mockResolvedValue(undefined),
+			refreshAllIndexData: vi.fn().mockResolvedValue(undefined),
+			getCurrentStatus: vi.fn().mockReturnValue({
+				systemStatus: "Indexed",
+				message: "V2 refresh re-evaluated 66,017 files and synced updated chunks",
+				processedItems: 210709,
+				totalItems: 210709,
+				currentItemUnit: "blocks",
+			}),
+			isFeatureEnabled: true,
+			isFeatureConfigured: true,
+			isInitialized: true,
+			state: "Standby",
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "fullRefreshIndexData",
+		} as any)
+
+		expect(mockManager.setWorkspaceEnabled).toHaveBeenCalledWith(true)
+		expect(mockManager.initialize).toHaveBeenCalledWith(mockClineProvider.contextProxy)
+		expect(mockManager.refreshAllIndexData).toHaveBeenCalledTimes(1)
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "indexingStatusUpdate",
+			values: expect.objectContaining({
+				systemStatus: "Indexed",
+				message: "V2 refresh re-evaluated 66,017 files and synced updated chunks",
+			}),
+		})
+	})
+
 	it("returns paginated indexing warning details on demand", async () => {
 		const mockManager = {
 			getIndexWarningDetails: vi.fn().mockResolvedValue({
@@ -769,6 +804,59 @@ describe("webviewMessageHandler - indexing flows", () => {
 					}),
 				],
 				hasMore: true,
+			},
+		})
+	})
+
+	it("returns paginated oversized file details on demand", async () => {
+		const mockManager = {
+			getOversizedFileDetails: vi.fn().mockResolvedValue({
+				total: 12,
+				actionable: 4,
+				items: [
+					{
+						relativePath: "src/huge-schema.sql",
+						normalizedPath: "/mock/workspace/src/huge-schema.sql",
+						status: "skipped",
+						sizeBytes: 1_600_000,
+						lastModifiedMtimeMs: 1_700_000_000_000,
+						recommendation: "likely_useful",
+						reason: "Looks like schema, config, policy, or structured source data.",
+						approvedMaxBytes: null,
+						lastEvaluatedAt: 1700000000000,
+					},
+				],
+			}),
+			getCurrentStatus: vi.fn().mockReturnValue({
+				workspacePath: "/mock/workspace",
+			}),
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "requestIndexingOversizedFilesDetails",
+			values: {
+				offset: 20,
+				limit: 10,
+			},
+		} as any)
+
+		expect(mockManager.getOversizedFileDetails).toHaveBeenCalledWith(20, 10)
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenCalledWith({
+			type: "indexingOversizedFilesDetails",
+			values: {
+				workspacePath: "/mock/workspace",
+				offset: 20,
+				limit: 10,
+				total: 12,
+				actionable: 4,
+				items: [
+					expect.objectContaining({
+						relativePath: "src/huge-schema.sql",
+						status: "skipped",
+					}),
+				],
+				hasMore: false,
 			},
 		})
 	})

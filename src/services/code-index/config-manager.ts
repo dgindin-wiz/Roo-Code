@@ -12,6 +12,7 @@ import { Package } from "../../shared/package"
  * Handles loading, validating, and providing access to configuration values.
  */
 export class CodeIndexConfigManager {
+	private static readonly DEFAULT_MAX_FILE_SIZE_MB = 1
 	private codebaseIndexEnabled: boolean = false
 	private embedderProvider: EmbedderProvider = "openai"
 	private modelId?: string
@@ -26,6 +27,14 @@ export class CodeIndexConfigManager {
 	private openRouterOptions?: { apiKey: string; specificProvider?: string }
 	private qdrantUrl?: string = "http://localhost:6333"
 	private qdrantApiKey?: string
+	private maxFileSizeBytes: number = CodeIndexConfigManager.DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024
+	private oversizedFileApprovals: Array<{
+		workspacePath: string
+		relativePath: string
+		sizeAtApprovalBytes: number
+		approvedMaxBytes: number
+		approvedAt: number
+	}> = []
 	private searchMinScore?: number
 	private searchMaxResults?: number
 	private respectGitIgnore: boolean = true
@@ -64,6 +73,7 @@ export class CodeIndexConfigManager {
 		const {
 			codebaseIndexEnabled,
 			codebaseIndexQdrantUrl,
+			codebaseIndexMaxFileSizeMb,
 			codebaseIndexEmbedderProvider,
 			codebaseIndexEmbedderBaseUrl,
 			codebaseIndexEmbedderModelId,
@@ -94,6 +104,19 @@ export class CodeIndexConfigManager {
 		this.codebaseIndexEnabled = codebaseIndexEnabled ?? false
 		this.qdrantUrl = codebaseIndexQdrantUrl
 		this.qdrantApiKey = qdrantApiKey ?? ""
+		const maxFileSizeMb = Number(codebaseIndexMaxFileSizeMb ?? CodeIndexConfigManager.DEFAULT_MAX_FILE_SIZE_MB)
+		this.maxFileSizeBytes =
+			Number.isFinite(maxFileSizeMb) && maxFileSizeMb >= 1
+				? Math.round(maxFileSizeMb * 1024 * 1024)
+				: CodeIndexConfigManager.DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024
+		this.oversizedFileApprovals = Array.isArray(codebaseIndexConfig.codebaseIndexOversizedFileApprovals)
+			? codebaseIndexConfig.codebaseIndexOversizedFileApprovals.filter(
+					(
+						entry,
+					): entry is NonNullable<typeof codebaseIndexConfig.codebaseIndexOversizedFileApprovals>[number] =>
+						Boolean(entry?.workspacePath && entry?.relativePath && entry?.approvedMaxBytes),
+				)
+			: []
 		this.searchMinScore = codebaseIndexSearchMinScore
 		this.searchMaxResults = codebaseIndexSearchMaxResults
 		this.respectGitIgnore = respectGitIgnoreSetting
@@ -182,6 +205,14 @@ export class CodeIndexConfigManager {
 			openRouterOptions?: { apiKey: string }
 			qdrantUrl?: string
 			qdrantApiKey?: string
+			maxFileSizeBytes?: number
+			oversizedFileApprovals?: Array<{
+				workspacePath: string
+				relativePath: string
+				sizeAtApprovalBytes: number
+				approvedMaxBytes: number
+				approvedAt: number
+			}>
 			searchMinScore?: number
 			respectGitIgnore?: boolean
 			embeddingLaneConcurrency?: number
@@ -208,6 +239,8 @@ export class CodeIndexConfigManager {
 			openRouterSpecificProvider: this.openRouterOptions?.specificProvider ?? "",
 			qdrantUrl: this.qdrantUrl ?? "",
 			qdrantApiKey: this.qdrantApiKey ?? "",
+			maxFileSizeBytes: this.maxFileSizeBytes,
+			oversizedFileApprovalsJson: JSON.stringify(this.oversizedFileApprovals),
 			respectGitIgnore: this.respectGitIgnore,
 			embeddingLaneConcurrency: this.embeddingLaneConcurrency,
 		}
@@ -249,6 +282,8 @@ export class CodeIndexConfigManager {
 				openRouterOptions: this.openRouterOptions,
 				qdrantUrl: this.qdrantUrl,
 				qdrantApiKey: this.qdrantApiKey,
+				maxFileSizeBytes: this.maxFileSizeBytes,
+				oversizedFileApprovals: this.oversizedFileApprovals,
 				searchMinScore: this.currentSearchMinScore,
 				respectGitIgnore: this.respectGitIgnore,
 				embeddingLaneConcurrency: this.embeddingLaneConcurrency,
@@ -349,6 +384,9 @@ export class CodeIndexConfigManager {
 		const prevOpenRouterSpecificProvider = prev?.openRouterSpecificProvider ?? ""
 		const prevQdrantUrl = prev?.qdrantUrl ?? ""
 		const prevQdrantApiKey = prev?.qdrantApiKey ?? ""
+		const prevMaxFileSizeBytes =
+			prev?.maxFileSizeBytes ?? CodeIndexConfigManager.DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024
+		const prevOversizedFileApprovalsJson = prev?.oversizedFileApprovalsJson ?? "[]"
 		const prevRespectGitIgnore = prev?.respectGitIgnore ?? true
 
 		// 1. Transition from disabled/unconfigured to enabled/configured
@@ -392,6 +430,8 @@ export class CodeIndexConfigManager {
 		const currentOpenRouterSpecificProvider = this.openRouterOptions?.specificProvider ?? ""
 		const currentQdrantUrl = this.qdrantUrl ?? ""
 		const currentQdrantApiKey = this.qdrantApiKey ?? ""
+		const currentMaxFileSizeBytes = this.maxFileSizeBytes
+		const currentOversizedFileApprovalsJson = JSON.stringify(this.oversizedFileApprovals)
 		const currentRespectGitIgnore = this.respectGitIgnore
 
 		// Helper: detect if a secret "disappeared" (was set, now empty).
@@ -463,6 +503,14 @@ export class CodeIndexConfigManager {
 			return true
 		}
 
+		if (prevMaxFileSizeBytes !== currentMaxFileSizeBytes) {
+			return true
+		}
+
+		if (prevOversizedFileApprovalsJson !== currentOversizedFileApprovalsJson) {
+			return true
+		}
+
 		if (prevRespectGitIgnore !== currentRespectGitIgnore) {
 			return true
 		}
@@ -520,6 +568,8 @@ export class CodeIndexConfigManager {
 			openRouterOptions: this.openRouterOptions,
 			qdrantUrl: this.qdrantUrl,
 			qdrantApiKey: this.qdrantApiKey,
+			maxFileSizeBytes: this.maxFileSizeBytes,
+			oversizedFileApprovals: this.oversizedFileApprovals,
 			searchMinScore: this.currentSearchMinScore,
 			searchMaxResults: this.currentSearchMaxResults,
 			respectGitIgnore: this.respectGitIgnore,
@@ -592,6 +642,42 @@ export class CodeIndexConfigManager {
 
 	public get currentEmbeddingLaneConcurrency(): number {
 		return this.embeddingLaneConcurrency
+	}
+
+	public get currentMaxFileSizeBytes(): number {
+		return this.maxFileSizeBytes
+	}
+
+	public getOversizedFileApproval(
+		workspacePath: string,
+		relativePath: string,
+	):
+		| {
+				workspacePath: string
+				relativePath: string
+				sizeAtApprovalBytes: number
+				approvedMaxBytes: number
+				approvedAt: number
+		  }
+		| undefined {
+		return this.oversizedFileApprovals.find(
+			(entry) => entry.workspacePath === workspacePath && entry.relativePath === relativePath,
+		)
+	}
+
+	public getOversizedFileApprovalsForWorkspace(workspacePath: string): Array<{
+		workspacePath: string
+		relativePath: string
+		sizeAtApprovalBytes: number
+		approvedMaxBytes: number
+		approvedAt: number
+	}> {
+		return this.oversizedFileApprovals.filter((entry) => entry.workspacePath === workspacePath)
+	}
+
+	public getEffectiveMaxFileSizeBytes(workspacePath: string, relativePath: string): number {
+		const approval = this.getOversizedFileApproval(workspacePath, relativePath)
+		return Math.max(this.maxFileSizeBytes, approval?.approvedMaxBytes ?? 0)
 	}
 
 	/**

@@ -100,6 +100,8 @@ export interface IVectorStore {
 export interface VectorStoreSearchResult {
 	id: string | number
 	score: number
+	rerankScore?: number
+	matchReasons?: string[]
 	payload?: Payload | null
 }
 
@@ -108,5 +110,15 @@ export interface Payload {
 	codeChunk: string
 	startLine: number
 	endLine: number
+	chunkFingerprint?: string
+	variantType?: string
+	language?: string
+	chunkKind?: string
+	symbolName?: string
+	symbolQualifiedName?: string
+	parentSymbolName?: string
+	parentChunkFingerprint?: string
+	summary?: string
+	searchText?: string
 	[key: string]: any
 }

@@ -111,4 +111,95 @@ describe("StatHashService", () => {
 		expect(summary.oversizedFiles).toBe(1)
 		expect(summary.missingFiles).toBe(0)
 	})
+
+	it("prioritizes likely useful and reapproval-needed oversized files ahead of noisy files", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue([
+			{
+				fileId: "file-noise",
+				relativePath: "dist/app.bundle.js",
+				normalizedPath: "/workspace/dist/app.bundle.js",
+				lastSeenSize: MAX_FILE_SIZE_BYTES + 500,
+				lastSeenMtimeMs: 20,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+			},
+			{
+				fileId: "file-useful",
+				relativePath: "config/openapi.yaml",
+				normalizedPath: "/workspace/config/openapi.yaml",
+				lastSeenSize: MAX_FILE_SIZE_BYTES + 800,
+				lastSeenMtimeMs: 20,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+			},
+			{
+				fileId: "file-review",
+				relativePath: "src/huge-service.ts",
+				normalizedPath: "/workspace/src/huge-service.ts",
+				lastSeenSize: MAX_FILE_SIZE_BYTES + 200,
+				lastSeenMtimeMs: 20,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+			},
+			{
+				fileId: "file-approved",
+				relativePath: "src/schema.ts",
+				normalizedPath: "/workspace/src/schema.ts",
+				lastSeenSize: MAX_FILE_SIZE_BYTES + 900,
+				lastSeenMtimeMs: 20,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+			},
+		])
+
+		const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+		const summary = await service.run("run-1", undefined, undefined, {
+			resolveApprovedMaxBytes: (relativePath) =>
+				relativePath === "src/schema.ts" ? MAX_FILE_SIZE_BYTES + 100 : undefined,
+		})
+
+		expect(summary.oversizedDetails.map((detail) => detail.relativePath)).toEqual([
+			"src/schema.ts",
+			"config/openapi.yaml",
+			"src/huge-service.ts",
+			"dist/app.bundle.js",
+		])
+		expect(summary.oversizedDetails[0]).toMatchObject({
+			relativePath: "src/schema.ts",
+			needsReapproval: true,
+		})
+	})
+
+	it("keeps only the top 20 prioritized oversized files", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue(
+			Array.from({ length: 25 }, (_, index) => ({
+				fileId: `file-${index}`,
+				relativePath: index === 24 ? "config/high-priority.yaml" : `dist/generated-${index}.bundle.js`,
+				normalizedPath:
+					index === 24
+						? "/workspace/config/high-priority.yaml"
+						: `/workspace/dist/generated-${index}.bundle.js`,
+				lastSeenSize: MAX_FILE_SIZE_BYTES + 1000 + index,
+				lastSeenMtimeMs: 20,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+			})),
+		)
+
+		const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+		const summary = await service.run("run-1")
+
+		expect(summary.oversizedDetails).toHaveLength(20)
+		expect(summary.oversizedDetails[0]?.relativePath).toBe("config/high-priority.yaml")
+		expect(summary.oversizedDetails.some((detail) => detail.relativePath === "dist/generated-24.bundle.js")).toBe(
+			false,
+		)
+	})
 })

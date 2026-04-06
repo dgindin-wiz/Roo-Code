@@ -6,9 +6,17 @@ export interface VectorPointPayload {
 	relativePath: string
 	revisionId: string
 	chunkFingerprint: string
+	variantType?: string
 	startLine: number
 	endLine: number
 	language?: string
+	chunkKind?: string
+	symbolName?: string
+	symbolQualifiedName?: string
+	parentSymbolName?: string
+	parentChunkFingerprint?: string
+	summary?: string
+	searchText?: string
 	modelId?: string
 	parserVersion?: string
 	chunkerVersion?: string

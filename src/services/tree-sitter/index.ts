@@ -68,6 +68,9 @@ const extensions = [
 	"markdown",
 	// JSON
 	"json",
+	// YAML
+	"yml",
+	"yaml",
 	// CSS
 	"css",
 	// SystemRDL

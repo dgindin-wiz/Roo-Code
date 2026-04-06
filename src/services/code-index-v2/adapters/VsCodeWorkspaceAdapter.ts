@@ -8,6 +8,7 @@ import { Package } from "../../../shared/package"
 import { isPathInIgnoredDirectory } from "../../glob/ignore-utils"
 import { scannerExtensions } from "../../code-index/shared/supported-extensions"
 import { generateRelativeFilePath } from "../../code-index/shared/get-relative-path"
+import { shouldSkipLowValueFile } from "../../code-index/shared/low-value-files"
 import {
 	WorkspaceAdapter,
 	WorkspaceCandidateFilesResult,
@@ -188,6 +189,10 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 		const extension = path.extname(absolutePath).toLowerCase()
 
 		if (!scannerExtensions.includes(extension)) {
+			return false
+		}
+
+		if (shouldSkipLowValueFile(relativePath)) {
 			return false
 		}
 

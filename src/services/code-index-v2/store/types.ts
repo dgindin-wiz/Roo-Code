@@ -9,10 +9,13 @@ export type FileRevisionState =
 	| "failed"
 
 export type ChunkState = "parsed" | "upserted" | "deleted" | "abandoned" | "terminal_failed"
+export type ChunkVariantType = "raw_code" | "summary" | "symbol_signature"
+export type ChunkVariantState = ChunkState
 
 export type JobState = "queued" | "running" | "done" | "abandoned" | "terminal_failed"
 
 export type IndexRunState = "started" | "discovery_complete" | "complete" | "failed" | "stopped"
+export type OversizedTrackingStatus = "skipped" | "needs_reapproval" | "approved" | "eligible" | "missing"
 
 export interface WorkspaceRecord {
 	workspaceId: string
@@ -86,6 +89,14 @@ export interface ChunkRecord {
 	chunkFingerprint: string
 	startLine: number
 	endLine: number
+	language: string | null
+	chunkKind: string | null
+	symbolName: string | null
+	symbolQualifiedName: string | null
+	parentSymbolName: string | null
+	parentChunkFingerprint: string | null
+	summary: string | null
+	searchText: string | null
 	content: string
 	contentHash: string
 	tokenEstimate: number | null
@@ -106,6 +117,14 @@ export interface ChunkInput {
 	chunkFingerprint: string
 	startLine: number
 	endLine: number
+	language?: string | null
+	chunkKind?: string | null
+	symbolName?: string | null
+	symbolQualifiedName?: string | null
+	parentSymbolName?: string | null
+	parentChunkFingerprint?: string | null
+	summary?: string | null
+	searchText?: string | null
 	content: string
 	contentHash: string
 	tokenEstimate?: number | null
@@ -121,6 +140,35 @@ export interface ChunkWithRevisionRecord extends ChunkRecord {
 	normalizedPath: string
 	parserVersion: string
 	chunkerVersion: string
+}
+
+export interface LexicalChunkSearchRecord extends ChunkWithRevisionRecord {
+	lexicalScore: number
+}
+
+export interface ChunkVariantRecord {
+	variantId: string
+	chunkId: string
+	variantType: ChunkVariantType
+	content: string
+	contentHash: string
+	tokenEstimate: number | null
+	embeddingModel: string | null
+	vectorPointId: string | null
+	state: ChunkVariantState
+	createdAt: number
+	updatedAt: number
+}
+
+export interface ChunkVariantInput {
+	chunkId: string
+	variantType: ChunkVariantType
+	content: string
+	contentHash: string
+	tokenEstimate?: number | null
+	embeddingModel?: string | null
+	vectorPointId?: string | null
+	state?: ChunkVariantState
 }
 
 export interface JobRecord {
@@ -171,6 +219,40 @@ export interface WatchEventRecord {
 	eventType: string
 	observedAt: number
 	coalesced: boolean
+}
+
+export interface OversizedTrackedFileRecord {
+	workspaceId: string
+	relativePath: string
+	normalizedPath: string
+	status: OversizedTrackingStatus
+	sizeBytes: number
+	lastModifiedMtimeMs: number | null
+	recommendation: "likely_useful" | "review_manually" | "probably_skip"
+	reason: string
+	approvedMaxBytes: number | null
+	sourceRunId: string | null
+	lastEvaluatedAt: number
+}
+
+export interface OversizedTrackedFileInput {
+	workspaceId: string
+	relativePath: string
+	normalizedPath: string
+	status: OversizedTrackingStatus
+	sizeBytes: number
+	lastModifiedMtimeMs?: number | null
+	recommendation: "likely_useful" | "review_manually" | "probably_skip"
+	reason: string
+	approvedMaxBytes?: number | null
+	sourceRunId?: string | null
+	lastEvaluatedAt?: number
+}
+
+export interface PaginatedOversizedTrackedFiles {
+	total: number
+	actionable: number
+	items: OversizedTrackedFileRecord[]
 }
 
 export interface StaleRunCleanupSummary {

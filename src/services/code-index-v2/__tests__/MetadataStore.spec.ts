@@ -43,6 +43,69 @@ describe("MetadataStore integration", () => {
 		}
 	})
 
+	it("adds last_modified_mtime_ms to legacy oversized tracking tables during initialization", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const store = new MetadataStore(context, workspacePath)
+		const dbPath = store.getDatabasePath()
+
+		await fs.mkdir(path.dirname(dbPath), { recursive: true })
+
+		const { DatabaseSync } = require("node:sqlite") as {
+			DatabaseSync: new (path: string) => {
+				exec(sql: string): void
+				close(): void
+			}
+		}
+		const legacyDb = new DatabaseSync(dbPath)
+		legacyDb.exec(`
+			CREATE TABLE IF NOT EXISTS schema_meta (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS oversized_file_tracking (
+				workspace_id TEXT NOT NULL,
+				relative_path TEXT NOT NULL,
+				normalized_path TEXT NOT NULL,
+				status TEXT NOT NULL,
+				size_bytes INTEGER NOT NULL,
+				recommendation TEXT NOT NULL,
+				reason TEXT NOT NULL,
+				approved_max_bytes INTEGER,
+				source_run_id TEXT,
+				last_evaluated_at INTEGER NOT NULL,
+				PRIMARY KEY(workspace_id, relative_path)
+			);
+		`)
+		legacyDb.close()
+
+		await store.initialize()
+
+		await store.replaceTrackedOversizedFiles(store.getWorkspaceId(), [
+			{
+				workspaceId: store.getWorkspaceId(),
+				relativePath: "dist/bundle.js",
+				normalizedPath: path.join(workspacePath, "dist/bundle.js"),
+				status: "skipped",
+				sizeBytes: 2_000_000,
+				lastModifiedMtimeMs: 123456789,
+				recommendation: "probably_skip",
+				reason: "Looks generated.",
+				approvedMaxBytes: undefined,
+				sourceRunId: "run-1",
+			},
+		])
+
+		const records = await store.listTrackedOversizedFiles(store.getWorkspaceId(), 10, 0)
+		expect(records.items).toHaveLength(1)
+		expect(records.items[0]?.lastModifiedMtimeMs).toBe(123456789)
+
+		await store.dispose()
+	})
+
 	it("preserves retryable stale jobs and adopts them into the next run", async () => {
 		const context = {
 			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
@@ -76,12 +139,28 @@ describe("MetadataStore integration", () => {
 				chunkFingerprint: "chunk-fp",
 				startLine: 1,
 				endLine: 5,
+				language: "ts",
+				chunkKind: "function",
+				symbolName: "doWork",
+				symbolQualifiedName: "ExampleService.doWork",
+				parentSymbolName: "ExampleService",
+				parentChunkFingerprint: "parent-fp",
+				summary: "ts function doWork in ExampleService",
+				searchText: "Path: src/example.ts\nSymbol: doWork\nParent: ExampleService\n\nconst value = 1",
 				content: "const value = 1",
 				contentHash: "chunk-hash",
 				state: "parsed",
 			},
 		])
 		const [chunk] = await store.getChunksForRevision(revision.revisionId)
+		expect(chunk?.language).toBe("ts")
+		expect(chunk?.chunkKind).toBe("function")
+		expect(chunk?.symbolName).toBe("doWork")
+		expect(chunk?.symbolQualifiedName).toBe("ExampleService.doWork")
+		expect(chunk?.parentSymbolName).toBe("ExampleService")
+		expect(chunk?.parentChunkFingerprint).toBe("parent-fp")
+		expect(chunk?.summary).toContain("doWork")
+		expect(chunk?.searchText).toContain("Parent: ExampleService")
 		await store.enqueueJobs([
 			{
 				workspaceId,
@@ -112,6 +191,137 @@ describe("MetadataStore integration", () => {
 
 		const adoptedRevision = await store.getFileRevision(revision.revisionId)
 		expect(adoptedRevision.runId).toBe(resumedRunId)
+
+		await store.dispose()
+	})
+
+	it("finds active chunks by relative path and chunk fingerprint", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const runId = await store.beginRun("initial-discovery")
+		const file = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/example.ts",
+			normalizedPath: path.join(workspacePath, "src/example.ts"),
+			lastSeenMtimeMs: 123,
+			lastSeenSize: 456,
+			ignoreState: "included",
+		})
+		const revision = await store.createFileRevision({
+			fileId: file.fileId,
+			runId,
+			contentHash: "content-hash",
+			fastFingerprint: "456:123",
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+			state: "parsed",
+		})
+		await store.upsertChunks([
+			{
+				revisionId: revision.revisionId,
+				chunkFingerprint: "parent-fp",
+				startLine: 1,
+				endLine: 20,
+				language: "ts",
+				chunkKind: "class",
+				symbolName: "ExampleService",
+				symbolQualifiedName: "ExampleService",
+				content: "class ExampleService {}",
+				contentHash: "parent-content-hash",
+				state: "upserted",
+			},
+			{
+				revisionId: revision.revisionId,
+				chunkFingerprint: "child-fp",
+				startLine: 5,
+				endLine: 10,
+				language: "ts",
+				chunkKind: "method",
+				symbolName: "run",
+				symbolQualifiedName: "ExampleService.run",
+				parentSymbolName: "ExampleService",
+				parentChunkFingerprint: "parent-fp",
+				content: "run() {}",
+				contentHash: "child-content-hash",
+				state: "upserted",
+			},
+		])
+		await store.markRevisionCommitted(revision.revisionId)
+
+		const results = await store.getActiveChunksByFingerprints([
+			{
+				relativePath: "src/example.ts",
+				chunkFingerprint: "parent-fp",
+			},
+		])
+
+		expect(results).toHaveLength(1)
+		expect(results[0]?.relativePath).toBe("src/example.ts")
+		expect(results[0]?.chunkFingerprint).toBe("parent-fp")
+		expect(results[0]?.symbolQualifiedName).toBe("ExampleService")
+
+		await store.dispose()
+	})
+
+	it("searches active chunks lexically across path and symbol metadata", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const runId = await store.beginRun("initial-discovery")
+		const file = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/auth/validate.ts",
+			normalizedPath: path.join(workspacePath, "src/auth/validate.ts"),
+			lastSeenMtimeMs: 123,
+			lastSeenSize: 456,
+			ignoreState: "included",
+		})
+		const revision = await store.createFileRevision({
+			fileId: file.fileId,
+			runId,
+			contentHash: "content-hash",
+			fastFingerprint: "456:123",
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+			state: "parsed",
+		})
+		await store.upsertChunks([
+			{
+				revisionId: revision.revisionId,
+				chunkFingerprint: "chunk-fp",
+				startLine: 10,
+				endLine: 20,
+				language: "ts",
+				chunkKind: "function",
+				symbolName: "validateToken",
+				symbolQualifiedName: "Auth.validateToken",
+				parentSymbolName: "Auth",
+				summary: "ts function validateToken in Auth at src/auth/validate.ts:10-20",
+				searchText: "Path: src/auth/validate.ts\nSymbol: validateToken\nParent: Auth",
+				content: "export function validateToken() {}",
+				contentHash: "chunk-content-hash",
+				state: "upserted",
+			},
+		])
+		await store.markRevisionCommitted(revision.revisionId)
+
+		const results = await store.searchActiveChunksLexically("validateToken", 5)
+
+		expect(results).toHaveLength(1)
+		expect(results[0]?.relativePath).toBe("src/auth/validate.ts")
+		expect(results[0]?.symbolQualifiedName).toBe("Auth.validateToken")
+		expect(results[0]?.lexicalScore).toBeGreaterThan(0)
 
 		await store.dispose()
 	})
@@ -166,6 +376,58 @@ describe("MetadataStore integration", () => {
 
 		const reusableRevision = await store.findReusableRevision(file.fileId, "reuse-content-hash", "99:55")
 		expect(reusableRevision?.revisionId).toBe(revision.revisionId)
+
+		await store.dispose()
+	})
+
+	it("boosts lexical matches for exact filename-style queries", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-filename-query") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-filename-query")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const runId = await store.beginRun("filename-query")
+		const file = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/services/code-index-v2/store/schema.ts",
+			normalizedPath: path.join(workspacePath, "src/services/code-index-v2/store/schema.ts"),
+			lastSeenMtimeMs: 321,
+			lastSeenSize: 654,
+			ignoreState: "included",
+		})
+		const revision = await store.createFileRevision({
+			fileId: file.fileId,
+			runId,
+			contentHash: "schema-content-hash",
+			fastFingerprint: "654:321",
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+			state: "parsed",
+		})
+		await store.upsertChunks([
+			{
+				revisionId: revision.revisionId,
+				chunkFingerprint: "schema-fp",
+				startLine: 1,
+				endLine: 10,
+				language: "ts",
+				chunkKind: "module",
+				summary: "schema definitions for code index tables",
+				searchText: "CREATE TABLE chunk_variants",
+				content: "CREATE TABLE IF NOT EXISTS chunk_variants (...)",
+				contentHash: "schema-chunk-content-hash",
+				state: "upserted",
+			},
+		])
+		await store.markRevisionCommitted(revision.revisionId)
+
+		const results = await store.searchActiveChunksLexically("schema.ts CREATE TABLE chunk_variants", 5)
+
+		expect(results[0]?.relativePath).toBe("src/services/code-index-v2/store/schema.ts")
+		expect(results[0]?.lexicalScore).toBeGreaterThan(0)
 
 		await store.dispose()
 	})
@@ -425,6 +687,84 @@ describe("MetadataStore integration", () => {
 
 		const warningPaths = await store.listWarningRelativePaths(workspaceId, "all")
 		expect(warningPaths).toEqual(["src/warning-0.ts", "src/warning-1.ts", "src/warning-2.ts"])
+
+		await store.dispose()
+	})
+
+	it("persists and paginates tracked oversized files", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-6") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-6")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		await store.replaceTrackedOversizedFiles(workspaceId, [
+			{
+				workspaceId,
+				relativePath: "src/huge-schema.sql",
+				normalizedPath: path.join(workspacePath, "src/huge-schema.sql"),
+				status: "skipped",
+				sizeBytes: 1_600_000,
+				lastModifiedMtimeMs: 1_700_000_000_000,
+				recommendation: "likely_useful",
+				reason: "Looks like schema, config, policy, or structured source data.",
+				sourceRunId: "run-1",
+			},
+			{
+				workspaceId,
+				relativePath: "dist/bundle.js",
+				normalizedPath: path.join(workspacePath, "dist/bundle.js"),
+				status: "approved",
+				sizeBytes: 1_300_000,
+				lastModifiedMtimeMs: 1_700_000_100_000,
+				recommendation: "probably_skip",
+				reason: "Looks like generated, bundled, or repetitive output.",
+				approvedMaxBytes: 1_600_000,
+				sourceRunId: "run-1",
+			},
+			{
+				workspaceId,
+				relativePath: "src/missing.proto",
+				normalizedPath: path.join(workspacePath, "src/missing.proto"),
+				status: "missing",
+				sizeBytes: 0,
+				lastModifiedMtimeMs: null,
+				recommendation: "likely_useful",
+				reason: "This tracked file is no longer present in the workspace.",
+				sourceRunId: "run-1",
+			},
+		])
+
+		const page = await store.listTrackedOversizedFiles(workspaceId, 2, 0)
+		expect(page.total).toBe(3)
+		expect(page.actionable).toBe(1)
+		expect(page.items).toHaveLength(2)
+		expect(page.items[0]?.relativePath).toBe("src/huge-schema.sql")
+		expect(page.items[1]?.status).toBe("approved")
+
+		const trackedPaths = await store.listTrackedOversizedRelativePaths(workspaceId)
+		expect(trackedPaths).toEqual(["dist/bundle.js", "src/huge-schema.sql", "src/missing.proto"])
+
+		await store.replaceTrackedOversizedFiles(workspaceId, [
+			{
+				workspaceId,
+				relativePath: "src/huge-schema.sql",
+				normalizedPath: path.join(workspacePath, "src/huge-schema.sql"),
+				status: "eligible",
+				sizeBytes: 800_000,
+				lastModifiedMtimeMs: 1_700_000_200_000,
+				recommendation: "likely_useful",
+				reason: "This file is now within the current size limit and can be indexed without an oversized override.",
+				sourceRunId: "run-2",
+			},
+		])
+
+		const refreshed = await store.listTrackedOversizedFiles(workspaceId, 10, 0)
+		expect(refreshed.total).toBe(1)
+		expect(refreshed.actionable).toBe(0)
+		expect(refreshed.items[0]?.status).toBe("eligible")
 
 		await store.dispose()
 	})

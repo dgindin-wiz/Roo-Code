@@ -21,6 +21,7 @@ export const CODEBASE_INDEX_DEFAULTS = {
 export const codebaseIndexConfigSchema = z.object({
 	codebaseIndexEnabled: z.boolean().optional(),
 	codebaseIndexQdrantUrl: z.string().optional(),
+	codebaseIndexMaxFileSizeMb: z.number().min(1).max(100).optional(),
 	codebaseIndexEmbedderProvider: z
 		.enum([
 			"openai",
@@ -56,6 +57,17 @@ export const codebaseIndexConfigSchema = z.object({
 	codebaseIndexBedrockProfile: z.string().optional(),
 	// OpenRouter specific fields
 	codebaseIndexOpenRouterSpecificProvider: z.string().optional(),
+	codebaseIndexOversizedFileApprovals: z
+		.array(
+			z.object({
+				workspacePath: z.string(),
+				relativePath: z.string(),
+				sizeAtApprovalBytes: z.number().int().positive(),
+				approvedMaxBytes: z.number().int().positive(),
+				approvedAt: z.number().int().positive(),
+			}),
+		)
+		.optional(),
 })
 
 export type CodebaseIndexConfig = z.infer<typeof codebaseIndexConfigSchema>

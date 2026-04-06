@@ -6,6 +6,7 @@ import * as path from "path"
 const { mockCodeIndexEngineV2, MockedCodeIndexEngineV2Class } = vi.hoisted(() => {
 	const engine = {
 		start: vi.fn().mockResolvedValue(undefined),
+		refreshAll: vi.fn().mockResolvedValue(undefined),
 		stop: vi.fn().mockResolvedValue(undefined),
 		clear: vi.fn().mockResolvedValue(undefined),
 		search: vi.fn().mockResolvedValue([]),
@@ -71,6 +72,26 @@ vi.mock("vscode", () => {
 				onDidChange: vi.fn().mockReturnValue({ dispose: vi.fn() }),
 				onDidDelete: vi.fn().mockReturnValue({ dispose: vi.fn() }),
 				dispose: vi.fn(),
+			}),
+			getConfiguration: vi.fn().mockReturnValue({
+				get: vi.fn((key: string, defaultValue: unknown) => {
+					if (key === "codeIndex.respectGitIgnore") {
+						return true
+					}
+					if (key === "codeIndex.embeddingLaneConcurrency") {
+						return 2
+					}
+					if (key === "codeIndex.embeddingBatchSize") {
+						return 60
+					}
+					if (key === "codeIndex.maxFiles") {
+						return 100000
+					}
+					if (key === "codeIndex.debugLogging") {
+						return false
+					}
+					return defaultValue
+				}),
 			}),
 			getWorkspaceFolder: vi.fn(),
 		},
@@ -158,6 +179,7 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 		CodeIndexManager.disposeAll()
 		vi.clearAllMocks()
 		mockCodeIndexEngineV2.start.mockResolvedValue(undefined)
+		mockCodeIndexEngineV2.refreshAll.mockResolvedValue(undefined)
 		mockCodeIndexEngineV2.stop.mockResolvedValue(undefined)
 		mockCodeIndexEngineV2.clear.mockResolvedValue(undefined)
 		mockCodeIndexEngineV2.search.mockResolvedValue([])
@@ -1079,6 +1101,53 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			expect(mockOrchestrator.stopIndexing).toHaveBeenCalled()
 			expect(mockOrchestrator.clearIndexData).toHaveBeenCalled()
 			expect(mockCacheManager.clearCacheFile).toHaveBeenCalled()
+		})
+	})
+
+	describe("refreshAllIndexData", () => {
+		it("delegates to the V2 engine refresh path", async () => {
+			const manager = CodeIndexManager.getInstance(mockContext as any, testWorkspacePath)!
+			vi.spyOn(manager, "selectedEngine", "get").mockReturnValue("v2" as any)
+			const mockContextProxy = {
+				getGlobalState: vi.fn((key: string) =>
+					key === "codebaseIndexConfig"
+						? {
+								codebaseIndexEnabled: true,
+								codebaseIndexQdrantUrl: "http://localhost:6333",
+								codebaseIndexEmbedderProvider: "openai",
+								codebaseIndexEmbedderModelId: "text-embedding-3-small",
+							}
+						: undefined,
+				),
+				getSecret: vi.fn((key: string) => (key === "codeIndexOpenAiKey" ? "test-openai-key" : undefined)),
+				refreshSecrets: vi.fn().mockResolvedValue(undefined),
+				setValue: vi.fn(),
+			} as any
+
+			await manager.initialize(mockContextProxy)
+			await manager.refreshAllIndexData()
+
+			expect(mockCodeIndexEngineV2.refreshAll).toHaveBeenCalledTimes(1)
+			expect(mockCodeIndexEngineV2.clear).not.toHaveBeenCalled()
+		})
+
+		it("initializes before refreshing when V2 is not yet initialized", async () => {
+			const manager = CodeIndexManager.getInstance(mockContext as any, testWorkspacePath)!
+			vi.spyOn(manager, "selectedEngine", "get").mockReturnValue("v2" as any)
+			;(manager as any)._contextProxy = {} as any
+			const initializeSpy = vi.spyOn(manager, "initialize").mockImplementation(async () => {
+				;(manager as any)._configManager = {
+					isFeatureEnabled: true,
+					isFeatureConfigured: true,
+				}
+				;(manager as any)._engineV2 = mockCodeIndexEngineV2
+				return { requiresRestart: false }
+			})
+
+			await manager.refreshAllIndexData()
+
+			expect(initializeSpy).toHaveBeenCalledTimes(1)
+			expect(mockCodeIndexEngineV2.refreshAll).toHaveBeenCalledTimes(1)
 		})
 	})
 

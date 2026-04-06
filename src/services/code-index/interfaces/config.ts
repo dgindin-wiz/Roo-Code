@@ -19,6 +19,14 @@ export interface CodeIndexConfig {
 	openRouterOptions?: { apiKey: string; specificProvider?: string }
 	qdrantUrl?: string
 	qdrantApiKey?: string
+	maxFileSizeBytes?: number
+	oversizedFileApprovals?: Array<{
+		workspacePath: string
+		relativePath: string
+		sizeAtApprovalBytes: number
+		approvedMaxBytes: number
+		approvedAt: number
+	}>
 	searchMinScore?: number
 	searchMaxResults?: number
 	respectGitIgnore?: boolean
@@ -47,6 +55,8 @@ export type PreviousConfigSnapshot = {
 	openRouterSpecificProvider?: string
 	qdrantUrl?: string
 	qdrantApiKey?: string
+	maxFileSizeBytes?: number
+	oversizedFileApprovalsJson?: string
 	respectGitIgnore?: boolean
 	embeddingLaneConcurrency?: number
 }

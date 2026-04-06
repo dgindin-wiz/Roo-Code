@@ -1,6 +1,7 @@
 import { readFile, stat } from "fs/promises"
 import { createHash } from "crypto"
 import * as path from "path"
+import * as yaml from "yaml"
 import { Node } from "web-tree-sitter"
 import { LanguageParser, loadRequiredLanguageParsers } from "../../tree-sitter/languageParser"
 import { parseMarkdown } from "../../tree-sitter/markdownParser"
@@ -38,6 +39,7 @@ export class CodeParser implements ICodeParser {
 		options?: {
 			content?: string
 			fileHash?: string
+			maxFileSizeBytes?: number
 		},
 	): Promise<CodeBlock[]> {
 		// Get file extension
@@ -52,6 +54,8 @@ export class CodeParser implements ICodeParser {
 		let content: string
 		let fileHash: string
 
+		const maxFileSizeBytes = options?.maxFileSizeBytes ?? MAX_PARSEABLE_FILE_SIZE_BYTES
+
 		if (options?.content) {
 			content = options.content
 			fileHash = options.fileHash || this.createFileHash(content)
@@ -61,9 +65,9 @@ export class CodeParser implements ICodeParser {
 				// Both scanner and file-watcher already guard size, but the parser
 				// can be called directly.
 				const fileStat = await stat(filePath)
-				if (fileStat.size > MAX_PARSEABLE_FILE_SIZE_BYTES) {
+				if (fileStat.size > maxFileSizeBytes) {
 					console.warn(
-						`[CodeParser] Skipping file too large for parsing: ${filePath} (${fileStat.size} bytes, limit ${MAX_PARSEABLE_FILE_SIZE_BYTES})`,
+						`[CodeParser] Skipping file too large for parsing: ${filePath} (${fileStat.size} bytes, limit ${maxFileSizeBytes})`,
 					)
 					return []
 				}
@@ -81,9 +85,9 @@ export class CodeParser implements ICodeParser {
 		}
 
 		const contentBytes = Buffer.byteLength(content, "utf8")
-		if (contentBytes > MAX_PARSEABLE_FILE_SIZE_BYTES) {
+		if (contentBytes > maxFileSizeBytes) {
 			console.warn(
-				`[CodeParser] Skipping file too large for parsing: ${filePath} (${contentBytes} bytes, limit ${MAX_PARSEABLE_FILE_SIZE_BYTES})`,
+				`[CodeParser] Skipping file too large for parsing: ${filePath} (${contentBytes} bytes, limit ${maxFileSizeBytes})`,
 			)
 			return []
 		}
@@ -150,6 +154,20 @@ export class CodeParser implements ICodeParser {
 		// Handle markdown files specially
 		if (ext === "md" || ext === "markdown") {
 			return this.parseMarkdownContent(filePath, content, fileHash, seenSegmentHashes)
+		}
+
+		// Handle structured config files specially
+		if (ext === "json" || ext === "yaml" || ext === "yml" || ext === "toml") {
+			const structuredBlocks = this.parseStructuredConfigContent(
+				filePath,
+				content,
+				fileHash,
+				seenSegmentHashes,
+				ext,
+			)
+			if (structuredBlocks.length > 0) {
+				return structuredBlocks
+			}
 		}
 
 		// Check if this extension should use fallback chunking
@@ -246,10 +264,8 @@ export class CodeParser implements ICodeParser {
 					}
 				} else {
 					// Node meets min chars and is within max chars, create a block
-					const identifier =
-						currentNode.childForFieldName("name")?.text ||
-						currentNode.children.find((c) => c?.type === "identifier")?.text ||
-						null
+					const identifier = this.getNodeIdentifier(currentNode)
+					const parentSymbol = this.findParentSymbol(filePath, currentNode)
 					const type = currentNode.type
 					const start_line = currentNode.startPosition.row + 1
 					const end_line = currentNode.endPosition.row + 1
@@ -264,6 +280,8 @@ export class CodeParser implements ICodeParser {
 						results.push({
 							file_path: filePath,
 							identifier,
+							parentIdentifier: parentSymbol?.identifier ?? null,
+							parentChunkFingerprint: parentSymbol?.chunkFingerprint ?? null,
 							type,
 							start_line,
 							end_line,
@@ -290,6 +308,9 @@ export class CodeParser implements ICodeParser {
 		chunkType: string,
 		seenSegmentHashes: Set<string>,
 		baseStartLine: number = 1, // 1-based start line of the *first* line in the `lines` array
+		identifier: string | null = null,
+		parentIdentifier: string | null = null,
+		parentChunkFingerprint: string | null = null,
 	): CodeBlock[] {
 		const chunks: CodeBlock[] = []
 		let currentChunkLines: string[] = []
@@ -311,7 +332,9 @@ export class CodeParser implements ICodeParser {
 					seenSegmentHashes.add(segmentHash)
 					chunks.push({
 						file_path: filePath,
-						identifier: null,
+						identifier,
+						parentIdentifier,
+						parentChunkFingerprint,
 						type: chunkType,
 						start_line: startLine,
 						end_line: endLine,
@@ -338,7 +361,9 @@ export class CodeParser implements ICodeParser {
 				seenSegmentHashes.add(segmentHash)
 				chunks.push({
 					file_path: filePath,
-					identifier: null,
+					identifier,
+					parentIdentifier,
+					parentChunkFingerprint,
 					type: `${chunkType}_segment`,
 					start_line: originalLineNumber,
 					end_line: originalLineNumber,
@@ -446,6 +471,8 @@ export class CodeParser implements ICodeParser {
 	): CodeBlock[] {
 		const lines = node.text.split("\n")
 		const baseStartLine = node.startPosition.row + 1
+		const identifier = this.getNodeIdentifier(node)
+		const parentSymbol = this.findParentSymbol(filePath, node)
 		return this._chunkTextByLines(
 			lines,
 			filePath,
@@ -453,6 +480,9 @@ export class CodeParser implements ICodeParser {
 			node.type, // Use the node's type
 			seenSegmentHashes,
 			baseStartLine,
+			identifier,
+			parentSymbol?.identifier ?? null,
+			parentSymbol?.chunkFingerprint ?? null,
 		)
 	}
 
@@ -504,6 +534,8 @@ export class CodeParser implements ICodeParser {
 				{
 					file_path: filePath,
 					identifier,
+					parentIdentifier: null,
+					parentChunkFingerprint: null,
 					type,
 					start_line: startLine,
 					end_line: endLine,
@@ -598,6 +630,240 @@ export class CodeParser implements ICodeParser {
 		}
 
 		return results
+	}
+
+	private parseStructuredConfigContent(
+		filePath: string,
+		content: string,
+		fileHash: string,
+		seenSegmentHashes: Set<string>,
+		ext: string,
+	): CodeBlock[] {
+		const lines = content.split("\n")
+		switch (ext) {
+			case "json":
+				return this.parseJsonContent(filePath, content, fileHash, seenSegmentHashes, lines)
+			case "yaml":
+			case "yml":
+				return this.parseYamlContent(filePath, content, fileHash, seenSegmentHashes, lines)
+			case "toml":
+				return this.parseTomlContent(filePath, content, fileHash, seenSegmentHashes, lines)
+			default:
+				return []
+		}
+	}
+
+	private parseJsonContent(
+		filePath: string,
+		content: string,
+		fileHash: string,
+		seenSegmentHashes: Set<string>,
+		lines: string[],
+	): CodeBlock[] {
+		let parsed: unknown
+		try {
+			parsed = JSON.parse(content)
+		} catch {
+			return []
+		}
+
+		if (Array.isArray(parsed)) {
+			const results: CodeBlock[] = []
+			for (let index = 0; index < parsed.length; index++) {
+				const item = parsed[index]
+				const itemText = JSON.stringify(item, null, 2)
+				if (!itemText) {
+					continue
+				}
+				const identifier = `[${index}]`
+				const startLine = this.findLineIndex(lines, new RegExp(`^\\s*\\{?\\s*$`), 1) || 1
+				const blocks = this.processStructuredSection(
+					filePath,
+					fileHash,
+					seenSegmentHashes,
+					itemText,
+					startLine,
+					`json_array_item`,
+					identifier,
+				)
+				results.push(...blocks)
+			}
+			return results
+		}
+
+		if (!parsed || typeof parsed !== "object") {
+			return []
+		}
+
+		const results: CodeBlock[] = []
+		for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+			const itemText = JSON.stringify({ [key]: value }, null, 2)
+			const startLine = this.findLineIndex(lines, new RegExp(`^\\s*"${this.escapeRegex(key)}"\\s*:`), 1) || 1
+			results.push(
+				...this.processStructuredSection(
+					filePath,
+					fileHash,
+					seenSegmentHashes,
+					itemText,
+					startLine,
+					"json_key",
+					key,
+				),
+			)
+		}
+		return results
+	}
+
+	private parseYamlContent(
+		filePath: string,
+		content: string,
+		fileHash: string,
+		seenSegmentHashes: Set<string>,
+		lines: string[],
+	): CodeBlock[] {
+		try {
+			yaml.parse(content)
+		} catch {
+			return []
+		}
+
+		const topLevelKeyIndices = lines
+			.map((line, index) => {
+				const match = line.match(/^([A-Za-z0-9_.-]+)\s*:/)
+				return match ? { key: match[1], index } : null
+			})
+			.filter((entry): entry is { key: string; index: number } => entry !== null)
+
+		const results: CodeBlock[] = []
+		for (let i = 0; i < topLevelKeyIndices.length; i++) {
+			const current = topLevelKeyIndices[i]
+			const next = topLevelKeyIndices[i + 1]
+			const sectionLines = lines.slice(current.index, next?.index ?? lines.length)
+			results.push(
+				...this.processStructuredSection(
+					filePath,
+					fileHash,
+					seenSegmentHashes,
+					sectionLines.join("\n"),
+					current.index + 1,
+					"yaml_key",
+					current.key,
+				),
+			)
+		}
+
+		return results
+	}
+
+	private parseTomlContent(
+		filePath: string,
+		content: string,
+		fileHash: string,
+		seenSegmentHashes: Set<string>,
+		lines: string[],
+	): CodeBlock[] {
+		const sectionIndices = lines
+			.map((line, index) => {
+				const match = line.match(/^\s*\[([^\]]+)\]\s*$/)
+				return match ? { key: match[1], index } : null
+			})
+			.filter((entry): entry is { key: string; index: number } => entry !== null)
+
+		const results: CodeBlock[] = []
+		for (let i = 0; i < sectionIndices.length; i++) {
+			const current = sectionIndices[i]
+			const next = sectionIndices[i + 1]
+			const sectionLines = lines.slice(current.index, next?.index ?? lines.length)
+			results.push(
+				...this.processStructuredSection(
+					filePath,
+					fileHash,
+					seenSegmentHashes,
+					sectionLines.join("\n"),
+					current.index + 1,
+					"toml_table",
+					current.key,
+				),
+			)
+		}
+
+		if (results.length === 0) {
+			const rootLines = lines.filter((line) => line.trim().length > 0)
+			return this.processStructuredSection(
+				filePath,
+				fileHash,
+				seenSegmentHashes,
+				rootLines.join("\n"),
+				1,
+				"toml_content",
+				null,
+			)
+		}
+
+		return results
+	}
+
+	private processStructuredSection(
+		filePath: string,
+		fileHash: string,
+		seenSegmentHashes: Set<string>,
+		content: string,
+		startLine: number,
+		type: string,
+		identifier: string | null,
+	): CodeBlock[] {
+		const normalizedContent = content.trim()
+		if (normalizedContent.length < MIN_BLOCK_CHARS) {
+			return []
+		}
+
+		const lines = normalizedContent.split("\n")
+		return this.processMarkdownSection(lines, filePath, fileHash, type, seenSegmentHashes, startLine, identifier)
+	}
+
+	private findLineIndex(lines: string[], pattern: RegExp, fallbackLine: number): number {
+		const index = lines.findIndex((line) => pattern.test(line))
+		return index >= 0 ? index + 1 : fallbackLine
+	}
+
+	private escapeRegex(value: string): string {
+		return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+	}
+
+	private getNodeIdentifier(node: Node | null | undefined): string | null {
+		if (!node) {
+			return null
+		}
+		return (
+			node.childForFieldName?.("name")?.text || node.children?.find((c) => c?.type === "identifier")?.text || null
+		)
+	}
+
+	private findParentSymbol(
+		filePath: string,
+		node: Node | null | undefined,
+	): { identifier: string; chunkFingerprint: string } | null {
+		let current = node?.parent
+		while (current) {
+			const identifier = this.getNodeIdentifier(current)
+			if (identifier) {
+				return {
+					identifier,
+					chunkFingerprint: this.createNodeSegmentHash(filePath, current, current.text || ""),
+				}
+			}
+			current = current.parent
+		}
+		return null
+	}
+
+	private createNodeSegmentHash(filePath: string, node: Node, content: string): string {
+		const startLine = node.startPosition?.row !== undefined ? node.startPosition.row + 1 : 0
+		const endLine = node.endPosition?.row !== undefined ? node.endPosition.row + 1 : startLine
+		const contentPreview = content.slice(0, 100)
+		return createHash("sha256")
+			.update(`${filePath}-${startLine}-${endLine}-${content.length}-${contentPreview}`)
+			.digest("hex")
 	}
 }
 

@@ -61,6 +61,14 @@ CREATE TABLE IF NOT EXISTS chunks (
   chunk_fingerprint TEXT NOT NULL,
   start_line INTEGER NOT NULL,
   end_line INTEGER NOT NULL,
+  language TEXT,
+  chunk_kind TEXT,
+  symbol_name TEXT,
+  symbol_qualified_name TEXT,
+  parent_symbol_name TEXT,
+  parent_chunk_fingerprint TEXT,
+  summary TEXT,
+  search_text TEXT,
   content TEXT NOT NULL DEFAULT '',
   content_hash TEXT NOT NULL,
   token_estimate INTEGER,
@@ -69,6 +77,36 @@ CREATE TABLE IF NOT EXISTS chunks (
   state TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chunk_variants (
+  variant_id TEXT PRIMARY KEY,
+  chunk_id TEXT NOT NULL,
+  variant_type TEXT NOT NULL,
+  content TEXT NOT NULL DEFAULT '',
+  content_hash TEXT NOT NULL,
+  token_estimate INTEGER,
+  embedding_model TEXT,
+  vector_point_id TEXT,
+  state TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(chunk_id, variant_type)
+);
+
+CREATE TABLE IF NOT EXISTS oversized_file_tracking (
+  workspace_id TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  normalized_path TEXT NOT NULL,
+  status TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  last_modified_mtime_ms INTEGER,
+  recommendation TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  approved_max_bytes INTEGER,
+  source_run_id TEXT,
+  last_evaluated_at INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, relative_path)
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -109,6 +147,8 @@ CREATE TABLE IF NOT EXISTS reconciliation_runs (
 CREATE INDEX IF NOT EXISTS idx_files_workspace_path ON files(workspace_id, relative_path);
 CREATE INDEX IF NOT EXISTS idx_revisions_file_state ON file_revisions(file_id, state);
 CREATE INDEX IF NOT EXISTS idx_chunks_revision_state ON chunks(revision_id, state);
+CREATE INDEX IF NOT EXISTS idx_chunk_variants_chunk_state ON chunk_variants(chunk_id, state);
+CREATE INDEX IF NOT EXISTS idx_oversized_tracking_workspace_status ON oversized_file_tracking(workspace_id, status, last_evaluated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_state_next_attempt ON jobs(state, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_watch_events_workspace_observed ON watch_events(workspace_id, observed_at);
 `

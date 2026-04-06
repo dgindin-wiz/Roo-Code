@@ -22,12 +22,14 @@ describe("EmbedUpsertWorker", () => {
 		const metadataStore = {
 			claimJobs: vi.fn(),
 			getChunksByIds: vi.fn(),
+			getChunkVariantsByChunkIds: vi.fn().mockResolvedValue([]),
 			completeJob: vi.fn().mockResolvedValue(undefined),
 			completeJobs: vi.fn().mockResolvedValue(undefined),
 			failJob: vi.fn().mockResolvedValue(undefined),
 			markJobTerminalFailed: vi.fn().mockResolvedValue(undefined),
 			markChunkState: vi.fn().mockResolvedValue(undefined),
 			markChunkStates: vi.fn().mockResolvedValue(undefined),
+			markChunkVariantStates: vi.fn().mockResolvedValue(undefined),
 			getNextRetryAt: vi.fn(),
 			getRevisionsByState: vi.fn(),
 			getWorkspaceId: vi.fn().mockReturnValue("workspace-1"),
@@ -155,6 +157,120 @@ describe("EmbedUpsertWorker", () => {
 		expect(summary.committedRevisions).toBe(1)
 		expect(summary.laneConcurrency).toBe(2)
 		expect(summary.peakInFlightChunkCount).toBeGreaterThanOrEqual(1)
+	})
+
+	it("embeds the primary rich raw-code variant plus symbol variants while keeping chunk-level job semantics", async () => {
+		const { metadataStore, embeddingAdapter, vectorStore } = createWorkerDeps()
+		const now = Date.now()
+		const job = {
+			jobId: "job-1",
+			workspaceId: "workspace-1",
+			runId: "run-1",
+			jobType: "upsert",
+			entityId: "chunk-1",
+			state: "running" as const,
+			priority: 100,
+			attemptCount: 1,
+			nextAttemptAt: now,
+			lastError: null,
+			createdAt: now,
+			updatedAt: now,
+		}
+		const chunk = {
+			chunkId: "chunk-1",
+			revisionId: "revision-1",
+			chunkFingerprint: "fp-1",
+			startLine: 10,
+			endLine: 18,
+			content: "export function validateToken(token: string) { return token.length > 0 }",
+			contentHash: "hash-1",
+			tokenEstimate: 20,
+			embeddingModel: null,
+			vectorPointId: null,
+			state: "parsed" as const,
+			createdAt: now,
+			updatedAt: now,
+			fileId: "file-1",
+			workspaceId: "workspace-1",
+			relativePath: "src/auth.ts",
+			normalizedPath: "/workspace/src/auth.ts",
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+			chunkKind: "function",
+			symbolName: "validateToken",
+			symbolQualifiedName: "Auth.validateToken",
+			parentSymbolName: "Auth",
+			parentChunkFingerprint: null,
+			language: "ts",
+			summary: "ts function validateToken in Auth at src/auth.ts:10-18",
+			searchText:
+				"Path: src/auth.ts\nSymbol: validateToken\nParent: Auth\n\nexport function validateToken(token: string) { return token.length > 0 }",
+		}
+		metadataStore.claimJobs.mockImplementation(async (jobType: string) => {
+			if (jobType === "delete") {
+				return []
+			}
+			return metadataStore.claimJobs.mock.calls.filter(([type]) => type === "upsert").length === 1 ? [job] : []
+		})
+		metadataStore.getChunksByIds.mockResolvedValue([chunk])
+		metadataStore.getChunkVariantsByChunkIds.mockResolvedValue([
+			{
+				variantId: "variant-raw",
+				chunkId: "chunk-1",
+				variantType: "raw_code",
+				content: chunk.searchText,
+				contentHash: "hash-raw",
+				tokenEstimate: 20,
+				embeddingModel: null,
+				vectorPointId: null,
+				state: "parsed" as const,
+				createdAt: now,
+				updatedAt: now,
+			},
+		])
+		metadataStore.getNextRetryAt.mockResolvedValue(undefined)
+		metadataStore.getRevisionsByState.mockResolvedValue([
+			{ revisionId: "revision-1", fileId: "file-1", runId: "run-1" },
+		])
+		metadataStore.getRevisionJobResolution.mockResolvedValue({
+			doneJobs: 1,
+			queuedJobs: 0,
+			runningJobs: 0,
+			terminalFailedJobs: 0,
+			totalJobs: 1,
+		})
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
+		embeddingAdapter.createEmbeddings.mockResolvedValue({
+			embeddings: [
+				[0.1, 0.2, 0.3],
+				[0.4, 0.5, 0.6],
+			],
+		})
+
+		const worker = new EmbedUpsertWorker(metadataStore as any, embeddingAdapter as any, vectorStore as any)
+		const summary = await worker.run("run-1")
+
+		expect(embeddingAdapter.createEmbeddings).toHaveBeenCalledWith(
+			[
+				"Path: src/auth.ts\nSymbol: validateToken\nParent: Auth\n\nexport function validateToken(token: string) { return token.length > 0 }",
+			],
+			expect.any(Object),
+		)
+		expect(vectorStore.upsertPoints).toHaveBeenCalledWith(
+			expect.arrayContaining([
+				expect.objectContaining({ payload: expect.objectContaining({ variantType: "raw_code" }) }),
+			]),
+		)
+		expect(metadataStore.markChunkVariantStates).toHaveBeenCalled()
+		expect(metadataStore.markChunkStates).toHaveBeenCalledWith(
+			expect.arrayContaining([
+				expect.objectContaining({
+					chunkId: "chunk-1",
+					vectorPointId: expect.any(String),
+				}),
+			]),
+		)
+		expect(summary.upsertedChunks).toBe(1)
 	})
 
 	it("isolates a permanently failing chunk so an unrelated chunk can still commit", async () => {

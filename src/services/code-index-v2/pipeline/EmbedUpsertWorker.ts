@@ -623,36 +623,66 @@ export class EmbedUpsertWorker {
 		}
 
 		try {
+			const variants = await this.metadataStore.getChunkVariantsByChunkIds(
+				jobPairs.map(({ chunk }) => chunk.chunkId),
+			)
+			const variantsByChunkId = new Map<string, typeof variants>()
+			for (const variant of variants) {
+				const group = variantsByChunkId.get(variant.chunkId) ?? []
+				group.push(variant)
+				variantsByChunkId.set(variant.chunkId, group)
+			}
+			const variantPairs = jobPairs.flatMap(({ job, chunk }) =>
+				this.getChunkVariantsForEmbedding(chunk, variantsByChunkId.get(chunk.chunkId) ?? []).map((variant) => ({
+					job,
+					chunk,
+					variant,
+				})),
+			)
+			if (variantPairs.length === 0) {
+				await this.metadataStore.completeJobs(jobPairs.map(({ job }) => job.jobId))
+				return
+			}
+
 			const batchStartedAt = Date.now()
 			const idleGapMs = Math.max(batchStartedAt - this.lastBatchCompletedAt, 0)
 			const embedStartedAt = Date.now()
 			const embeddingResponse = await this.embeddingAdapter.createEmbeddings(
-				jobPairs.map(({ chunk }) => chunk.content),
+				variantPairs.map(({ variant }) => variant.content),
 				{
 					signal,
 					debugContext: {
 						runId: jobPairs[0]?.job.runId,
-						batchId: `${jobPairs[0]?.job.runId ?? "run"}:${jobPairs[0]?.job.jobId ?? "job"}:${jobPairs.length}`,
-						outerBatchSize: jobPairs.length,
+						batchId: `${jobPairs[0]?.job.runId ?? "run"}:${jobPairs[0]?.job.jobId ?? "job"}:${variantPairs.length}`,
+						outerBatchSize: variantPairs.length,
 					},
 				},
 			)
 			const embedLatencyMs = Date.now() - embedStartedAt
 
-			const points = jobPairs.map(({ chunk }, index) =>
-				this.createPoint(chunk, embeddingResponse.embeddings[index] ?? []),
+			const points = variantPairs.map(({ chunk, variant }, index) =>
+				this.createPoint(chunk, variant, embeddingResponse.embeddings[index] ?? []),
 			)
 			const upsertStartedAt = Date.now()
 			await this.vectorStore.upsertPoints(points)
 			const upsertLatencyMs = Date.now() - upsertStartedAt
 
 			const metadataCommitStartedAt = Date.now()
+			await this.metadataStore.markChunkVariantStates(
+				variantPairs.map(({ variant, chunk }) => ({
+					variantId: variant.variantId,
+					state: "upserted" as const,
+					embeddingModel: this.embeddingAdapter.modelId,
+					vectorPointId: this.createPointId(chunk, variant.variantType),
+					clearContent: true,
+				})),
+			)
 			await this.metadataStore.markChunkStates(
 				jobPairs.map(({ chunk }) => ({
 					chunkId: chunk.chunkId,
 					state: "upserted" as const,
 					embeddingModel: this.embeddingAdapter.modelId,
-					vectorPointId: this.createPointId(chunk),
+					vectorPointId: this.createPointId(chunk, "raw_code"),
 					clearContent: true,
 				})),
 			)
@@ -764,18 +794,32 @@ export class EmbedUpsertWorker {
 			throw new Error("Embed/upsert worker aborted")
 		}
 
-		const pointIds = jobPairs
-			.map(({ chunk }) => chunk.vectorPointId)
+		const variants = await this.metadataStore.getChunkVariantsByChunkIds(jobPairs.map(({ chunk }) => chunk.chunkId))
+		const variantPointIds = variants
+			.map((variant) => variant.vectorPointId)
 			.filter((pointId): pointId is string => Boolean(pointId))
+		const deletePointIds =
+			variantPointIds.length > 0
+				? variantPointIds
+				: jobPairs
+						.map(({ chunk }) => chunk.vectorPointId)
+						.filter((pointId): pointId is string => Boolean(pointId))
 
 		try {
 			const batchStartedAt = Date.now()
 			const idleGapMs = Math.max(batchStartedAt - this.lastBatchCompletedAt, 0)
 			const upsertStartedAt = Date.now()
-			await this.vectorStore.deletePointsByIds(pointIds)
+			await this.vectorStore.deletePointsByIds(deletePointIds)
 			const upsertLatencyMs = Date.now() - upsertStartedAt
 
 			const metadataCommitStartedAt = Date.now()
+			await this.metadataStore.markChunkVariantStates(
+				variants.map((variant) => ({
+					variantId: variant.variantId,
+					state: "deleted" as const,
+					clearContent: true,
+				})),
+			)
 			await this.metadataStore.markChunkStates(
 				jobPairs.map(({ chunk }) => ({
 					chunkId: chunk.chunkId,
@@ -788,7 +832,7 @@ export class EmbedUpsertWorker {
 			this.lastBatchCompletedAt = Date.now()
 			this.completedBatchCount++
 
-			callbacks.onChunksDeleted(pointIds.length)
+			callbacks.onChunksDeleted(deletePointIds.length)
 			emitBatchProgress({
 				batchKind: "delete",
 				batchSize: jobPairs.length,
@@ -870,10 +914,18 @@ export class EmbedUpsertWorker {
 
 	private createPoint(
 		chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number],
+		variant:
+			| Awaited<ReturnType<MetadataStore["getChunkVariantsByChunkIds"]>>[number]
+			| {
+					variantId: string
+					chunkId: string
+					variantType: "raw_code"
+					content: string
+			  },
 		vector: number[],
 	): VectorPoint {
 		return {
-			id: this.createPointId(chunk),
+			id: this.createPointId(chunk, variant.variantType),
 			vector,
 			payload: {
 				workspaceId: chunk.workspaceId,
@@ -881,12 +933,21 @@ export class EmbedUpsertWorker {
 				relativePath: chunk.relativePath,
 				revisionId: chunk.revisionId,
 				chunkFingerprint: chunk.chunkFingerprint,
+				variantType: variant.variantType,
 				startLine: chunk.startLine,
 				endLine: chunk.endLine,
+				language: chunk.language ?? undefined,
+				chunkKind: chunk.chunkKind ?? undefined,
+				symbolName: chunk.symbolName ?? undefined,
+				symbolQualifiedName: chunk.symbolQualifiedName ?? undefined,
+				parentSymbolName: chunk.parentSymbolName ?? undefined,
+				parentChunkFingerprint: chunk.parentChunkFingerprint ?? undefined,
+				summary: chunk.summary ?? undefined,
 				modelId: this.embeddingAdapter.modelId,
 				parserVersion: chunk.parserVersion,
 				chunkerVersion: chunk.chunkerVersion,
 				codeChunk: chunk.content,
+				searchText: chunk.searchText ?? undefined,
 				filePath: chunk.relativePath,
 				pathSegments: chunk.relativePath
 					.split(/[\\/]/)
@@ -899,13 +960,43 @@ export class EmbedUpsertWorker {
 		}
 	}
 
-	private createPointId(chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number]): string {
+	private getChunkVariantsForEmbedding(
+		chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number],
+		variants: Awaited<ReturnType<MetadataStore["getChunkVariantsByChunkIds"]>>,
+	): Array<
+		| Awaited<ReturnType<MetadataStore["getChunkVariantsByChunkIds"]>>[number]
+		| {
+				variantId: string
+				chunkId: string
+				variantType: "raw_code"
+				content: string
+		  }
+	> {
+		if (variants.length > 0) {
+			return variants
+		}
+
+		return [
+			{
+				variantId: `legacy:${chunk.chunkId}`,
+				chunkId: chunk.chunkId,
+				variantType: "raw_code",
+				content: chunk.searchText || chunk.content,
+			},
+		]
+	}
+
+	private createPointId(
+		chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number],
+		variantType: "raw_code" | "summary" | "symbol_signature",
+	): string {
 		const seed = [
 			chunk.workspaceId,
 			chunk.relativePath,
 			chunk.revisionId,
 			chunk.parserVersion,
 			chunk.chunkFingerprint,
+			variantType,
 		].join(":")
 		const hex = createHash("sha256").update(seed).digest("hex").slice(0, 32).split("")
 		hex[12] = "5"

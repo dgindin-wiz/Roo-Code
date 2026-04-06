@@ -36,6 +36,15 @@ interface IndexingResilienceStats {
 	}>
 }
 
+type OversizedDetail = {
+	relativePath: string
+	sizeBytes: number
+	recommendation: "likely_useful" | "review_manually" | "probably_skip"
+	reason: string
+	needsReapproval?: boolean
+	approvedMaxBytes?: number
+}
+
 /**
  * Formats milliseconds into a human-readable ETA string.
  */
@@ -70,6 +79,7 @@ export class CodeIndexStateManager {
 	private _changedFiles: number = 0
 	private _unchangedFiles: number = 0
 	private _oversizedFiles: number = 0
+	private _oversizedDetails: OversizedDetail[] = []
 	private _missingFiles: number = 0
 	private _startingBlockCount: number = 0 // pre-existing blocks in Qdrant from a previous session
 	private _isEstimatedTotal: boolean = false
@@ -122,6 +132,7 @@ export class CodeIndexStateManager {
 			changedFiles: this._changedFiles,
 			unchangedFiles: this._unchangedFiles,
 			oversizedFiles: this._oversizedFiles,
+			oversizedDetails: this._oversizedDetails,
 			missingFiles: this._missingFiles,
 			estimatedTimeRemainingMs: this._estimatedTimeRemainingMs,
 			isEstimatedTotal: this._isEstimatedTotal,
@@ -517,6 +528,14 @@ export class CodeIndexStateManager {
 		})
 	}
 
+	public setOversizedDetails(details: OversizedDetail[]): void {
+		this._oversizedDetails = details
+		this._progressEmitter.fire(this.getCurrentStatus())
+		IndexDebugLogger.log("StateManager", "setOversizedDetails", {
+			count: details.length,
+		})
+	}
+
 	/**
 	 * Reports custom progress for non-legacy index engines while still using
 	 * the same progress payload shape the webview already understands.
@@ -703,6 +722,7 @@ export class CodeIndexStateManager {
 		this._changedFiles = 0
 		this._unchangedFiles = 0
 		this._oversizedFiles = 0
+		this._oversizedDetails = []
 		this._missingFiles = 0
 		this._startingBlockCount = 0
 		this._isEstimatedTotal = false

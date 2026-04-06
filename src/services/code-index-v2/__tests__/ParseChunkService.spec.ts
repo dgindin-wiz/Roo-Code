@@ -6,7 +6,32 @@ describe("ParseChunkService", () => {
 		const metadataStore = {
 			getWorkspaceId: vi.fn().mockReturnValue("workspace-1"),
 			getRevisionsByState: vi.fn(),
-			upsertChunks: vi.fn().mockResolvedValue(undefined),
+			upsertChunks: vi.fn().mockImplementation(async (chunks: any[]) =>
+				chunks.map((chunk, index) => ({
+					chunkId: `chunk-${index + 1}`,
+					revisionId: chunk.revisionId,
+					chunkFingerprint: chunk.chunkFingerprint,
+					startLine: chunk.startLine,
+					endLine: chunk.endLine,
+					language: chunk.language ?? null,
+					chunkKind: chunk.chunkKind ?? null,
+					symbolName: chunk.symbolName ?? null,
+					symbolQualifiedName: chunk.symbolQualifiedName ?? null,
+					parentSymbolName: chunk.parentSymbolName ?? null,
+					parentChunkFingerprint: chunk.parentChunkFingerprint ?? null,
+					summary: chunk.summary ?? null,
+					searchText: chunk.searchText ?? null,
+					content: chunk.content,
+					contentHash: chunk.contentHash,
+					tokenEstimate: chunk.tokenEstimate ?? null,
+					embeddingModel: null,
+					vectorPointId: null,
+					state: chunk.state,
+					createdAt: Date.now(),
+					updatedAt: Date.now(),
+				})),
+			),
+			upsertChunkVariants: vi.fn().mockResolvedValue([]),
 			markRevisionState: vi.fn().mockResolvedValue(undefined),
 			markRevisionTerminalFailure: vi.fn().mockResolvedValue(undefined),
 		}
@@ -57,6 +82,53 @@ describe("ParseChunkService", () => {
 		expect(summary.parsedChunks).toBe(1)
 		expect(summary.retryingRevisions).toBe(1)
 		expect(summary.terminalFailedRevisions).toBe(0)
+	})
+
+	it("creates a rich raw-code variant and symbol signature variant for structured chunks", async () => {
+		const { metadataStore, workspaceAdapter, parserAdapter } = createDeps()
+		metadataStore.getRevisionsByState.mockResolvedValue([
+			{
+				revisionId: "revision-1",
+				fileId: "file-1",
+				runId: "run-1",
+				normalizedPath: "/workspace/src/auth.ts",
+				relativePath: "src/auth.ts",
+			},
+		])
+		workspaceAdapter.readFile.mockResolvedValue("export function validateToken(token: string) {}")
+		parserAdapter.parseFile.mockResolvedValue([
+			{
+				chunkFingerprint: "fp-1",
+				startLine: 10,
+				endLine: 12,
+				content: "export function validateToken(token: string) {}",
+				searchText:
+					"Path: src/auth.ts\nLanguage: ts\nKind: function\nLines: 10-12\nSymbol: validateToken\nParent: Auth\n\nexport function validateToken(token: string) {}",
+				language: "ts",
+				chunkKind: "function",
+				symbolName: "validateToken",
+				symbolQualifiedName: "Auth.validateToken",
+				parentSymbolName: "Auth",
+				summary: "ts function validateToken in Auth at src/auth.ts:10-12",
+			},
+		])
+
+		const service = new ParseChunkService(metadataStore as any, workspaceAdapter as any, parserAdapter as any)
+		await service.run("run-1")
+
+		expect(metadataStore.upsertChunkVariants).toHaveBeenCalledWith(
+			expect.arrayContaining([
+				expect.objectContaining({
+					variantType: "raw_code",
+					content:
+						"Path: src/auth.ts\nLanguage: ts\nKind: function\nLines: 10-12\nSymbol: validateToken\nParent: Auth\n\nexport function validateToken(token: string) {}",
+				}),
+				expect.objectContaining({ variantType: "symbol_signature" }),
+			]),
+		)
+		expect(metadataStore.upsertChunkVariants).not.toHaveBeenCalledWith(
+			expect.arrayContaining([expect.objectContaining({ variantType: "summary" })]),
+		)
 	})
 
 	it("marks a revision terminal_failed after bounded parse retries and continues", async () => {

@@ -94,6 +94,19 @@ export default `
   name: (type_identifier) @name.definition.type
   type_parameters: (type_parameters)?) @definition.type
 
+; Top-level exported constants
+(program
+  (export_statement
+    declaration: (lexical_declaration
+      (variable_declarator
+        name: (identifier) @name.definition.constant) @definition.constant)))
+
+; Top-level module constants
+(program
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name.definition.constant) @definition.constant))
+
 ; Utility Types
 (type_alias_declaration
   name: (type_identifier) @name.definition.utility_type) @definition.utility_type

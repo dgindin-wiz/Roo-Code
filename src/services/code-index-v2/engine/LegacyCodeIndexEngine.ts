@@ -19,6 +19,10 @@ export class LegacyCodeIndexEngine implements ICodeIndexEngine {
 		await this.deps.startIndexing()
 	}
 
+	async refreshAll(): Promise<void> {
+		await this.deps.startIndexing()
+	}
+
 	async stop(): Promise<void> {
 		this.deps.stopIndexing()
 	}
@@ -64,6 +68,28 @@ export class LegacyCodeIndexEngine implements ICodeIndexEngine {
 	}> {
 		return {
 			total: 0,
+			items: [],
+		}
+	}
+
+	async getOversizedFileDetails(): Promise<{
+		total: number
+		actionable: number
+		items: Array<{
+			relativePath: string
+			normalizedPath: string
+			status: "skipped" | "needs_reapproval" | "approved" | "eligible" | "missing"
+			sizeBytes: number
+			lastModifiedMtimeMs: number | null
+			recommendation: "likely_useful" | "review_manually" | "probably_skip"
+			reason: string
+			approvedMaxBytes: number | null
+			lastEvaluatedAt: number
+		}>
+	}> {
+		return {
+			total: 0,
+			actionable: 0,
 			items: [],
 		}
 	}

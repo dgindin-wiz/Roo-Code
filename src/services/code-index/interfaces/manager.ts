@@ -38,6 +38,25 @@ export interface ICodeIndexManager {
 	 * Starts the indexing process
 	 */
 	startIndexing(): Promise<void>
+	refreshAllIndexData?(): Promise<void>
+	getOversizedFileDetails?(
+		offset: number,
+		limit: number,
+	): Promise<{
+		total: number
+		actionable: number
+		items: Array<{
+			relativePath: string
+			normalizedPath: string
+			status: "skipped" | "needs_reapproval" | "approved" | "eligible" | "missing"
+			sizeBytes: number
+			lastModifiedMtimeMs: number | null
+			recommendation: "likely_useful" | "review_manually" | "probably_skip"
+			reason: string
+			approvedMaxBytes: number | null
+			lastEvaluatedAt: number
+		}>
+	}>
 	retryIndexWarningFiles?(
 		filter: "all" | "parser_failed" | "failed" | "degraded",
 		relativePaths?: string[],
