@@ -87,6 +87,8 @@ interface MermaidBlockProps {
 	code: string
 }
 
+let hasLoggedMermaidLoad = false
+
 export default function MermaidBlock({ code }: MermaidBlockProps) {
 	const containerRef = useRef<HTMLDivElement>(null)
 	const [isLoading, setIsLoading] = useState(false)
@@ -97,6 +99,13 @@ export default function MermaidBlock({ code }: MermaidBlockProps) {
 
 	// 1) Whenever `code` changes, mark that we need to re-render a new chart
 	useEffect(() => {
+		if (!hasLoggedMermaidLoad) {
+			hasLoggedMermaidLoad = true
+			vscode.postMessage({
+				type: "webviewBootMarker" as any,
+				text: "mermaid-renderer-loaded",
+			})
+		}
 		setIsLoading(true)
 		setError(null)
 	}, [code])

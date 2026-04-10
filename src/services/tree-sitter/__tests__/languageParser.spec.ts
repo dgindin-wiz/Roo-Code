@@ -1,6 +1,7 @@
 // npx vitest services/tree-sitter/__tests__/languageParser.spec.ts
 
 import * as path from "path"
+import { describe, expect, it } from "vitest"
 import { loadRequiredLanguageParsers } from "../languageParser"
 
 // Path to the directory containing the WASM files.
@@ -47,6 +48,12 @@ describe("loadRequiredLanguageParsers", () => {
 		expect(parsers.kts).toBeDefined()
 		expect(parsers.kt.query).toBeDefined()
 		expect(parsers.kts.query).toBeDefined()
+	})
+
+	it("should resolve tree-sitter assets from a workers directory", async () => {
+		const files = ["test.py"]
+		const parsers = await loadRequiredLanguageParsers(files, path.join(process.cwd(), "dist", "workers"))
+		expect(parsers.py).toBeDefined()
 	})
 
 	it("should throw error for unsupported file extensions", async () => {

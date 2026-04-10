@@ -15,5 +15,6 @@
 	"roo-cline.codeIndex.maxFiles": 100000,
 	"roo-cline.codeIndex.embeddingBatchSize": 200,
 	"roo-cline.codeIndex.debugLogging": true,
-	"roo-cline.maximumIndexedFilesForFileSearch": 50000
+	"roo-cline.maximumIndexedFilesForFileSearch": 50000,
+	"roo-cline.codeIndex.embeddingLaneConcurrency": 2
 }

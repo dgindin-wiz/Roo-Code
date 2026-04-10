@@ -1,21 +1,25 @@
 /**
  * Source Map Initializer
  *
- * This utility ensures source maps are properly loaded in production builds.
- * It attempts to preload source maps for all scripts on the page and
- * sets up global error handlers to enhance errors with source maps.
- *
- * This implementation is compatible with VSCode's Content Security Policy.
+ * This utility can enable extra production debugging for the webview, but it is
+ * intentionally opt-in because preloading/fetching source maps is expensive in
+ * the VS Code webview runtime.
  */
 
-import { enhanceErrorWithSourceMaps } from "./sourceMapUtils"
+function isProductionSourceMapDebugEnabled(): boolean {
+	return process.env.NODE_ENV === "production" && process.env.PKG_ENABLE_WEBVIEW_SOURCE_MAPS === "true"
+}
+
+async function enhanceErrorWithSourceMaps(error: Error) {
+	const module = await import("./sourceMapUtils")
+	return module.enhanceErrorWithSourceMaps(error)
+}
 
 /**
  * Initialize source map support for production builds
  */
 export function initializeSourceMaps(): void {
-	if (process.env.NODE_ENV !== "production") {
-		// Only needed in production builds
+	if (!isProductionSourceMapDebugEnabled()) {
 		return
 	}
 
@@ -113,7 +117,7 @@ export function initializeSourceMaps(): void {
  * Expose source maps on the window object for debugging
  */
 export function exposeSourceMapsForDebugging(): void {
-	if (process.env.NODE_ENV !== "production") {
+	if (!isProductionSourceMapDebugEnabled()) {
 		return
 	}
 

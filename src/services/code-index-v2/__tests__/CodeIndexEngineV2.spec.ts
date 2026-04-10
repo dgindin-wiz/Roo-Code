@@ -1,5 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { CodeIndexEngineV2 } from "../engine/CodeIndexEngineV2"
+import { ExistingEmbedderAdapter } from "../adapters/ExistingEmbedderAdapter"
+import { QdrantRestVectorStoreAdapter } from "../adapters/QdrantRestVectorStoreAdapter"
+import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
+
+const createDeferred = <T>() => {
+	let resolve!: (value: T | PromiseLike<T>) => void
+	let reject!: (reason?: unknown) => void
+	const promise = new Promise<T>((innerResolve, innerReject) => {
+		resolve = innerResolve
+		reject = innerReject
+	})
+
+	return { promise, resolve, reject }
+}
 
 const mocks = vi.hoisted(() => {
 	const fsAccess = vi.fn().mockResolvedValue(undefined)
@@ -24,6 +38,8 @@ const mocks = vi.hoisted(() => {
 		countTrackedFilesForWorkspace: vi.fn().mockResolvedValue(10),
 		countActiveIndexedFilesForWorkspace: vi.fn().mockResolvedValue(3),
 		countActiveChunksForWorkspace: vi.fn().mockResolvedValue(24_439),
+		getDiscoveredFilesForWorkspace: vi.fn().mockResolvedValue([]),
+		getDiscoveredFilesByRelativePaths: vi.fn().mockResolvedValue([]),
 		listRevisionWarnings: vi.fn().mockResolvedValue({ total: 0, items: [] }),
 		listWarningRelativePaths: vi.fn().mockResolvedValue([]),
 		beginRun: vi.fn().mockResolvedValue("delete-run"),
@@ -33,9 +49,21 @@ const mocks = vi.hoisted(() => {
 		getChunksForRevision: vi.fn().mockResolvedValue([]),
 		getActiveChunksByFingerprints: vi.fn().mockResolvedValue([]),
 		getActiveChunksByRelativePaths: vi.fn().mockResolvedValue([]),
+		getRunBacklogMetrics: vi.fn(),
 		searchActiveChunksLexically: vi.fn().mockResolvedValue([]),
+		searchActiveChunksLexicallyWithStatus: vi.fn().mockResolvedValue({
+			results: [],
+			status: "completed",
+			mode: "fts_only",
+			timingsMs: {
+				ftsMs: 0,
+				fallbackMs: 0,
+				totalMs: 0,
+			},
+		}),
 		enqueueJobs: vi.fn().mockResolvedValue(undefined),
 		markFileTombstoned: vi.fn().mockResolvedValue(undefined),
+		excludeFilesFromIndexing: vi.fn().mockResolvedValue(undefined),
 		markRunComplete: vi.fn().mockResolvedValue(undefined),
 		markRunFailed: vi.fn().mockResolvedValue(undefined),
 		markRunStopped: vi.fn().mockResolvedValue(undefined),
@@ -100,6 +128,7 @@ const mocks = vi.hoisted(() => {
 			parsedChunks: 3,
 			parsedRevisionIds: ["revision-1"],
 		}),
+		dispose: vi.fn().mockResolvedValue(undefined),
 	}
 
 	const diffPlanner = {
@@ -118,6 +147,7 @@ const mocks = vi.hoisted(() => {
 			deletedChunks: 0,
 			committedRevisions: 1,
 		}),
+		dispose: vi.fn().mockResolvedValue(undefined),
 	}
 
 	const reconciliationService = {
@@ -174,9 +204,16 @@ const mocks = vi.hoisted(() => {
 
 	const stateManager = {
 		startIndexingTimer: vi.fn(),
+		beginPipelineRun: vi.fn(),
+		setPipelineSnapshot: vi.fn(),
+		setPipelineTerminalState: vi.fn(),
+		preserveCompletedPipelineSnapshot: vi.fn(),
 		reportCustomProgress: vi.fn(),
 		reportHeartbeat: vi.fn(),
 		setActivityDetail: vi.fn(),
+		getCurrentStatus: vi.fn().mockReturnValue({
+			estimatedTimeRemaining: null,
+		}),
 		setResilienceStats: vi.fn(),
 		setOversizedDetails: vi.fn(),
 		setRecoveryContext: vi.fn(),
@@ -257,6 +294,12 @@ vi.mock("../pipeline", () => ({
 	ParseChunkService: vi.fn(() => mocks.parseChunkService),
 	DiffPlanner: vi.fn(() => mocks.diffPlanner),
 	EmbedUpsertWorker: vi.fn(() => mocks.embedUpsertWorker),
+	SidecarParseExecutor: vi.fn(() => ({
+		dispose: vi.fn().mockResolvedValue(undefined),
+	})),
+	SidecarEmbedUpsertExecutor: vi.fn(() => ({
+		dispose: vi.fn().mockResolvedValue(undefined),
+	})),
 }))
 
 vi.mock("../reconciliation/ReconciliationService", () => ({
@@ -293,10 +336,35 @@ vi.mock("../logging/IndexDebugLoggerV2", () => ({
 			heapUsedMB: 128,
 			heapTotalMB: 256,
 		})),
+		getCpuSnapshot: vi.fn(() => ({
+			processPercent: 12,
+		})),
+		getTrackedProcessSummary: vi.fn(() => ({
+			totalTrackedRssMB: 96,
+			byGroup: {
+				parseSidecars: { totalRssMB: 48 },
+				embedSidecars: { totalRssMB: 48 },
+			},
+		})),
+		getBuildInfo: vi.fn(() => ({
+			version: "test-version",
+			buildTimestamp: "2026-04-10T00:00:00.000Z",
+			sha: "test-sha",
+		})),
 	},
 }))
 
 describe("CodeIndexEngineV2 smoke", () => {
+	const zeroBacklog = () => ({
+		parsedRevisions: 0,
+		plannedRevisions: 0,
+		stagedChunks: 0,
+		queuedUpsertJobs: 0,
+		runningUpsertJobs: 0,
+		queuedDeleteJobs: 0,
+		runningDeleteJobs: 0,
+	})
+
 	const mockContext = {
 		globalStorageUri: { fsPath: "/global-storage" },
 	} as any
@@ -305,6 +373,9 @@ describe("CodeIndexEngineV2 smoke", () => {
 		currentEmbedderProvider: "ollama",
 		currentModelId: "text-embedding-3-small",
 		currentModelDimension: 1536,
+		currentRespectGitIgnore: true,
+		currentIncludeDefaultIgnoredGeneratedPaths: false,
+		currentEmbeddingLaneConcurrency: 2,
 		currentSearchMinScore: 0.4,
 		currentMaxFileSizeBytes: 1024 * 1024,
 		getEffectiveMaxFileSizeBytes: vi.fn(() => 1024 * 1024),
@@ -321,6 +392,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 	beforeEach(() => {
 		vi.useFakeTimers()
 		vi.clearAllMocks()
+		vi.spyOn(CodeIndexEngineV2.prototype as any, "waitForPipelineTick").mockResolvedValue(undefined)
 		mocks.fsAccess.mockResolvedValue(undefined)
 
 		mocks.discoveryService.runInitialDiscovery.mockResolvedValue({
@@ -389,6 +461,27 @@ describe("CodeIndexEngineV2 smoke", () => {
 			deletedChunks: 0,
 			committedRevisions: 1,
 		})
+		mocks.metadataStore.getRunBacklogMetrics.mockReset()
+		mocks.metadataStore.getRunBacklogMetrics.mockImplementation(async () => {
+			if (mocks.embedUpsertWorker.run.mock.calls.length > 0) {
+				return zeroBacklog()
+			}
+			if (mocks.diffPlanner.run.mock.calls.length > 0) {
+				return {
+					...zeroBacklog(),
+					plannedRevisions: 1,
+					queuedUpsertJobs: 3,
+				}
+			}
+			if (mocks.parseChunkService.run.mock.calls.length > 0) {
+				return {
+					...zeroBacklog(),
+					parsedRevisions: 1,
+					stagedChunks: 3,
+				}
+			}
+			return zeroBacklog()
+		})
 		mocks.vectorStore.hasIndexedPoints.mockResolvedValue(true)
 		mocks.vectorStore.search.mockResolvedValue([
 			{
@@ -412,6 +505,11 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.metadataStore.initialize).toHaveBeenCalledTimes(1)
 		expect(mocks.metadataStore.cleanupStaleRuns).toHaveBeenCalledTimes(1)
 		expect(mocks.metadataStore.adoptRetryableJobsFromStaleRuns).toHaveBeenCalledWith("run-1", [])
+		const { VsCodeWorkspaceAdapter } = await import("../adapters/VsCodeWorkspaceAdapter")
+		expect(VsCodeWorkspaceAdapter).toHaveBeenCalledWith("/workspace", {
+			respectGitIgnore: true,
+			includeDefaultIgnoredGeneratedPaths: false,
+		})
 		expect(mocks.workspaceAdapter.initialize).toHaveBeenCalledTimes(1)
 		expect(mocks.vectorStore.initialize).toHaveBeenCalled()
 		expect(mocks.embeddingAdapter.createEmbeddings).toHaveBeenCalledWith(["preflight"], {
@@ -430,22 +528,29 @@ describe("CodeIndexEngineV2 smoke", () => {
 			"run-1",
 			expect.any(Object),
 			expect.any(Function),
-			{
+			expect.objectContaining({
 				limit: 20,
-			},
+				concurrency: 4,
+			}),
 		)
 		expect(mocks.parseChunkService.run).toHaveBeenNthCalledWith(
 			2,
 			"run-1",
 			expect.any(Object),
 			expect.any(Function),
-			{
+			expect.objectContaining({
 				limit: 20,
-			},
+				concurrency: 4,
+			}),
 		)
-		expect(mocks.diffPlanner.run).toHaveBeenCalledWith("run-1", expect.any(Object), {
-			revisionIds: ["revision-1"],
-		})
+		expect(mocks.diffPlanner.run).toHaveBeenCalledWith(
+			"run-1",
+			expect.any(Object),
+			expect.objectContaining({
+				limit: 50,
+				maxJobs: 1500,
+			}),
+		)
 		expect(mocks.embedUpsertWorker.run).toHaveBeenCalledWith("run-1", expect.any(Object), expect.any(Function))
 		expect(mocks.watcherCoordinator.initialize).toHaveBeenCalledTimes(1)
 		expect(mocks.stateManager.startIndexingTimer).toHaveBeenCalledTimes(1)
@@ -459,7 +564,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.vectorStore.initialize).toHaveBeenCalled()
 		expect(mocks.vectorStore.hasIndexedPoints).toHaveBeenCalled()
 		expect(mocks.embeddingAdapter.createEmbeddings).toHaveBeenCalledWith(["find value"], { isQuery: true })
-		expect(mocks.vectorStore.search).toHaveBeenCalledWith([0.1, 0.2, 0.3], 15, 0.4)
+		expect(mocks.vectorStore.search).toHaveBeenCalledWith([0.1, 0.2, 0.3], 20, 0.4)
 		expect(searchResults).toHaveLength(1)
 
 		await vi.advanceTimersByTimeAsync(5 * 60 * 1000)
@@ -477,6 +582,163 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.embeddingAdapter.recycleClient).toHaveBeenCalled()
 		expect(mocks.vectorStore.recycleClient).toHaveBeenCalled()
 		expect(mocks.metadataStore.dispose).toHaveBeenCalledTimes(1)
+	})
+
+	it("emits split embedding and vector sync service snapshots during the fused embed drain", async () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+
+		await engine.start()
+
+		const pipelineSnapshots = mocks.stateManager.setPipelineSnapshot.mock.calls.map(([snapshot]) => snapshot)
+		const splitSnapshot = pipelineSnapshots.find((snapshot: any) => {
+			if (!Array.isArray(snapshot?.services)) {
+				return false
+			}
+
+			const embeddingService = snapshot.services.find((service: any) => service.id === "embedding")
+			const vectorSyncService = snapshot.services.find((service: any) => service.id === "vector_sync")
+
+			return (
+				embeddingService &&
+				vectorSyncService &&
+				Array.isArray(vectorSyncService.metrics) &&
+				vectorSyncService.metrics.length > 0
+			)
+		})
+
+		expect(splitSnapshot).toBeDefined()
+		expect(splitSnapshot.services.find((service: any) => service.id === "embedding")?.summary).toBeDefined()
+		expect(splitSnapshot.services.find((service: any) => service.id === "vector_sync")?.metrics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ key: "avgUpsert" }),
+				expect.objectContaining({ key: "queuedUpserts" }),
+			]),
+		)
+	})
+
+	it("retires stale tracked files that no longer match current candidate rules before stat-hash", async () => {
+		mocks.metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValueOnce([
+			{
+				fileId: "generated-1",
+				workspaceId: "workspace-1",
+				relativePath: "src/webview-ui/build/assets/index.js",
+				normalizedPath: "/workspace/src/webview-ui/build/assets/index.js",
+				lastSeenMtimeMs: 1,
+				lastSeenSize: 1024,
+				ignoreState: "included",
+				activeRevisionId: "revision-generated",
+				tombstoned: false,
+				latestRevisionId: "revision-generated",
+				latestRevisionContentHash: "hash-generated",
+				latestRevisionFastFingerprint: "fp-generated",
+				latestRevisionState: "committed",
+			},
+			{
+				fileId: "source-1",
+				workspaceId: "workspace-1",
+				relativePath: "src/app.ts",
+				normalizedPath: "/workspace/src/app.ts",
+				lastSeenMtimeMs: 1,
+				lastSeenSize: 128,
+				ignoreState: "included",
+				activeRevisionId: "revision-source",
+				tombstoned: false,
+				latestRevisionId: "revision-source",
+				latestRevisionContentHash: "hash-source",
+				latestRevisionFastFingerprint: "fp-source",
+				latestRevisionState: "committed",
+			},
+		])
+		mocks.workspaceAdapter.isCandidateFile.mockImplementation((filePath: string) => !filePath.includes("/build/"))
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+
+		await engine.start()
+
+		expect(mocks.metadataStore.excludeFilesFromIndexing).toHaveBeenCalledWith(["generated-1"])
+		expect(mocks.statHashService.run).toHaveBeenCalledTimes(1)
+	})
+
+	it("does not mark a run complete until pending vector work fully drains", async () => {
+		const backlog = zeroBacklog()
+		const embedDrain = createDeferred<{
+			runId: string
+			upsertedChunks: number
+			deletedChunks: number
+			committedRevisions: number
+		}>()
+		const embedStarted = createDeferred<void>()
+		let parseBatch = 0
+
+		mocks.parseChunkService.run.mockReset()
+		mocks.diffPlanner.run.mockReset()
+		mocks.embedUpsertWorker.run.mockReset()
+		mocks.metadataStore.getRunBacklogMetrics.mockImplementation(async () => ({ ...backlog }))
+		mocks.parseChunkService.run.mockImplementation(async () => {
+			parseBatch += 1
+			if (parseBatch === 1) {
+				backlog.parsedRevisions = 1
+				backlog.stagedChunks = 3
+				return {
+					runId: "run-1",
+					attemptedRevisions: 1,
+					parsedRevisions: 1,
+					parsedChunks: 3,
+					parsedRevisionIds: ["revision-1"],
+					retryingRevisions: 0,
+					terminalFailedRevisions: 0,
+				}
+			}
+
+			return {
+				runId: "run-1",
+				attemptedRevisions: 0,
+				parsedRevisions: 0,
+				parsedChunks: 0,
+				parsedRevisionIds: [],
+				retryingRevisions: 0,
+				terminalFailedRevisions: 0,
+			}
+		})
+		mocks.diffPlanner.run.mockImplementation(async () => {
+			backlog.parsedRevisions = 0
+			backlog.plannedRevisions = 1
+			backlog.stagedChunks = 0
+			backlog.queuedUpsertJobs = 3
+
+			return {
+				runId: "run-1",
+				plannedRevisions: 1,
+				upsertJobs: 3,
+				deleteJobs: 0,
+			}
+		})
+		mocks.embedUpsertWorker.run.mockImplementation(async () => {
+			embedStarted.resolve()
+			backlog.plannedRevisions = 0
+			backlog.queuedUpsertJobs = 0
+			backlog.runningUpsertJobs = 3
+			const summary = await embedDrain.promise
+			backlog.runningUpsertJobs = 0
+			return summary
+		})
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		const startPromise = engine.start()
+
+		await embedStarted.promise
+		expect(mocks.metadataStore.markRunComplete).not.toHaveBeenCalled()
+
+		embedDrain.resolve({
+			runId: "run-1",
+			upsertedChunks: 3,
+			deletedChunks: 0,
+			committedRevisions: 1,
+		})
+		await startPromise
+
+		expect(mocks.metadataStore.markRunComplete).toHaveBeenCalledTimes(1)
+		expect(mocks.metadataStore.markRunComplete).toHaveBeenCalledWith("run-1")
 	})
 
 	it("fails fast on Qdrant preflight before workspace discovery begins", async () => {
@@ -645,6 +907,41 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(status.message).toContain("V2 refresh re-evaluated 3 files")
 	})
 
+	it("uses conservative scheduler defaults for very large workspaces", async () => {
+		mocks.statHashService.run.mockResolvedValueOnce({
+			runId: "run-1",
+			checkedFiles: 65_000,
+			skippedFiles: 10,
+			changedFiles: 1,
+			unchangedFiles: 64_989,
+			oversizedFiles: 0,
+			missingFiles: 0,
+			reusedParsedRevisionIds: [],
+		})
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		expect(mocks.parseChunkService.run).toHaveBeenNthCalledWith(
+			1,
+			"run-1",
+			expect.any(Object),
+			expect.any(Function),
+			expect.objectContaining({
+				limit: 10,
+				concurrency: 2,
+			}),
+		)
+		expect(mocks.diffPlanner.run).toHaveBeenCalledWith(
+			"run-1",
+			expect.any(Object),
+			expect.objectContaining({
+				limit: 25,
+				maxJobs: 800,
+			}),
+		)
+	})
+
 	it("reranks search results using symbol, path, and summary metadata", async () => {
 		mocks.vectorStore.search.mockResolvedValueOnce([
 			{
@@ -689,6 +986,68 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(results[0].matchReasons).toContain("symbol token overlap")
 		expect(results[0].matchReasons).toContain("path token overlap")
 		expect(results[0].matchReasons).toContain("chunk kind match")
+	})
+
+	it("uses a real candidate floor for small limits", async () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		await engine.search("find value", 1)
+
+		expect(mocks.vectorStore.search).toHaveBeenCalledWith([0.1, 0.2, 0.3], 20, 0.4)
+		expect(mocks.metadataStore.searchActiveChunksLexicallyWithStatus).toHaveBeenCalledWith(
+			"find value",
+			20,
+			expect.any(Object),
+		)
+	})
+
+	it("parses query intent once and threads it through search", async () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		const parseQueryIntentSpy = vi.spyOn(engine as any, "parseQueryIntent")
+		await engine.start()
+
+		await engine.search("How does Roo add parent and sibling context to code search results", 5)
+
+		expect(parseQueryIntentSpy).toHaveBeenCalledTimes(1)
+	})
+
+	it("matches token overlap on whole tokens instead of substrings", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-submerged",
+				score: 0.9,
+				payload: {
+					filePath: "src/search/submerged.ts",
+					chunkFingerprint: "submerged-fp",
+					codeChunk: "const submerged = true",
+					searchText: "submerged helper",
+					startLine: 1,
+					endLine: 2,
+				},
+			},
+			{
+				id: "point-merge",
+				score: 0.9,
+				payload: {
+					filePath: "src/search/merge.ts",
+					chunkFingerprint: "merge-fp",
+					codeChunk: "export function merge() {}",
+					searchText: "merge helper",
+					startLine: 1,
+					endLine: 2,
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("merge", 5)
+
+		expect(results[0].id).toBe("point-merge")
+		expect(results[0].matchReasons).toContain("content token overlap")
+		expect(results[1].matchReasons ?? []).not.toContain("content token overlap")
 	})
 
 	it("boosts path-like query hints ahead of generic token overlap", async () => {
@@ -773,38 +1132,47 @@ describe("CodeIndexEngineV2 smoke", () => {
 			.mockResolvedValueOnce({
 				embeddings: [],
 			})
-		mocks.metadataStore.searchActiveChunksLexically.mockResolvedValueOnce([
-			{
-				chunkId: "chunk-lexical",
-				revisionId: "revision-1",
-				chunkFingerprint: "lexical-fp",
-				startLine: 15,
-				endLine: 19,
-				language: "ts",
-				chunkKind: "function",
-				symbolName: "AssumeRoleWithWebIdentity",
-				symbolQualifiedName: "Auth.AssumeRoleWithWebIdentity",
-				parentSymbolName: "Auth",
-				parentChunkFingerprint: null,
-				summary: "ts function AssumeRoleWithWebIdentity in Auth at src/auth.ts:15-19",
-				searchText: "AssumeRoleWithWebIdentity function",
-				content: "export function AssumeRoleWithWebIdentity() {}",
-				contentHash: "hash-lexical",
-				tokenEstimate: 12,
-				embeddingModel: null,
-				vectorPointId: "vector-lexical",
-				state: "upserted",
-				createdAt: 1,
-				updatedAt: 1,
-				fileId: "file-1",
-				workspaceId: "workspace-1",
-				relativePath: "src/auth.ts",
-				normalizedPath: "/workspace/src/auth.ts",
-				parserVersion: "parser-v1",
-				chunkerVersion: "chunker-v1",
-				lexicalScore: 18,
+		mocks.metadataStore.searchActiveChunksLexicallyWithStatus.mockResolvedValueOnce({
+			results: [
+				{
+					chunkId: "chunk-lexical",
+					revisionId: "revision-1",
+					chunkFingerprint: "lexical-fp",
+					startLine: 15,
+					endLine: 19,
+					language: "ts",
+					chunkKind: "function",
+					symbolName: "AssumeRoleWithWebIdentity",
+					symbolQualifiedName: "Auth.AssumeRoleWithWebIdentity",
+					parentSymbolName: "Auth",
+					parentChunkFingerprint: null,
+					summary: "ts function AssumeRoleWithWebIdentity in Auth at src/auth.ts:15-19",
+					searchText: "AssumeRoleWithWebIdentity function",
+					content: "export function AssumeRoleWithWebIdentity() {}",
+					contentHash: "hash-lexical",
+					tokenEstimate: 12,
+					embeddingModel: null,
+					vectorPointId: "vector-lexical",
+					state: "upserted",
+					createdAt: 1,
+					updatedAt: 1,
+					fileId: "file-1",
+					workspaceId: "workspace-1",
+					relativePath: "src/auth.ts",
+					normalizedPath: "/workspace/src/auth.ts",
+					parserVersion: "parser-v1",
+					chunkerVersion: "chunker-v1",
+					lexicalScore: 18,
+				},
+			],
+			status: "completed",
+			mode: "fts_plus_exact_fallback",
+			timingsMs: {
+				ftsMs: 6,
+				fallbackMs: 4,
+				totalMs: 10,
 			},
-		])
+		})
 
 		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
 		await engine.start()
@@ -852,6 +1220,745 @@ describe("CodeIndexEngineV2 smoke", () => {
 
 		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/store/schema.ts")
 		expect(results[0].matchReasons).toContain("exact hinted filename match")
+		expect(results[0].matchReasons).toContain("schema file match")
+		expect(results[0].matchReasons).toContain("schema storage path match")
+		expect(results[0].matchReasons).toContain("ddl token overlap")
+	})
+
+	it("penalizes blog content for natural-language code questions", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "blog-point",
+				score: 0.95,
+				payload: {
+					filePath: "apps/web-roo-code/src/content/blog/example.md",
+					chunkFingerprint: "blog-fp",
+					codeChunk: "How does Roo add parent and sibling context to code search results?",
+					startLine: 1,
+					endLine: 4,
+					summary: "Blog content about Roo adoption",
+				},
+			},
+			{
+				id: "engine-point",
+				score: 0.82,
+				payload: {
+					filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+					chunkFingerprint: "engine-fp",
+					codeChunk: "private async expandSearchResultsWithParents() {}",
+					searchText: "expandSearchResultsWithParents parent sibling context code search results",
+					startLine: 100,
+					endLine: 130,
+					summary: "Engine logic for parent and sibling context expansion",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("How does Roo add parent and sibling context to code search results", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
+		expect(results[0].matchReasons).toContain("retrieval engine surface match")
+		expect(results[1].matchReasons).toContain("non-code content penalty")
+	})
+
+	it("boosts startup oversized tracking queries toward the engine implementation", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "config-point",
+				score: 0.95,
+				payload: {
+					filePath: "src/services/code-index/config-manager.ts",
+					chunkFingerprint: "config-fp",
+					codeChunk: "getOversizedFileApproval() {}",
+					searchText: "oversized approvals config manager",
+					startLine: 1,
+					endLine: 20,
+					summary: "Oversized approval lookup in config manager",
+				},
+			},
+			{
+				id: "engine-point",
+				score: 0.82,
+				payload: {
+					filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+					chunkFingerprint: "engine-fp",
+					codeChunk: "private async refreshTrackedOversizedFiles() {}",
+					searchText: "refreshTrackedOversizedFiles startup reconcile oversized approvals",
+					startLine: 200,
+					endLine: 240,
+					summary: "Refresh tracked oversized files on startup and reconcile approvals",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("refreshTrackedOversizedFiles startup reconcile oversized approvals", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
+		expect(results[0].matchReasons).toContain("startup tracking engine surface match")
+		expect(results[0].matchReasons).toContain("exact startup tracking match")
+		expect(results[0].matchReasons).toContain("content token overlap")
+		expect(results[0].matchReasons).toContain("implementation token overlap")
+	})
+
+	it("boosts full refresh manager queries toward the manager implementation entrypoint", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "custom-modes-point",
+				score: 0.95,
+				payload: {
+					filePath: "src/core/config/CustomModesManager.ts",
+					chunkFingerprint: "custom-modes-fp",
+					codeChunk: "private refreshMergedState() {}",
+					searchText: "refresh merged state custom modes manager",
+					symbolName: "refreshMergedState",
+					symbolQualifiedName: "CustomModesManager.refreshMergedState",
+					startLine: 1,
+					endLine: 20,
+					summary: "Refresh custom modes manager merged state",
+				},
+			},
+			{
+				id: "manager-point",
+				score: 0.83,
+				payload: {
+					filePath: "src/services/code-index/manager.ts",
+					chunkFingerprint: "manager-fp",
+					codeChunk: "public async refreshAllIndexData() {}",
+					searchText: "refreshAllIndexData full refresh manager workspace index",
+					symbolName: "refreshAllIndexData",
+					symbolQualifiedName: "CodeIndexManager.refreshAllIndexData",
+					startLine: 200,
+					endLine: 260,
+					summary: "Run a non destructive full refresh of the workspace index",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("refreshAllIndexData full refresh manager", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index/manager.ts")
+		expect(results[0].matchReasons).toContain("full refresh manager path match")
+		expect(results[0].matchReasons).toContain("exact full refresh manager match")
+	})
+
+	it("penalizes wrapper surfaces for implementation-oriented hybrid retrieval queries", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "ui-point",
+				score: 0.95,
+				payload: {
+					filePath: "webview-ui/src/components/chat/CodebaseSearchResultsDisplay.tsx",
+					chunkFingerprint: "ui-fp",
+					codeChunk: "function CodebaseSearchResultsDisplay() {}",
+					searchText: "codebase search results display parent context sibling context",
+					startLine: 1,
+					endLine: 20,
+					summary: "Search result display component",
+				},
+			},
+			{
+				id: "engine-point",
+				score: 0.82,
+				payload: {
+					filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+					chunkFingerprint: "engine-fp",
+					codeChunk: "private mergeSearchCandidates() {}",
+					searchText: "mergeSearchCandidates lexical vector hybrid retrieval",
+					startLine: 50,
+					endLine: 90,
+					summary: "Engine logic for combining lexical and vector retrieval before reranking",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search(
+			"How does V2 combine lexical search and vector search before returning results",
+			5,
+		)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
+		expect(results[0].matchReasons).toContain("hybrid retrieval engine surface match")
+		expect(results[0].matchReasons).toContain("implementation token overlap")
+		expect(results[1].matchReasons).toContain("wrapper surface penalty")
+	})
+
+	it("prefers engine parent and sibling context behavior over wrapper and fixture surfaces", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "display-point",
+				score: 0.95,
+				payload: {
+					filePath: "webview-ui/src/components/chat/CodebaseSearchResultsDisplay.tsx",
+					chunkFingerprint: "display-fp",
+					codeChunk: "function CodebaseSearchResultsDisplay() {}",
+					searchText: "codebase search results display parent context sibling context",
+					startLine: 1,
+					endLine: 20,
+					summary: "Search result display component",
+				},
+			},
+			{
+				id: "fixture-point",
+				score: 0.9,
+				payload: {
+					filePath: "src/services/code-index-v2/eval/fixtures/roo-code-benchmark.ts",
+					chunkFingerprint: "fixture-fp",
+					codeChunk: "How does Roo add parent and sibling context to code search results",
+					searchText: "eval benchmark fixture parent sibling context",
+					startLine: 1,
+					endLine: 20,
+					summary: "Benchmark fixture for retrieval queries",
+				},
+			},
+			{
+				id: "engine-point",
+				score: 0.82,
+				payload: {
+					filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+					chunkFingerprint: "engine-fp",
+					codeChunk: "private async expandSearchResultsWithParents() {}",
+					searchText:
+						"expandSearchResultsWithParents parent sibling context code search results add parent context add sibling context",
+					symbolName: "expandSearchResultsWithParents",
+					symbolQualifiedName: "CodeIndexEngineV2.expandSearchResultsWithParents",
+					startLine: 100,
+					endLine: 130,
+					summary: "Expand code search results with parent and sibling context",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("How does Roo add parent and sibling context to code search results", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
+		expect(results[0].matchReasons).toContain("retrieval engine surface match")
+		expect(results.some((result) => result.matchReasons?.includes("fixture surface penalty"))).toBe(true)
+	})
+
+	it("penalizes context-management distractors for parent and sibling context retrieval queries", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "context-point",
+				score: 0.95,
+				payload: {
+					filePath: "src/core/context/context-management/context-error-handling.ts",
+					chunkFingerprint: "context-fp",
+					codeChunk: "function checkContextWindowExceededError() {}",
+					searchText: "context window management context handling",
+					symbolName: "checkContextWindowExceededError",
+					symbolQualifiedName: "checkContextWindowExceededError",
+					startLine: 1,
+					endLine: 20,
+					summary: "Context management error handling",
+				},
+			},
+			{
+				id: "engine-point",
+				score: 0.82,
+				payload: {
+					filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+					chunkFingerprint: "engine-fp",
+					codeChunk: "private async expandSearchResultsWithParents() {}",
+					searchText:
+						"expandSearchResultsWithParents parent sibling context code search results add parent context add sibling context",
+					symbolName: "expandSearchResultsWithParents",
+					symbolQualifiedName: "CodeIndexEngineV2.expandSearchResultsWithParents",
+					startLine: 100,
+					endLine: 130,
+					summary: "Expand code search results with parent and sibling context",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("How does Roo add parent and sibling context to code search results", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
+		expect(results[1].matchReasons).toContain("context-management surface penalty")
+	})
+
+	it("prefers the search results display component over benchmark fixtures for display-oriented queries", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "fixture-point",
+				score: 0.95,
+				payload: {
+					filePath: "src/services/code-index-v2/eval/fixtures/roo-code-benchmark.ts",
+					chunkFingerprint: "fixture-fp",
+					codeChunk: "codebase search results display parent context sibling context",
+					searchText: "benchmark fixture search results display parent sibling context",
+					startLine: 1,
+					endLine: 20,
+					summary: "Benchmark fixture",
+				},
+			},
+			{
+				id: "display-point",
+				score: 0.83,
+				payload: {
+					filePath: "webview-ui/src/components/chat/CodebaseSearchResultsDisplay.tsx",
+					chunkFingerprint: "display-fp",
+					codeChunk: "function CodebaseSearchResultsDisplay() {}",
+					searchText: "codebase search results display parent context sibling context",
+					symbolName: "CodebaseSearchResultsDisplay",
+					symbolQualifiedName: "CodebaseSearchResultsDisplay",
+					startLine: 1,
+					endLine: 20,
+					summary: "Display codebase search results with parent and sibling context",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("codebase search results display parent context sibling context", 5)
+
+		expect(results[0].payload?.filePath).toBe("webview-ui/src/components/chat/CodebaseSearchResultsDisplay.tsx")
+		expect(results[0].matchReasons).toContain("search results display surface match")
+		expect(results[1].matchReasons).toContain("fixture surface penalty")
+	})
+
+	it("penalizes parser adapter surfaces for parent and sibling context behavior queries", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "parser-point",
+				score: 0.95,
+				payload: {
+					filePath: "src/services/code-index-v2/adapters/CodeIndexParserAdapter.ts",
+					chunkFingerprint: "parser-fp",
+					codeChunk: "buildSearchText() {}",
+					searchText: "build search text parent sibling context code search results",
+					symbolName: "buildSearchText",
+					symbolQualifiedName: "CodeIndexParserAdapter.buildSearchText",
+					startLine: 1,
+					endLine: 20,
+					summary: "Build search text for code index chunks",
+				},
+			},
+			{
+				id: "engine-point",
+				score: 0.82,
+				payload: {
+					filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+					chunkFingerprint: "engine-fp",
+					codeChunk: "private async expandSearchResultsWithParents() {}",
+					searchText:
+						"expandSearchResultsWithParents parent sibling context code search results add parent context add sibling context",
+					symbolName: "expandSearchResultsWithParents",
+					symbolQualifiedName: "CodeIndexEngineV2.expandSearchResultsWithParents",
+					startLine: 100,
+					endLine: 130,
+					summary: "Expand code search results with parent and sibling context",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("How does Roo add parent and sibling context to code search results", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
+		expect(results[1].matchReasons).toContain("parser/adapter surface penalty")
+	})
+
+	it("penalizes metadata store surfaces for parent and sibling context behavior queries", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "store-point",
+				score: 0.95,
+				payload: {
+					filePath: "src/services/code-index-v2/store/MetadataStore.ts",
+					chunkFingerprint: "store-fp",
+					codeChunk: "computeLexicalScore() {}",
+					searchText: "compute lexical score parent sibling context code search results",
+					symbolName: "computeLexicalScore",
+					symbolQualifiedName: "MetadataStore.computeLexicalScore",
+					startLine: 1,
+					endLine: 20,
+					summary: "Compute lexical score for code index retrieval",
+				},
+			},
+			{
+				id: "engine-point",
+				score: 0.82,
+				payload: {
+					filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+					chunkFingerprint: "engine-fp",
+					codeChunk: "private async expandSearchResultsWithParents() {}",
+					searchText:
+						"expandSearchResultsWithParents parent sibling context code search results add parent context add sibling context",
+					symbolName: "expandSearchResultsWithParents",
+					symbolQualifiedName: "CodeIndexEngineV2.expandSearchResultsWithParents",
+					startLine: 100,
+					endLine: 130,
+					summary: "Expand code search results with parent and sibling context",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("How does Roo add parent and sibling context to code search results", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
+		expect(results[1].matchReasons).toContain("storage surface penalty")
+	})
+
+	it("boosts preflight timeout queries toward the engine verification flow", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "cli-point",
+				score: 0.95,
+				payload: {
+					filePath: "apps/cli/scripts/integration/cases/cancel-immediately-after-start-ack.ts",
+					chunkFingerprint: "cli-fp",
+					codeChunk: "onTimeoutMessage() {}",
+					searchText: "timeout message qdrant verification timed out",
+					symbolName: "onTimeoutMessage",
+					symbolQualifiedName: "runStreamCase.onTimeoutMessage",
+					startLine: 1,
+					endLine: 20,
+					summary: "CLI timeout message helper",
+				},
+			},
+			{
+				id: "engine-point",
+				score: 0.82,
+				payload: {
+					filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+					chunkFingerprint: "engine-fp",
+					codeChunk: "private async preflightIndexingDependencies() {}",
+					searchText: "preflightIndexingDependencies qdrant verification timed out after 10s preflight",
+					symbolName: "preflightIndexingDependencies",
+					symbolQualifiedName: "CodeIndexEngineV2.preflightIndexingDependencies",
+					startLine: 200,
+					endLine: 260,
+					summary: "Verify Qdrant and embedding provider availability before indexing starts",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("Qdrant verification timed out after 10s preflight", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
+		expect(results[0].matchReasons).toContain("preflight implementation match")
+		expect(results[1].matchReasons).toContain("preflight cli surface penalty")
+	})
+
+	it("boosts low value file filtering queries toward the shared low value file implementation", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "fixture-point",
+				score: 0.95,
+				payload: {
+					filePath: "src/services/code-index-v2/eval/fixtures/roo-code-benchmark.ts",
+					chunkFingerprint: "fixture-fp",
+					codeChunk: "low value file filtering code index",
+					searchText: "low value file filtering benchmark fixture",
+					startLine: 1,
+					endLine: 20,
+					summary: "Benchmark query fixture",
+				},
+			},
+			{
+				id: "engine-point",
+				score: 0.7,
+				payload: {
+					filePath: "src/services/code-index/shared/low-value-files.ts",
+					chunkFingerprint: "shared-fp",
+					codeChunk: "const LOW_VALUE_FILE_NAMES = new Set([])",
+					searchText: "LOW_VALUE_FILE_NAMES low value file filtering code index",
+					symbolName: "LOW_VALUE_FILE_NAMES",
+					symbolQualifiedName: "LOW_VALUE_FILE_NAMES",
+					startLine: 1,
+					endLine: 20,
+					summary: "Low value file filtering list used by code index",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("low value file filtering code index", 5)
+
+		expect(results[0].payload?.filePath).toBe("src/services/code-index/shared/low-value-files.ts")
+		expect(results[0].matchReasons).toContain("low value files implementation match")
+		expect(results[1].matchReasons).toContain("low value files non-code surface penalty")
+	})
+
+	it("boosts oversized webview handler queries toward the webview handler implementation", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "cli-point",
+				score: 0.95,
+				payload: {
+					filePath: "apps/cli/src/agent/json-event-emitter.ts",
+					chunkFingerprint: "cli-fp",
+					codeChunk: "handleReasoningMessage() {}",
+					searchText: "json event emitter handler message",
+					symbolName: "handleReasoningMessage",
+					symbolQualifiedName: "JsonEventEmitter.handleReasoningMessage",
+					startLine: 1,
+					endLine: 20,
+					summary: "CLI reasoning event handler",
+				},
+			},
+			{
+				id: "handler-point",
+				score: 0.79,
+				payload: {
+					filePath: "src/core/webview/webviewMessageHandler.ts",
+					chunkFingerprint: "handler-fp",
+					codeChunk: 'case "fullRefreshIndexData": requestOversizedFileDetails()',
+					searchText: "fullRefreshIndexData requestOversizedFileDetails webview message handler",
+					symbolName: "fullRefreshIndexData",
+					symbolQualifiedName: "webviewMessageHandler.fullRefreshIndexData",
+					startLine: 200,
+					endLine: 260,
+					summary: "Webview message handler for full refresh and oversized file details",
+				},
+			},
+		])
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search(
+			"fullRefreshIndexData requestOversizedFileDetails webview message handler",
+			5,
+		)
+
+		expect(results[0].payload?.filePath).toBe("src/core/webview/webviewMessageHandler.ts")
+		expect(results[0].matchReasons).toContain("oversized webview handler implementation match")
+		expect(results[1].matchReasons).toContain("oversized webview handler unrelated surface penalty")
+	})
+
+	it("returns stage snapshots through searchDebug without changing the final result shape", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "schema-point",
+				score: 0.72,
+				payload: {
+					filePath: "src/services/code-index-v2/store/schema.ts",
+					chunkFingerprint: "schema-fp",
+					codeChunk: "CREATE TABLE IF NOT EXISTS chunk_variants (...)",
+					startLine: 1,
+					endLine: 10,
+					chunkKind: "module",
+				},
+			},
+		])
+		mocks.metadataStore.searchActiveChunksLexicallyWithStatus.mockResolvedValueOnce({
+			results: [
+				{
+					chunkId: "schema-lexical",
+					revisionId: "revision-1",
+					chunkFingerprint: "schema-fp",
+					startLine: 1,
+					endLine: 10,
+					language: "ts",
+					chunkKind: "module",
+					symbolName: null,
+					symbolQualifiedName: null,
+					parentSymbolName: null,
+					parentChunkFingerprint: null,
+					summary: "schema definitions for code index tables",
+					searchText: "CREATE TABLE chunk_variants",
+					content: "CREATE TABLE IF NOT EXISTS chunk_variants (...)",
+					contentHash: "schema-content-hash",
+					tokenEstimate: 12,
+					embeddingModel: null,
+					vectorPointId: "schema-point",
+					state: "upserted",
+					createdAt: 1,
+					updatedAt: 1,
+					fileId: "file-1",
+					workspaceId: "workspace-1",
+					relativePath: "src/services/code-index-v2/store/schema.ts",
+					normalizedPath: "/workspace/src/services/code-index-v2/store/schema.ts",
+					parserVersion: "parser-v1",
+					chunkerVersion: "chunker-v1",
+					lexicalScore: 28,
+				},
+			],
+			status: "completed",
+			mode: "fts_plus_exact_fallback",
+			timingsMs: {
+				ftsMs: 7,
+				fallbackMs: 3,
+				totalMs: 10,
+			},
+		})
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const trace = await engine.searchDebug!("schema.ts CREATE TABLE chunk_variants", 5)
+
+		expect(trace.timingsMs.totalMs).toBeGreaterThanOrEqual(0)
+		expect(trace.timingsMs.lexicalRetrievalMs).toBeGreaterThanOrEqual(0)
+		expect(trace.lexicalStatus).toBe("completed")
+		expect(trace.lexicalMode).toBe("fts_plus_exact_fallback")
+		expect(trace.stages.vector).toHaveLength(1)
+		expect(trace.stages.lexical).toHaveLength(1)
+		expect(trace.stages.merged).toHaveLength(1)
+		expect(trace.stages.final).toHaveLength(1)
+		expect(trace.stages.final[0]?.payload?.filePath).toBe("src/services/code-index-v2/store/schema.ts")
+	})
+
+	it("skips lexical retrieval in searchDebug for broad long natural language queries without retrieval hints", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([])
+		mocks.metadataStore.searchActiveChunksLexicallyWithStatus.mockResolvedValueOnce({
+			results: [
+				{
+					chunkId: "lexical-1",
+					revisionId: "revision-1",
+					chunkFingerprint: "lexical-fp",
+					startLine: 1,
+					endLine: 10,
+					language: "ts",
+					chunkKind: "module",
+					symbolName: null,
+					symbolQualifiedName: null,
+					parentSymbolName: null,
+					parentChunkFingerprint: null,
+					summary: "ignored",
+					searchText: "ignored",
+					content: "ignored",
+					contentHash: "ignored",
+					tokenEstimate: 12,
+					embeddingModel: null,
+					vectorPointId: "vector-1",
+					state: "upserted",
+					createdAt: 1,
+					updatedAt: 1,
+					fileId: "file-1",
+					workspaceId: "workspace-1",
+					relativePath: "src/ignored.ts",
+					normalizedPath: "/workspace/src/ignored.ts",
+					parserVersion: "parser-v1",
+					chunkerVersion: "chunker-v1",
+					lexicalScore: 28,
+				},
+			],
+			status: "completed",
+			mode: "fts_only",
+			timingsMs: {
+				ftsMs: 9,
+				fallbackMs: 0,
+				totalMs: 9,
+			},
+		})
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const trace = await engine.searchDebug!(
+			"How does Roo decide what code to use for general workspace behavior",
+			5,
+		)
+
+		expect(mocks.metadataStore.searchActiveChunksLexicallyWithStatus).not.toHaveBeenCalled()
+		expect(trace.stages.lexical).toHaveLength(0)
+		expect(trace.timingsMs.lexicalRetrievalMs).toBe(0)
+		expect(trace.lexicalStatus).toBe("skipped")
+		expect(trace.lexicalMode).toBe("none")
+	})
+
+	it("runs FTS-only lexical retrieval for natural-language implementation queries", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "vector-point",
+				score: 0.88,
+				payload: {
+					filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+					chunkFingerprint: "engine-fp",
+					codeChunk: "private async expandSearchResultsWithParents() {}",
+					startLine: 1,
+					endLine: 10,
+					chunkKind: "method",
+				},
+			},
+		])
+		mocks.metadataStore.searchActiveChunksLexicallyWithStatus.mockReset()
+		mocks.metadataStore.searchActiveChunksLexicallyWithStatus.mockResolvedValue({
+			results: [],
+			status: "completed",
+			mode: "fts_only",
+			timingsMs: {
+				ftsMs: 12,
+				fallbackMs: 0,
+				totalMs: 12,
+			},
+		})
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const trace = await engine.searchDebug!("How does Roo add parent and sibling context to code search results", 5)
+
+		expect(mocks.metadataStore.searchActiveChunksLexicallyWithStatus).toHaveBeenCalledWith(
+			"How does Roo add parent and sibling context to code search results",
+			20,
+			{ allowExactFallback: false },
+		)
+		expect(trace.lexicalStatus).toBe("completed")
+		expect(trace.lexicalMode).toBe("fts_only")
+		expect(trace.stages.lexical).toHaveLength(0)
+		expect(trace.stages.final[0]?.payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
+		expect(trace.timingsMs.lexicalRetrievalMs).toBeGreaterThanOrEqual(0)
+	})
+
+	it("uses separate dependency instances for indexing and search", async () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+
+		await engine.start()
+		await engine.searchDebug!("schema.ts CREATE TABLE chunk_variants", 5)
+
+		expect(vi.mocked(ExistingEmbedderAdapter)).toHaveBeenCalledTimes(2)
+		expect(vi.mocked(QdrantRestVectorStoreAdapter)).toHaveBeenCalledTimes(2)
+	})
+
+	it("logs a compact indexing performance summary for successful runs", async () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+
+		await engine.start()
+
+		expect(vi.mocked(IndexDebugLoggerV2.log)).toHaveBeenCalledWith(
+			"basic",
+			"CodeIndexEngineV2",
+			"index-performance-summary",
+			expect.objectContaining({
+				runType: "start",
+				discoveredFiles: 2,
+				filesScanned: 2,
+				filesChanged: 1,
+			}),
+		)
 	})
 
 	it("merges lexical and vector candidates for the same chunk", async () => {
@@ -872,38 +1979,47 @@ describe("CodeIndexEngineV2 smoke", () => {
 				},
 			},
 		])
-		mocks.metadataStore.searchActiveChunksLexically.mockResolvedValueOnce([
-			{
-				chunkId: "chunk-shared",
-				revisionId: "revision-1",
-				chunkFingerprint: "shared-fp",
-				startLine: 10,
-				endLine: 14,
-				language: "ts",
-				chunkKind: "function",
-				symbolName: "validateToken",
-				symbolQualifiedName: "Auth.validateToken",
-				parentSymbolName: "Auth",
-				parentChunkFingerprint: null,
-				summary: "ts function validateToken in Auth at src/auth.ts:10-14",
-				searchText: "validateToken function",
-				content: "export function validateToken() {}",
-				contentHash: "hash-shared",
-				tokenEstimate: 12,
-				embeddingModel: null,
-				vectorPointId: "point-vector",
-				state: "upserted",
-				createdAt: 1,
-				updatedAt: 1,
-				fileId: "file-1",
-				workspaceId: "workspace-1",
-				relativePath: "src/auth.ts",
-				normalizedPath: "/workspace/src/auth.ts",
-				parserVersion: "parser-v1",
-				chunkerVersion: "chunker-v1",
-				lexicalScore: 18,
+		mocks.metadataStore.searchActiveChunksLexicallyWithStatus.mockResolvedValueOnce({
+			results: [
+				{
+					chunkId: "chunk-shared",
+					revisionId: "revision-1",
+					chunkFingerprint: "shared-fp",
+					startLine: 10,
+					endLine: 14,
+					language: "ts",
+					chunkKind: "function",
+					symbolName: "validateToken",
+					symbolQualifiedName: "Auth.validateToken",
+					parentSymbolName: "Auth",
+					parentChunkFingerprint: null,
+					summary: "ts function validateToken in Auth at src/auth.ts:10-14",
+					searchText: "validateToken function",
+					content: "export function validateToken() {}",
+					contentHash: "hash-shared",
+					tokenEstimate: 12,
+					embeddingModel: null,
+					vectorPointId: "point-vector",
+					state: "upserted",
+					createdAt: 1,
+					updatedAt: 1,
+					fileId: "file-1",
+					workspaceId: "workspace-1",
+					relativePath: "src/auth.ts",
+					normalizedPath: "/workspace/src/auth.ts",
+					parserVersion: "parser-v1",
+					chunkerVersion: "chunker-v1",
+					lexicalScore: 18,
+				},
+			],
+			status: "completed",
+			mode: "fts_plus_exact_fallback",
+			timingsMs: {
+				ftsMs: 5,
+				fallbackMs: 3,
+				totalMs: 8,
 			},
-		])
+		})
 
 		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
 		await engine.start()
@@ -1402,8 +2518,10 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.stateManager.resetIndexingState).toHaveBeenCalledWith("Index data cleared successfully.")
 		expect((engine as any)._started).toBe(false)
 		expect((engine as any)._watcherCoordinator).toBeUndefined()
-		expect((engine as any)._embeddingAdapter).toBeUndefined()
-		expect((engine as any)._vectorStore).toBeUndefined()
+		expect((engine as any)._indexEmbeddingAdapter).toBeUndefined()
+		expect((engine as any)._indexVectorStore).toBeUndefined()
+		expect((engine as any)._searchEmbeddingAdapter).toBeUndefined()
+		expect((engine as any)._searchVectorStore).toBeUndefined()
 		expect((engine as any)._staleRunIdsToResume).toEqual([])
 		expect((engine as any)._resumedRetryJobsCount).toBe(0)
 		expect((engine as any)._resumedPendingJobsCount).toBe(0)
@@ -1449,6 +2567,8 @@ describe("CodeIndexEngineV2 smoke", () => {
 	})
 
 	it("plans and syncs preserved parsed revisions reused from a previous run", async () => {
+		const backlog = zeroBacklog()
+
 		mocks.statHashService.run.mockReset()
 		mocks.statHashService.run.mockResolvedValueOnce({
 			runId: "run-1",
@@ -1470,6 +2590,8 @@ describe("CodeIndexEngineV2 smoke", () => {
 				revisionId: "revision-reused",
 			},
 		])
+		backlog.parsedRevisions = 1
+		backlog.stagedChunks = 2
 		mocks.parseChunkService.run.mockReset()
 		mocks.parseChunkService.run.mockResolvedValueOnce({
 			runId: "run-1",
@@ -1480,13 +2602,44 @@ describe("CodeIndexEngineV2 smoke", () => {
 			retryingRevisions: 0,
 			terminalFailedRevisions: 0,
 		})
+		mocks.metadataStore.getRunBacklogMetrics.mockImplementation(async () => ({ ...backlog }))
+		mocks.diffPlanner.run.mockReset()
+		mocks.diffPlanner.run.mockImplementation(async () => {
+			backlog.parsedRevisions = 0
+			backlog.plannedRevisions = 1
+			backlog.stagedChunks = 0
+			backlog.queuedUpsertJobs = 2
+
+			return {
+				runId: "run-1",
+				plannedRevisions: 1,
+				upsertJobs: 2,
+				deleteJobs: 0,
+			}
+		})
+		mocks.embedUpsertWorker.run.mockReset()
+		mocks.embedUpsertWorker.run.mockImplementation(async () => {
+			backlog.plannedRevisions = 0
+			backlog.queuedUpsertJobs = 0
+			return {
+				runId: "run-1",
+				upsertedChunks: 2,
+				deletedChunks: 0,
+				committedRevisions: 1,
+			}
+		})
 
 		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
 		await engine.start()
 
-		expect(mocks.diffPlanner.run).toHaveBeenCalledWith("run-1", expect.anything(), {
-			revisionIds: ["revision-reused"],
-		})
+		expect(mocks.diffPlanner.run).toHaveBeenCalledWith(
+			"run-1",
+			expect.anything(),
+			expect.objectContaining({
+				limit: 50,
+				maxJobs: 1500,
+			}),
+		)
 		expect(mocks.embedUpsertWorker.run).toHaveBeenCalled()
 	})
 
@@ -1558,11 +2711,12 @@ describe("CodeIndexEngineV2 smoke", () => {
 			4,
 			10,
 			2,
-			false,
+			true,
 			expect.objectContaining({
 				detailedStage: "embedding",
 				hasKnownVectorWork: true,
 				hasStartedVectorSync: true,
+				isBackgroundReconcile: false,
 			}),
 		)
 	})
@@ -1622,9 +2776,14 @@ describe("CodeIndexEngineV2 smoke", () => {
 		await engine.start()
 
 		expect(mocks.parseChunkService.run).toHaveBeenCalledTimes(3)
-		expect(mocks.diffPlanner.run).toHaveBeenCalledWith("run-1", expect.any(Object), {
-			revisionIds: ["revision-recovered"],
-		})
+		expect(mocks.diffPlanner.run).toHaveBeenCalledWith(
+			"run-1",
+			expect.any(Object),
+			expect.objectContaining({
+				limit: 50,
+				maxJobs: 1500,
+			}),
+		)
 		expect(mocks.embedUpsertWorker.run).toHaveBeenCalled()
 	})
 

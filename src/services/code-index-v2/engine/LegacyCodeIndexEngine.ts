@@ -31,6 +31,10 @@ export class LegacyCodeIndexEngine implements ICodeIndexEngine {
 		await this.deps.clearIndexData()
 	}
 
+	async clearDatabase(): Promise<void> {
+		await this.deps.clearIndexData()
+	}
+
 	async search(query: string, limit: number): Promise<VectorStoreSearchResult[]> {
 		return this.deps.searchIndex(query, limit)
 	}

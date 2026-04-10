@@ -5,7 +5,7 @@ import { BookOpenText, MessageCircleWarning, Copy, Check, Microscope, Info } fro
 
 import { useCopyToClipboard } from "@src/utils/clipboard"
 import { vscode } from "@src/utils/vscode"
-import CodeBlock from "../common/CodeBlock"
+import LazyCodeBlock from "../common/LazyCodeBlock"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@src/components/ui/dialog"
 import { Button } from "../ui"
 import { useExtensionState } from "@src/context/ExtensionStateContext"
@@ -222,7 +222,7 @@ export const ErrorRow = memo(
 					</div>
 					{isExpanded && (
 						<div className="px-2 py-1 mt-2 bg-vscode-editor-background ml-6 rounded-lg">
-							<CodeBlock source={message} language="text" />
+							<LazyCodeBlock source={message} language="text" />
 						</div>
 					)}
 				</div>

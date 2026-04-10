@@ -424,6 +424,7 @@ export interface WebviewMessage {
 		| "getListApiConfiguration"
 		| "customInstructions"
 		| "webviewDidLaunch"
+		| "webviewBootMarker"
 		| "newTask"
 		| "askResponse"
 		| "terminalOperation"
@@ -519,6 +520,8 @@ export interface WebviewMessage {
 		| "fullRefreshIndexData"
 		| "stopIndexing"
 		| "clearIndexData"
+		| "clearIndexDatabase"
+		| "codeIndexDebugLog"
 		| "indexingStatusUpdate"
 		| "indexingWarningDetails"
 		| "indexCleared"
@@ -750,6 +753,68 @@ export interface IndexClearedPayload {
 	error?: string
 }
 
+export type IndexingServiceId =
+	| "discovery"
+	| "file_checks"
+	| "parse"
+	| "plan"
+	| "embedding"
+	| "vector_sync"
+	| "embed"
+	| "cleanup"
+export type IndexingServiceState = "pending" | "running" | "completed" | "warning" | "failed" | "skipped"
+export type IndexingHealthState = "healthy" | "watch" | "critical" | "unknown"
+export type IndexingPipelineRunMode = "start" | "refresh" | "reconcile" | "resume" | "unknown"
+export type IndexingPipelineOverallState = "idle" | "running" | "completed" | "stopped" | "failed"
+export type IndexingMetricTone = "neutral" | "good" | "warning" | "critical"
+
+export interface IndexingServiceMetric {
+	key: string
+	label: string
+	value: string
+	tone?: IndexingMetricTone
+}
+
+export interface IndexingServiceSnapshot {
+	id: IndexingServiceId
+	title: string
+	state: IndexingServiceState
+	health: IndexingHealthState
+	summary: string
+	detail?: string
+	progressCurrent?: number
+	progressTotal?: number
+	progressUnit?: string
+	progressPercent?: number | null
+	indeterminate?: boolean
+	metrics: IndexingServiceMetric[]
+	issueCount?: number
+	updatedAt?: number
+}
+
+export interface IndexingRunSummarySnapshot {
+	primaryServiceId?: IndexingServiceId
+	headline: string
+	progressLabel?: string
+	secondaryLabel?: string
+	progressCurrent?: number
+	progressTotal?: number
+	progressUnit?: string
+	progressPercent?: number | null
+	indeterminate?: boolean
+}
+
+export interface IndexingPipelineSnapshot {
+	overallState: IndexingPipelineOverallState
+	overallHealth: IndexingHealthState
+	runMode: IndexingPipelineRunMode
+	etaMs?: number | null
+	services: IndexingServiceSnapshot[]
+	summary?: IndexingRunSummarySnapshot
+	lastCompletedAt?: number
+	preservedFromPreviousRun?: boolean
+}
+
 export const installMarketplaceItemWithParametersPayloadSchema = z.object({
 	item: marketplaceItemSchema,
 	parameters: z.record(z.string(), z.any()),
@@ -819,6 +884,7 @@ export interface IndexingStatus {
 		category?: "parser_failed" | "failed" | "degraded"
 		failureReason?: string | null
 	}>
+	pipeline?: IndexingPipelineSnapshot
 }
 
 export interface IndexingStatusUpdateMessage {

@@ -76,6 +76,7 @@ export interface ICodeIndexManager {
 	 * Clears the index data
 	 */
 	clearIndexData(): Promise<void>
+	clearIndexDatabase?(): Promise<void>
 
 	/**
 	 * Searches the index

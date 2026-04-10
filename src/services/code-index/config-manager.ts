@@ -38,6 +38,7 @@ export class CodeIndexConfigManager {
 	private searchMinScore?: number
 	private searchMaxResults?: number
 	private respectGitIgnore: boolean = true
+	private includeDefaultIgnoredGeneratedPaths: boolean = false
 	private embeddingLaneConcurrency: number = 2
 
 	constructor(private readonly contextProxy: ContextProxy) {
@@ -83,6 +84,9 @@ export class CodeIndexConfigManager {
 		const respectGitIgnoreSetting = vscode.workspace
 			.getConfiguration(Package.name)
 			.get<boolean>("codeIndex.respectGitIgnore", true)
+		const includeDefaultIgnoredGeneratedPathsSetting = vscode.workspace
+			.getConfiguration(Package.name)
+			.get<boolean>("codeIndex.includeDefaultIgnoredGeneratedPaths", false)
 		const embeddingLaneConcurrencySetting = vscode.workspace
 			.getConfiguration(Package.name)
 			.get<number>("codeIndex.embeddingLaneConcurrency", 2)
@@ -120,6 +124,7 @@ export class CodeIndexConfigManager {
 		this.searchMinScore = codebaseIndexSearchMinScore
 		this.searchMaxResults = codebaseIndexSearchMaxResults
 		this.respectGitIgnore = respectGitIgnoreSetting
+		this.includeDefaultIgnoredGeneratedPaths = includeDefaultIgnoredGeneratedPathsSetting
 		this.embeddingLaneConcurrency = Math.max(1, Math.min(3, Math.trunc(embeddingLaneConcurrencySetting || 2)))
 
 		// Validate and set model dimension
@@ -215,6 +220,7 @@ export class CodeIndexConfigManager {
 			}>
 			searchMinScore?: number
 			respectGitIgnore?: boolean
+			includeDefaultIgnoredGeneratedPaths?: boolean
 			embeddingLaneConcurrency?: number
 		}
 		requiresRestart: boolean
@@ -242,6 +248,7 @@ export class CodeIndexConfigManager {
 			maxFileSizeBytes: this.maxFileSizeBytes,
 			oversizedFileApprovalsJson: JSON.stringify(this.oversizedFileApprovals),
 			respectGitIgnore: this.respectGitIgnore,
+			includeDefaultIgnoredGeneratedPaths: this.includeDefaultIgnoredGeneratedPaths,
 			embeddingLaneConcurrency: this.embeddingLaneConcurrency,
 		}
 
@@ -286,6 +293,7 @@ export class CodeIndexConfigManager {
 				oversizedFileApprovals: this.oversizedFileApprovals,
 				searchMinScore: this.currentSearchMinScore,
 				respectGitIgnore: this.respectGitIgnore,
+				includeDefaultIgnoredGeneratedPaths: this.includeDefaultIgnoredGeneratedPaths,
 				embeddingLaneConcurrency: this.embeddingLaneConcurrency,
 			},
 			requiresRestart,
@@ -388,6 +396,7 @@ export class CodeIndexConfigManager {
 			prev?.maxFileSizeBytes ?? CodeIndexConfigManager.DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024
 		const prevOversizedFileApprovalsJson = prev?.oversizedFileApprovalsJson ?? "[]"
 		const prevRespectGitIgnore = prev?.respectGitIgnore ?? true
+		const prevIncludeDefaultIgnoredGeneratedPaths = prev?.includeDefaultIgnoredGeneratedPaths ?? false
 
 		// 1. Transition from disabled/unconfigured to enabled/configured
 		if ((!prevEnabled || !prevConfigured) && this.codebaseIndexEnabled && nowConfigured) {
@@ -433,6 +442,7 @@ export class CodeIndexConfigManager {
 		const currentMaxFileSizeBytes = this.maxFileSizeBytes
 		const currentOversizedFileApprovalsJson = JSON.stringify(this.oversizedFileApprovals)
 		const currentRespectGitIgnore = this.respectGitIgnore
+		const currentIncludeDefaultIgnoredGeneratedPaths = this.includeDefaultIgnoredGeneratedPaths
 
 		// Helper: detect if a secret "disappeared" (was set, now empty).
 		// This pattern indicates a stale secret cache (e.g., macOS keychain
@@ -515,6 +525,10 @@ export class CodeIndexConfigManager {
 			return true
 		}
 
+		if (prevIncludeDefaultIgnoredGeneratedPaths !== currentIncludeDefaultIgnoredGeneratedPaths) {
+			return true
+		}
+
 		// Vector dimension changes (still important for compatibility)
 		if (this._hasVectorDimensionChanged(prevProvider, prev?.modelId)) {
 			return true
@@ -573,6 +587,7 @@ export class CodeIndexConfigManager {
 			searchMinScore: this.currentSearchMinScore,
 			searchMaxResults: this.currentSearchMaxResults,
 			respectGitIgnore: this.respectGitIgnore,
+			includeDefaultIgnoredGeneratedPaths: this.includeDefaultIgnoredGeneratedPaths,
 			embeddingLaneConcurrency: this.embeddingLaneConcurrency,
 		}
 	}
@@ -638,6 +653,10 @@ export class CodeIndexConfigManager {
 
 	public get currentRespectGitIgnore(): boolean {
 		return this.respectGitIgnore
+	}
+
+	public get currentIncludeDefaultIgnoredGeneratedPaths(): boolean {
+		return this.includeDefaultIgnoredGeneratedPaths
 	}
 
 	public get currentEmbeddingLaneConcurrency(): number {

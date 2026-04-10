@@ -2,6 +2,7 @@ import * as vscode from "vscode"
 import * as path from "path"
 
 import { listFiles } from "../../services/glob/list-files"
+import { IndexDebugLoggerV2 } from "../../services/code-index-v2/logging/IndexDebugLoggerV2"
 import { ClineProvider } from "../../core/webview/ClineProvider"
 import { toRelativePath, getWorkspacePath } from "../../utils/path"
 
@@ -30,11 +31,22 @@ class WorkspaceTracker {
 			return
 		}
 		const tempCwd = this.cwd
+		const startedAt = Date.now()
+		IndexDebugLoggerV2.log("basic", "WorkspaceTracker", "initialize-file-paths-start", {
+			workspacePath: tempCwd,
+			maxInitialFiles: MAX_INITIAL_FILES,
+		})
 		const [files, _] = await listFiles(tempCwd, true, MAX_INITIAL_FILES)
 		if (this.prevWorkSpacePath !== tempCwd) {
 			return
 		}
 		files.slice(0, MAX_INITIAL_FILES).forEach((file) => this.filePaths.add(this.normalizeFilePath(file)))
+		IndexDebugLoggerV2.log("basic", "WorkspaceTracker", "initialize-file-paths-complete", {
+			workspacePath: tempCwd,
+			durationMs: Date.now() - startedAt,
+			discoveredFiles: files.length,
+			trackedFiles: this.filePaths.size,
+		})
 		this.workspaceDidUpdate()
 	}
 

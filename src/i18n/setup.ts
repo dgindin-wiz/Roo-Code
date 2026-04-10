@@ -6,6 +6,29 @@ const translations: Record<string, Record<string, any>> = {}
 // Determine if running in test environment
 const isTestEnv = process.env.NODE_ENV === "test"
 
+export function resolveLocalesDir(
+	baseDir: string,
+	pathModule = require("path"),
+	fsModule = require("fs"),
+): string | null {
+	const candidateDirs = [
+		pathModule.join(baseDir, "i18n", "locales"),
+		pathModule.join(baseDir, "..", "i18n", "locales"),
+	]
+
+	for (const candidateDir of candidateDirs) {
+		try {
+			if (fsModule.existsSync(candidateDir) && fsModule.statSync(candidateDir).isDirectory()) {
+				return candidateDir
+			}
+		} catch {
+			// Ignore broken candidates and keep searching.
+		}
+	}
+
+	return null
+}
+
 // Load translations based on environment
 if (!isTestEnv) {
 	try {
@@ -13,9 +36,9 @@ if (!isTestEnv) {
 		const fs = require("fs")
 		const path = require("path")
 
-		const localesDir = path.join(__dirname, "i18n", "locales")
+		const localesDir = resolveLocalesDir(__dirname, path, fs)
 
-		try {
+		if (localesDir) {
 			// Find all language directories
 			const languageDirs = fs.readdirSync(localesDir, { withFileTypes: true })
 
@@ -60,8 +83,8 @@ if (!isTestEnv) {
 			})
 
 			console.log(`Loaded translations for languages: ${Object.keys(translations).join(", ")}`)
-		} catch (dirError) {
-			console.error(`Error processing directory ${localesDir}:`, dirError)
+		} else {
+			console.warn(`Translation locales directory not found for base path ${__dirname}`)
 		}
 	} catch (error) {
 		console.error("Error loading translations:", error)

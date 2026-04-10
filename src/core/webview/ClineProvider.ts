@@ -103,6 +103,7 @@ import { getNonce } from "./getNonce"
 import { getUri } from "./getUri"
 import { REQUESTY_BASE_URL } from "../../shared/utils/requesty"
 import { validateAndFixToolResultIds } from "../task/validateToolResultIds"
+import { IndexDebugLoggerV2 } from "../../services/code-index-v2/logging/IndexDebugLoggerV2"
 
 /**
  * https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/default/weather-webview/src/providers/WeatherViewProvider.ts
@@ -166,6 +167,11 @@ export class ClineProvider
 	 * Used by the frontend to reject stale state that arrives out-of-order.
 	 */
 	private clineMessagesSeq = 0
+	private statePostTimer: NodeJS.Timeout | null = null
+	private pendingStatePostKind: "full" | "noTaskHistory" | "noMessages" | null = null
+	private pendingStatePostPromise: Promise<void> | null = null
+	private pendingStatePostResolve: (() => void) | null = null
+	private static readonly STATE_POST_DEBOUNCE_MS = 100
 
 	public isViewLaunched = false
 	public settingsImportedAt?: number
@@ -181,6 +187,9 @@ export class ClineProvider
 		mdmService?: MdmService,
 	) {
 		super()
+		IndexDebugLoggerV2.log("basic", "WebviewProvider", "constructor-start", {
+			renderContext,
+		})
 		this.currentWorkspacePath = getWorkspacePath()
 
 		ClineProvider.activeInstances.add(this)
@@ -232,6 +241,10 @@ export class ClineProvider
 		})
 
 		this.marketplaceManager = new MarketplaceManager(this.context, this.customModesManager)
+		IndexDebugLoggerV2.log("basic", "WebviewProvider", "constructor-complete", {
+			renderContext,
+			workspacePath: this.currentWorkspacePath,
+		})
 
 		// Forward <most> task events to the provider.
 		// We do something fairly similar for the IPC-based API.
@@ -656,6 +669,7 @@ export class ClineProvider
 	- https://github.com/microsoft/vscode-extension-samples/blob/main/webview-sample/src/extension.ts
 	*/
 	private clearWebviewResources() {
+		this.isViewLaunched = false
 		while (this.webviewDisposables.length) {
 			const x = this.webviewDisposables.pop()
 			if (x) {
@@ -682,6 +696,15 @@ export class ClineProvider
 		// Clear all pending edit operations to prevent memory leaks
 		this.clearAllPendingEditOperations()
 		this.log("Cleared pending operations")
+
+		if (this.statePostTimer) {
+			clearTimeout(this.statePostTimer)
+			this.statePostTimer = null
+		}
+		this.pendingStatePostKind = null
+		this.pendingStatePostResolve?.()
+		this.pendingStatePostResolve = null
+		this.pendingStatePostPromise = null
 
 		if (this.view && "dispose" in this.view) {
 			this.view.dispose()
@@ -831,6 +854,10 @@ export class ClineProvider
 	}
 
 	async resolveWebviewView(webviewView: vscode.WebviewView | vscode.WebviewPanel) {
+		const startedAt = Date.now()
+		IndexDebugLoggerV2.log("basic", "WebviewProvider", "resolve-webview-start", {
+			renderContext: this.renderContext,
+		})
 		this.view = webviewView
 		const inTabMode = "onDidChangeViewState" in webviewView
 
@@ -885,6 +912,11 @@ export class ClineProvider
 			this.contextProxy.extensionMode === vscode.ExtensionMode.Development
 				? await this.getHMRHtmlContent(webviewView.webview)
 				: await this.getHtmlContent(webviewView.webview)
+		IndexDebugLoggerV2.log("basic", "WebviewProvider", "resolve-webview-html-ready", {
+			renderContext: this.renderContext,
+			durationMs: Date.now() - startedAt,
+			htmlLength: webviewView.webview.html.length,
+		})
 
 		// Sets up an event listener to listen for messages passed from the webview view context
 		// and executes code based on the message that is received.
@@ -957,6 +989,10 @@ export class ClineProvider
 		if (!currentTask || currentTask.abandoned || currentTask.abort) {
 			await this.removeClineFromStack()
 		}
+		IndexDebugLoggerV2.log("basic", "WebviewProvider", "resolve-webview-complete", {
+			renderContext: this.renderContext,
+			durationMs: Date.now() - startedAt,
+		})
 	}
 
 	public async createTaskWithHistoryItem(
@@ -1186,9 +1222,29 @@ export class ClineProvider
 		}
 
 		try {
+			if (
+				message.type === "state" ||
+				message.type === "theme" ||
+				message.type === "marketplaceData" ||
+				message.type === "mcpServers"
+			) {
+				IndexDebugLoggerV2.log("basic", "WebviewProvider", "post-message", {
+					renderContext: this.renderContext,
+					messageType: message.type,
+					approxPayloadBytes: this.getApproxPayloadBytes(message),
+				})
+			}
 			await this.view?.webview.postMessage(message)
 		} catch {
 			// View disposed, drop message silently
+		}
+	}
+
+	private getApproxPayloadBytes(value: unknown): number | undefined {
+		try {
+			return Buffer.byteLength(JSON.stringify(value), "utf8")
+		} catch {
+			return undefined
 		}
 	}
 
@@ -1966,10 +2022,78 @@ export class ClineProvider
 		await this.postStateToWebview()
 	}
 
+	private mergePendingStatePostKind(
+		previous: "full" | "noTaskHistory" | "noMessages" | null,
+		next: "full" | "noTaskHistory" | "noMessages",
+	): "full" | "noTaskHistory" | "noMessages" {
+		if (previous === "full" || next === "full") {
+			return "full"
+		}
+		if (previous === "noTaskHistory" || next === "noTaskHistory") {
+			return "noTaskHistory"
+		}
+		return "noMessages"
+	}
+
+	private enqueueStatePost(kind: "full" | "noTaskHistory" | "noMessages"): Promise<void> {
+		if (!this.pendingStatePostPromise) {
+			this.pendingStatePostPromise = new Promise((resolve) => {
+				this.pendingStatePostResolve = resolve
+			})
+		}
+		this.pendingStatePostKind = this.mergePendingStatePostKind(this.pendingStatePostKind, kind)
+		if (!this.statePostTimer) {
+			this.statePostTimer = setTimeout(() => {
+				this.flushPendingStatePost().catch((error) => {
+					this.log(
+						`[postStateToWebview] Failed to flush pending state: ${error instanceof Error ? error.message : String(error)}`,
+					)
+				})
+			}, ClineProvider.STATE_POST_DEBOUNCE_MS)
+		}
+		return this.pendingStatePostPromise
+	}
+
+	private async flushPendingStatePost(): Promise<void> {
+		const pendingKind = this.pendingStatePostKind
+		const resolve = this.pendingStatePostResolve
+		this.pendingStatePostKind = null
+		this.pendingStatePostResolve = null
+		this.pendingStatePostPromise = null
+		if (this.statePostTimer) {
+			clearTimeout(this.statePostTimer)
+			this.statePostTimer = null
+		}
+		if (!pendingKind) {
+			resolve?.()
+			return
+		}
+		if (pendingKind === "full") {
+			await this.postStateToWebviewImmediate()
+		} else if (pendingKind === "noTaskHistory") {
+			await this.postStateToWebviewWithoutTaskHistoryImmediate()
+		} else {
+			await this.postStateToWebviewWithoutClineMessagesImmediate()
+		}
+		resolve?.()
+	}
+
 	async postStateToWebview() {
+		await this.enqueueStatePost("full")
+	}
+
+	private async postStateToWebviewImmediate() {
+		const startedAt = Date.now()
 		const state = await this.getStateToPostToWebview()
 		this.clineMessagesSeq++
 		state.clineMessagesSeq = this.clineMessagesSeq
+		IndexDebugLoggerV2.log("basic", "WebviewProvider", "post-state-full-ready", {
+			renderContext: this.renderContext,
+			durationMs: Date.now() - startedAt,
+			taskHistoryLength: state.taskHistory?.length ?? 0,
+			clineMessagesLength: state.clineMessages?.length ?? 0,
+			approxPayloadBytes: this.getApproxPayloadBytes(state),
+		})
 		this.postMessageToWebview({ type: "state", state })
 
 		// Check MDM compliance and send user to account tab if not compliant
@@ -1988,10 +2112,21 @@ export class ClineProvider
 	 *   `taskHistoryUpdated` / `taskHistoryItemUpdated`.
 	 */
 	async postStateToWebviewWithoutTaskHistory(): Promise<void> {
+		await this.enqueueStatePost("noTaskHistory")
+	}
+
+	private async postStateToWebviewWithoutTaskHistoryImmediate(): Promise<void> {
+		const startedAt = Date.now()
 		const state = await this.getStateToPostToWebview()
 		this.clineMessagesSeq++
 		state.clineMessagesSeq = this.clineMessagesSeq
 		const { taskHistory: _omit, ...rest } = state
+		IndexDebugLoggerV2.log("basic", "WebviewProvider", "post-state-no-task-history-ready", {
+			renderContext: this.renderContext,
+			durationMs: Date.now() - startedAt,
+			clineMessagesLength: state.clineMessages?.length ?? 0,
+			approxPayloadBytes: this.getApproxPayloadBytes(rest),
+		})
 		this.postMessageToWebview({ type: "state", state: rest })
 
 		// Preserve existing MDM redirect behavior
@@ -2012,8 +2147,18 @@ export class ClineProvider
 	 *   (cloud auth, org settings, profiles, etc.) without interfering with task message streaming.
 	 */
 	async postStateToWebviewWithoutClineMessages(): Promise<void> {
+		await this.enqueueStatePost("noMessages")
+	}
+
+	private async postStateToWebviewWithoutClineMessagesImmediate(): Promise<void> {
+		const startedAt = Date.now()
 		const state = await this.getStateToPostToWebview()
 		const { clineMessages: _omitMessages, taskHistory: _omitHistory, ...rest } = state
+		IndexDebugLoggerV2.log("basic", "WebviewProvider", "post-state-no-messages-ready", {
+			renderContext: this.renderContext,
+			durationMs: Date.now() - startedAt,
+			approxPayloadBytes: this.getApproxPayloadBytes(rest),
+		})
 		this.postMessageToWebview({ type: "state", state: rest })
 
 		// Preserve existing MDM redirect behavior
@@ -2124,6 +2269,7 @@ export class ClineProvider
 	}
 
 	async getStateToPostToWebview(): Promise<ExtensionState> {
+		const startedAt = Date.now()
 		// Ensure the store is initialized before reading task history
 		await this.taskHistoryStore.initialized
 
@@ -2239,7 +2385,7 @@ export class ClineProvider
 		const cwd = this.cwd
 		const currentTask = this.getCurrentTask()
 
-		return {
+		const state = {
 			version: this.context.extension?.packageJSON?.version ?? "",
 			apiConfiguration,
 			customInstructions,
@@ -2384,6 +2530,15 @@ export class ClineProvider
 			})(),
 			debug: vscode.workspace.getConfiguration(Package.name).get<boolean>("debug", false),
 		}
+		IndexDebugLoggerV2.log("basic", "WebviewProvider", "get-state-to-post-complete", {
+			renderContext: this.renderContext,
+			durationMs: Date.now() - startedAt,
+			taskHistoryLength: state.taskHistory?.length ?? 0,
+			clineMessagesLength: state.clineMessages?.length ?? 0,
+			messageQueueLength: state.messageQueue?.length ?? 0,
+			approxPayloadBytes: this.getApproxPayloadBytes(state),
+		})
+		return state
 	}
 
 	/**
@@ -2816,6 +2971,18 @@ export class ClineProvider
 	 */
 	public getCurrentWorkspaceCodeIndexManager(): CodeIndexManager | undefined {
 		return CodeIndexManager.getInstance(this.context)
+	}
+
+	public syncCurrentCodeIndexStatusToWebview(): void {
+		this.updateCodeIndexStatusSubscription()
+		const currentManager = this.getCurrentWorkspaceCodeIndexManager()
+		if (!currentManager) {
+			return
+		}
+		this.postMessageToWebview({
+			type: "indexingStatusUpdate",
+			values: currentManager.getCurrentStatus(),
+		})
 	}
 
 	/**

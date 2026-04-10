@@ -65,6 +65,7 @@ describe("RetrievalEvaluator", () => {
 		expect(report.aggregate.recallAt[3]).toBe(1)
 		expect(report.aggregate.mrr).toBe(0.75)
 		expect(report.queries[1]?.firstRelevantRank).toBe(2)
+		expect(report.queries[1]?.topHits[0]?.filePath).toBe("src/other.ts")
 	})
 
 	it("treats path and symbol expectations within one fixture as alternative acceptable hits", async () => {
@@ -96,5 +97,34 @@ describe("RetrievalEvaluator", () => {
 		expect(report.aggregate.recallAt[1]).toBe(1)
 		expect(report.aggregate.recallAt[3]).toBe(1)
 		expect(report.aggregate.mrr).toBe(1)
+	})
+
+	it("creates stage aggregates from query stage results", () => {
+		const evaluator = new RetrievalEvaluator([1, 3])
+
+		const aggregate = evaluator.buildStageAggregate("vector", [
+			{
+				fixture: { id: "q1", query: "query" },
+				results: [],
+				firstRelevantRank: 1,
+				mrr: 1,
+				recallAt: { 1: 1, 3: 1 },
+				topHits: [],
+				stageResults: [
+					{
+						stage: "vector",
+						firstRelevantRank: 2,
+						mrr: 0.5,
+						recallAt: { 1: 0, 3: 1 },
+						topHits: [],
+					},
+				],
+			},
+		])
+
+		expect(aggregate.stage).toBe("vector")
+		expect(aggregate.mrr).toBe(0.5)
+		expect(aggregate.recallAt[1]).toBe(0)
+		expect(aggregate.recallAt[3]).toBe(1)
 	})
 })

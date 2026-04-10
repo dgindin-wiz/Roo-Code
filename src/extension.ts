@@ -49,6 +49,7 @@ import {
 } from "./activate"
 import { initializeI18n } from "./i18n"
 import { flushModels, initializeModelCacheRefresh, refreshModels } from "./api/providers/fetchers/modelCache"
+import { IndexDebugLoggerV2 } from "./services/code-index-v2/logging/IndexDebugLoggerV2"
 
 /**
  * Built using https://github.com/microsoft/vscode-webview-ui-toolkit
@@ -118,6 +119,9 @@ async function checkWorktreeAutoOpen(
 // This method is called when your extension is activated.
 // Your extension is activated the very first time the command is executed.
 export async function activate(context: vscode.ExtensionContext) {
+	IndexDebugLoggerV2.log("basic", "Activation", "activate-start", {
+		workspaceFolders: vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath) ?? [],
+	})
 	extensionContext = context
 	outputChannel = vscode.window.createOutputChannel(Package.outputChannel)
 	context.subscriptions.push(outputChannel)
@@ -127,12 +131,14 @@ export async function activate(context: vscode.ExtensionContext) {
 	// When proxyUrl is configured, all HTTP/HTTPS traffic will be routed through it.
 	// Only applied in debug mode (F5).
 	await initializeNetworkProxy(context, outputChannel)
+	IndexDebugLoggerV2.log("basic", "Activation", "network-proxy-initialized")
 
 	// Set extension path for custom tool registry to find bundled esbuild
 	customToolRegistry.setExtensionPath(context.extensionPath)
 
 	// Migrate old settings to new
 	await migrateSettings(context, outputChannel)
+	IndexDebugLoggerV2.log("basic", "Activation", "settings-migrated")
 
 	// Initialize telemetry service.
 	const telemetryService = TelemetryService.createInstance()
@@ -148,6 +154,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	// Initialize MDM service
 	const mdmService = await MdmService.createInstance(cloudLogger)
+	IndexDebugLoggerV2.log("basic", "Activation", "mdm-initialized")
 
 	// Initialize i18n for internationalization support.
 	initializeI18n(context.globalState.get("language") ?? formatLanguage(vscode.env.language))
@@ -165,8 +172,14 @@ export async function activate(context: vscode.ExtensionContext) {
 	if (!context.globalState.get("allowedCommands")) {
 		context.globalState.update("allowedCommands", defaultCommands)
 	}
+	IndexDebugLoggerV2.log("basic", "Activation", "global-command-state-ready", {
+		defaultAllowedCommandsCount: defaultCommands.length,
+	})
 
 	const contextProxy = await ContextProxy.getInstance(context)
+	IndexDebugLoggerV2.log("basic", "Activation", "context-proxy-ready", {
+		contextProxyInitialized: contextProxy.isInitialized,
+	})
 
 	// Initialize code index managers for all workspace folders.
 	const codeIndexManagers: CodeIndexManager[] = []
@@ -185,6 +198,9 @@ export async function activate(context: vscode.ExtensionContext) {
 						`[CodeIndexManager] Error during background CodeIndexManager configuration/indexing for ${folder.uri.fsPath}: ${message}`,
 					)
 				})
+				IndexDebugLoggerV2.log("basic", "Activation", "code-index-manager-init-scheduled", {
+					workspacePath: folder.uri.fsPath,
+				})
 
 				context.subscriptions.push(manager)
 			}
@@ -193,6 +209,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	// Initialize the provider *before* the Roo Code Cloud service.
 	const provider = new ClineProvider(context, outputChannel, "sidebar", contextProxy, mdmService)
+	IndexDebugLoggerV2.log("basic", "Activation", "cline-provider-created", {
+		renderContext: "sidebar",
+	})
 
 	// Initialize Roo Code Cloud service.
 	const postStateListener = () => ClineProvider.getVisibleInstance()?.postStateToWebviewWithoutClineMessages()
@@ -267,6 +286,7 @@ export async function activate(context: vscode.ExtensionContext) {
 		"settings-updated": settingsUpdatedHandler,
 		"user-info": userInfoHandler,
 	})
+	IndexDebugLoggerV2.log("basic", "Activation", "cloud-service-created")
 
 	try {
 		if (cloudService.telemetryClient) {
@@ -289,6 +309,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			`[CloudService] Failed to initialize cloud profile sync: ${error instanceof Error ? error.message : String(error)}`,
 		)
 	}
+	IndexDebugLoggerV2.log("basic", "Activation", "cloud-profile-sync-ready")
 
 	// Finish initializing the provider.
 	TelemetryService.instance.setProvider(provider)
@@ -298,9 +319,11 @@ export async function activate(context: vscode.ExtensionContext) {
 			webviewOptions: { retainContextWhenHidden: true },
 		}),
 	)
+	IndexDebugLoggerV2.log("basic", "Activation", "webview-provider-registered")
 
 	// Check for worktree auto-open path (set when switching to a worktree)
 	await checkWorktreeAutoOpen(context, outputChannel)
+	IndexDebugLoggerV2.log("basic", "Activation", "worktree-auto-open-checked")
 
 	// Auto-import configuration if specified in settings.
 	try {
@@ -314,6 +337,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			`[AutoImport] Error during auto-import: ${error instanceof Error ? error.message : String(error)}`,
 		)
 	}
+	IndexDebugLoggerV2.log("basic", "Activation", "auto-import-complete")
 
 	registerCommands({ context, outputChannel, provider })
 
@@ -357,6 +381,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	// Allows other extensions to activate once Roo is ready.
 	vscode.commands.executeCommand(`${Package.name}.activationCompleted`)
+	IndexDebugLoggerV2.log("basic", "Activation", "activation-completed-command-fired")
 
 	// Implements the `RooCodeAPI` interface.
 	const socketPath = process.env.ROO_CODE_IPC_SOCKET_PATH
@@ -416,6 +441,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	// Initialize background model cache refresh
 	initializeModelCacheRefresh()
+	IndexDebugLoggerV2.log("basic", "Activation", "activate-complete")
 
 	return new API(outputChannel, provider, socketPath, enableLogging)
 }

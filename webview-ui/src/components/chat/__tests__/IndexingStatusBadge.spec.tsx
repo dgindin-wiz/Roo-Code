@@ -305,6 +305,131 @@ describe("IndexingStatusBadge", () => {
 		expect(text).toBe("Preparing files for indexing — 12 of 40 checked")
 	})
 
+	it("summarizes running pipeline services when structured pipeline data is present", () => {
+		const text = getIndexingBadgeTooltipText(
+			{
+				systemStatus: "Indexing",
+				processedItems: 10,
+				totalItems: 20,
+				currentItemUnit: "files",
+				pipeline: {
+					overallState: "running",
+					overallHealth: "watch",
+					runMode: "start",
+					services: [
+						{
+							id: "discovery",
+							title: "Discovery",
+							state: "completed",
+							health: "healthy",
+							summary: "done",
+							metrics: [],
+						},
+						{
+							id: "parse",
+							title: "Parse",
+							state: "running",
+							health: "healthy",
+							summary: "active",
+							metrics: [],
+						},
+						{
+							id: "embed",
+							title: "Embed",
+							state: "running",
+							health: "watch",
+							summary: "active",
+							metrics: [],
+						},
+					],
+				},
+			},
+			false,
+			(key: string) => key,
+			50,
+		)
+
+		expect(text).toBe("Indexing — Parse, Embed — health watch")
+	})
+
+	it("summarizes split embedding and vector-sync services when no pipeline summary is present", () => {
+		const text = getIndexingBadgeTooltipText(
+			{
+				systemStatus: "Indexing",
+				processedItems: 10,
+				totalItems: 20,
+				currentItemUnit: "files",
+				pipeline: {
+					overallState: "running",
+					overallHealth: "watch",
+					runMode: "start",
+					services: [
+						{
+							id: "parse",
+							title: "Parse",
+							state: "running",
+							health: "healthy",
+							summary: "active",
+							metrics: [],
+						},
+						{
+							id: "embedding",
+							title: "Embedding",
+							state: "running",
+							health: "watch",
+							summary: "active",
+							metrics: [],
+						},
+						{
+							id: "vector_sync",
+							title: "Vector sync",
+							state: "running",
+							health: "healthy",
+							summary: "active",
+							metrics: [],
+						},
+					],
+				},
+			},
+			false,
+			(key: string) => key,
+			50,
+		)
+
+		expect(text).toBe("Indexing — Parse, Embedding, Vector sync — health watch")
+	})
+
+	it("uses the host-provided pipeline summary when available", () => {
+		const text = getIndexingBadgeTooltipText(
+			{
+				systemStatus: "Indexing",
+				processedItems: 340,
+				totalItems: 2377,
+				currentItemUnit: "files",
+				estimatedTimeRemainingMs: 480000,
+				pipeline: {
+					overallState: "running",
+					overallHealth: "watch",
+					runMode: "start",
+					etaMs: 480000,
+					services: [],
+					summary: {
+						headline: "Building embeddings and syncing vectors",
+						progressLabel: "Synced 8,633 of 10,881 chunks",
+						secondaryLabel: "Also parsing changed files in the background.",
+					},
+				},
+			},
+			false,
+			(key: string) => key,
+			14,
+		)
+
+		expect(text).toBe(
+			"Building embeddings and syncing vectors — Synced 8,633 of 10,881 chunks — Also parsing changed files in the background. — ~8m remaining",
+		)
+	})
+
 	it("cleans up event listener on unmount", () => {
 		const { unmount } = renderComponent()
 		const removeEventListenerSpy = vi.spyOn(window, "removeEventListener")

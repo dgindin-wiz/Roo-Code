@@ -15,7 +15,7 @@ import { useExtensionState } from "@src/context/ExtensionStateContext"
 import { cn } from "@src/lib/utils"
 
 import { Button, StandardTooltip } from "@src/components/ui"
-import CodeBlock from "@src/components/common/CodeBlock"
+import LazyCodeBlock from "@src/components/common/LazyCodeBlock"
 
 import { CommandPatternSelector } from "./CommandPatternSelector"
 import { TerminalOutput } from "./TerminalOutput"
@@ -201,7 +201,7 @@ export const CommandExecution = ({ executionId, text, icon, title }: CommandExec
 
 			<div className="bg-vscode-editor-background border border-vscode-border rounded-xs ml-6 mt-2">
 				<div className="p-2">
-					<CodeBlock source={command} language="shell" />
+					<LazyCodeBlock source={command} language="shell" />
 					<OutputContainer isExpanded={isExpanded} output={output} />
 				</div>
 				{command && command.trim() && (

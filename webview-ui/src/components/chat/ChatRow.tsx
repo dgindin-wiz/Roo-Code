@@ -27,7 +27,7 @@ import { ToolUseBlock, ToolUseBlockHeader } from "../common/ToolUseBlock"
 import UpdateTodoListToolBlock from "./UpdateTodoListToolBlock"
 import { TodoChangeDisplay } from "./TodoChangeDisplay"
 import CodeAccordion from "../common/CodeAccordion"
-import MarkdownBlock from "../common/MarkdownBlock"
+import LazyMarkdownBlock from "../common/LazyMarkdownBlock"
 import { ReasoningBlock } from "./ReasoningBlock"
 import Thumbnails from "../common/Thumbnails"
 import ImageBlock from "../common/ImageBlock"
@@ -866,7 +866,7 @@ export const ChatRowContent = ({
 							</span>
 						</div>
 						<div className="border-l border-muted-foreground/80 ml-2 pl-4 pb-1">
-							<MarkdownBlock markdown={tool.content} />
+							<LazyMarkdownBlock markdown={tool.content} />
 							<div>
 								{childTaskId && !isFollowedBySubtaskResult && (
 									<button
@@ -890,7 +890,7 @@ export const ChatRowContent = ({
 							<span style={{ fontWeight: "bold" }}>{t("chat:subtasks.wantsToFinish")}</span>
 						</div>
 						<div className="text-muted-foreground pl-6">
-							<MarkdownBlock markdown={t("chat:subtasks.completionInstructions")} />
+							<LazyMarkdownBlock markdown={t("chat:subtasks.completionInstructions")} />
 						</div>
 					</>
 				)
@@ -1027,7 +1027,7 @@ export const ChatRowContent = ({
 								<span style={{ fontWeight: "bold" }}>{t("chat:subtasks.resultContent")}</span>
 								<Check className="size-3" />
 							</div>
-							<MarkdownBlock markdown={message.text} />
+							<LazyMarkdownBlock markdown={message.text} />
 							{completedChildTaskId && (
 								<button
 									className="cursor-pointer flex gap-1 items-center mt-2 text-vscode-descriptionForeground hover:text-vscode-descriptionForeground hover:underline font-normal"

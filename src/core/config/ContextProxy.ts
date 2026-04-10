@@ -22,6 +22,7 @@ import { TelemetryService } from "@roo-code/telemetry"
 
 import { logger } from "../../utils/logging"
 import { supportPrompt } from "../../shared/support-prompt"
+import { IndexDebugLoggerV2 } from "../../services/code-index-v2/logging/IndexDebugLoggerV2"
 
 type GlobalStateKey = keyof GlobalState
 type SecretStateKey = keyof SecretState
@@ -56,6 +57,8 @@ export class ContextProxy {
 	}
 
 	public async initialize() {
+		const startedAt = Date.now()
+		IndexDebugLoggerV2.log("basic", "ContextProxy", "initialize-start")
 		for (const key of GLOBAL_STATE_KEYS) {
 			try {
 				// Revert to original assignment
@@ -101,6 +104,11 @@ export class ContextProxy {
 		await this.migrateOldDefaultCondensingPrompt()
 
 		this._isInitialized = true
+		IndexDebugLoggerV2.log("basic", "ContextProxy", "initialize-complete", {
+			durationMs: Date.now() - startedAt,
+			globalStateKeyCount: GLOBAL_STATE_KEYS.length,
+			secretStateKeyCount: SECRET_STATE_KEYS.length + GLOBAL_SECRET_KEYS.length,
+		})
 	}
 
 	/**
@@ -577,9 +585,11 @@ export class ContextProxy {
 
 	static async getInstance(context: vscode.ExtensionContext) {
 		if (this._instance) {
+			IndexDebugLoggerV2.log("basic", "ContextProxy", "get-instance-reused")
 			return this._instance
 		}
 
+		IndexDebugLoggerV2.log("basic", "ContextProxy", "get-instance-create")
 		this._instance = new ContextProxy(context)
 		await this._instance.initialize()
 

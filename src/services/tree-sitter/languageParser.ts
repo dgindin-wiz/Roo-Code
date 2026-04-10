@@ -1,3 +1,4 @@
+import { existsSync } from "fs"
 import * as path from "path"
 import { Parser as ParserT, Language as LanguageT, Query as QueryT } from "web-tree-sitter"
 import {
@@ -37,9 +38,54 @@ export interface LanguageParser {
 	}
 }
 
+function resolveTreeSitterAssetPath(filename: string, sourceDirectory?: string): string {
+	const resolutionPaths = [process.cwd(), path.join(process.cwd(), "src"), __dirname]
+	let installedWasmDir: string | undefined
+	try {
+		const packageJsonPath = require.resolve("tree-sitter-wasms/package.json", {
+			paths: resolutionPaths,
+		})
+		installedWasmDir = path.join(path.dirname(packageJsonPath), "out")
+	} catch {
+		installedWasmDir = undefined
+	}
+
+	let installedParserCoreDir: string | undefined
+	let installedParserCoreLibDir: string | undefined
+	try {
+		const moduleEntryPath = require.resolve("web-tree-sitter", {
+			paths: resolutionPaths,
+		})
+		installedParserCoreLibDir = path.dirname(moduleEntryPath)
+		installedParserCoreDir = path.dirname(installedParserCoreLibDir)
+	} catch {
+		installedParserCoreDir = undefined
+		installedParserCoreLibDir = undefined
+	}
+
+	const candidates = [
+		sourceDirectory ? path.join(sourceDirectory, filename) : undefined,
+		sourceDirectory ? path.join(sourceDirectory, "..", filename) : undefined,
+		path.join(__dirname, filename),
+		path.join(__dirname, "..", filename),
+		path.join(process.cwd(), "dist", filename),
+		installedWasmDir ? path.join(installedWasmDir, filename) : undefined,
+		installedParserCoreDir ? path.join(installedParserCoreDir, filename) : undefined,
+		installedParserCoreLibDir ? path.join(installedParserCoreLibDir, filename) : undefined,
+	].filter((candidate): candidate is string => Boolean(candidate))
+
+	for (const candidate of candidates) {
+		if (existsSync(candidate)) {
+			return candidate
+		}
+	}
+
+	return candidates[0] ?? filename
+}
+
 async function loadLanguage(langName: string, sourceDirectory?: string) {
-	const baseDir = sourceDirectory || __dirname
-	const wasmPath = path.join(baseDir, `tree-sitter-${langName}.wasm`)
+	const wasmFilename = `tree-sitter-${langName}.wasm`
+	const wasmPath = resolveTreeSitterAssetPath(wasmFilename, sourceDirectory)
 
 	try {
 		const { Language } = require("web-tree-sitter")
@@ -80,7 +126,11 @@ export async function loadRequiredLanguageParsers(filesToParse: string[], source
 
 	if (!isParserInitialized) {
 		try {
-			await Parser.init()
+			await Parser.init({
+				locateFile(scriptName: string, scriptDirectory: string) {
+					return resolveTreeSitterAssetPath(scriptName, sourceDirectory ?? scriptDirectory)
+				},
+			})
 			isParserInitialized = true
 		} catch (error) {
 			console.error(`Error initializing parser: ${error instanceof Error ? error.message : error}`)

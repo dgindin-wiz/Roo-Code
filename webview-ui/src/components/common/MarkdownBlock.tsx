@@ -15,6 +15,8 @@ interface MarkdownBlockProps {
 	markdown?: string
 }
 
+let hasLoggedMarkdownBlockLoad = false
+
 const StyledMarkdown = styled.div`
 	* {
 		font-weight: 400;
@@ -204,6 +206,14 @@ const StyledMarkdown = styled.div`
 `
 
 const MarkdownBlock = memo(({ markdown }: MarkdownBlockProps) => {
+	if (!hasLoggedMarkdownBlockLoad) {
+		hasLoggedMarkdownBlockLoad = true
+		vscode.postMessage({
+			type: "webviewBootMarker" as any,
+			text: "markdown-renderer-loaded",
+		})
+	}
+
 	const components = useMemo(
 		() => ({
 			table: ({ children, ...props }: any) => {

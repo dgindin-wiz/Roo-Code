@@ -8,7 +8,13 @@
  * - formatEtaForDisplay helper
  */
 
-import { getIndexingHeadline, getProgressStageLabel } from "../CodeIndexPopover"
+import {
+	getDefaultCodeIndexPopoverTab,
+	getIndexingHeadline,
+	getRunSummaryDisplay,
+	getProgressStageLabel,
+	shouldExpandIndexServiceCard,
+} from "../CodeIndexPopover"
 
 // --- Unit test: formatEtaForDisplay ---
 // We test the function in isolation by extracting the same logic
@@ -78,6 +84,32 @@ describe("CodeIndexPopover - Status dot color mapping", () => {
 })
 
 describe("CodeIndexPopover - Phase label rendering logic", () => {
+	test("prefers the host-provided pipeline summary headline when present", () => {
+		expect(
+			getIndexingHeadline(
+				{
+					systemStatus: "Indexing",
+					processedItems: 12,
+					totalItems: 20,
+					detailedStage: "parsing",
+					pipeline: {
+						overallState: "running",
+						overallHealth: "watch",
+						runMode: "start",
+						services: [],
+						summary: {
+							headline: "Building embeddings and syncing vectors",
+							progressLabel: "Synced 8,633 of 10,881 chunks",
+							secondaryLabel: "Also parsing changed files in the background.",
+						},
+					},
+				},
+				false,
+				(key: string) => key,
+			),
+		).toBe("Building embeddings and syncing vectors")
+	})
+
 	test("uses truth-first parsing headline before vector sync starts", () => {
 		expect(
 			getIndexingHeadline(
@@ -156,6 +188,40 @@ describe("CodeIndexPopover - Phase label rendering logic", () => {
 		const phase: string | undefined = undefined
 		const shouldRender = !!phase
 		expect(shouldRender).toBe(false)
+	})
+})
+
+describe("CodeIndexPopover - Run summary display", () => {
+	test("uses pipeline summary lines instead of legacy stage text when available", () => {
+		const display = getRunSummaryDisplay(
+			{
+				systemStatus: "Indexing",
+				processedItems: 340,
+				totalItems: 2377,
+				detailedStage: "parsing",
+				message:
+					"Preparing changed files for indexing\nParsing 340 of 2,377 files • Streaming 7,282 of 9,870 parsed chunks",
+				pipeline: {
+					overallState: "running",
+					overallHealth: "watch",
+					runMode: "start",
+					services: [],
+					summary: {
+						headline: "Building embeddings and syncing vectors",
+						progressLabel: "Synced 8,633 of 10,881 chunks",
+						secondaryLabel: "Also parsing changed files in the background.",
+					},
+				},
+			},
+			false,
+			(key: string) => key,
+		)
+
+		expect(display).toEqual({
+			headline: "Building embeddings and syncing vectors",
+			progressLine: "Synced 8,633 of 10,881 chunks",
+			secondaryLine: "Also parsing changed files in the background.",
+		})
 	})
 })
 
@@ -391,5 +457,45 @@ describe("CodeIndexPopover - warning details state sync", () => {
 
 		expect(nextState.items).toHaveLength(1)
 		expect(nextState.total).toBe(1)
+	})
+})
+
+describe("CodeIndexPopover - overview defaults", () => {
+	test("defaults to overview when indexing is enabled and pipeline data exists", () => {
+		expect(
+			getDefaultCodeIndexPopoverTab(true, {
+				overallState: "running",
+				overallHealth: "healthy",
+				runMode: "start",
+				services: [],
+			}),
+		).toBe("overview")
+	})
+
+	test("defaults to settings when indexing is disabled", () => {
+		expect(
+			getDefaultCodeIndexPopoverTab(false, {
+				overallState: "running",
+				overallHealth: "healthy",
+				runMode: "start",
+				services: [],
+			}),
+		).toBe("settings")
+	})
+
+	test("defaults to settings when there is no pipeline snapshot yet", () => {
+		expect(getDefaultCodeIndexPopoverTab(true, undefined)).toBe("settings")
+	})
+
+	test("expands active and warning service cards by default", () => {
+		expect(shouldExpandIndexServiceCard("running")).toBe(true)
+		expect(shouldExpandIndexServiceCard("warning")).toBe(true)
+		expect(shouldExpandIndexServiceCard("failed")).toBe(true)
+	})
+
+	test("collapses pending and completed service cards by default", () => {
+		expect(shouldExpandIndexServiceCard("pending")).toBe(false)
+		expect(shouldExpandIndexServiceCard("completed")).toBe(false)
+		expect(shouldExpandIndexServiceCard("skipped")).toBe(false)
 	})
 })

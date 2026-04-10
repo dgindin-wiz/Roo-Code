@@ -18,7 +18,7 @@ export class ExistingEmbedderAdapter implements EmbeddingAdapter {
 		},
 	) {
 		this.provider = embedder.embedderInfo.name
-		this.modelId = options?.modelId ?? "configured-model"
+		this.modelId = options?.modelId ?? "unknown-configured-model"
 		this.runtimeKind = options?.runtimeKind ?? "remote"
 		this.runtimeLabel =
 			options?.runtimeLabel ?? (this.runtimeKind === "local" ? "Local embedder" : "Remote embedder")
@@ -36,7 +36,7 @@ export class ExistingEmbedderAdapter implements EmbeddingAdapter {
 				outerBatchSize?: number
 			}
 		},
-	): Promise<{ embeddings: number[][] }> {
+	): Promise<{ embeddings: number[][]; usage?: { promptTokens: number; totalTokens: number } }> {
 		if (options?.signal?.aborted) {
 			throw new Error("Embedding request aborted")
 		}
@@ -53,6 +53,7 @@ export class ExistingEmbedderAdapter implements EmbeddingAdapter {
 
 		return {
 			embeddings: response.embeddings,
+			usage: response.usage,
 		}
 	}
 

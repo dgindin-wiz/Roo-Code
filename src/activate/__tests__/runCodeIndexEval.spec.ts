@@ -3,6 +3,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest"
 
 import { runCodeIndexEvalForCurrentWorkspace } from "../registerCommands"
 import { CodeIndexManager } from "../../services/code-index/manager"
+import { rooCodeBenchmarkFixtures } from "../../services/code-index-v2/eval"
 
 vi.mock("vscode", () => ({
 	window: {
@@ -54,191 +55,54 @@ describe("runCodeIndexEvalForCurrentWorkspace", () => {
 			isFeatureConfigured: true,
 			selectedEngine: "v2",
 			initialize: vi.fn(),
-			searchIndex: vi.fn(async (query: string) => {
-				if (query === "codebase search tool output formatting") {
-					return [
-						{
-							id: "1",
-							score: 0.9,
-							payload: {
-								filePath: "src/core/tools/CodebaseSearchTool.ts",
-								codeChunk: "class CodebaseSearchTool {}",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
+			searchIndex: vi.fn(async (query: string, _limit?: number) => {
+				const fixture = rooCodeBenchmarkFixtures.find((item) => item.query === query)
+				if (!fixture) {
+					return []
 				}
 
-				if (query === "search active chunks lexically metadata store") {
-					return [
-						{
-							id: "2",
-							score: 0.91,
-							payload: {
-								filePath: "src/services/code-index-v2/store/MetadataStore.ts",
-								symbolQualifiedName: "searchActiveChunksLexically",
-								codeChunk: "searchActiveChunksLexically(...)",
-								startLine: 1,
-								endLine: 1,
-							},
+				return [
+					{
+						id: fixture.id,
+						score: 0.9,
+						rerankScore: 1.02,
+						matchReasons: ["lexical match", "path token overlap"],
+						payload: {
+							filePath: fixture.expectedPaths?.[0] ?? "src/unknown.ts",
+							symbolQualifiedName: fixture.expectedSymbols?.[0],
+							codeChunk: fixture.expectedSymbols?.[0] ?? fixture.expectedPaths?.[0] ?? "codeChunk",
+							startLine: 1,
+							endLine: 1,
 						},
-					]
+					},
+				]
+			}),
+			searchIndexDebug: vi.fn(async (query: string, limit: number) => {
+				const results = await mockManager.searchIndex(query, limit)
+				return {
+					query,
+					limit,
+					candidateLimit: limit * 3,
+					lexicalStatus: "completed",
+					lexicalMode: "fts_only",
+					timingsMs: {
+						queryEmbeddingMs: 5,
+						vectorRetrievalMs: 4,
+						lexicalFtsMs: 2,
+						lexicalFallbackMs: 1,
+						lexicalRetrievalMs: 3,
+						mergeMs: 1,
+						rerankMs: 2,
+						expansionMs: 2,
+						totalMs: 17,
+					},
+					stages: {
+						vector: results,
+						lexical: results,
+						merged: results,
+						final: results,
+					},
 				}
-
-				if (query === "CodeIndexEngineV2 search reranking") {
-					return [
-						{
-							id: "3",
-							score: 0.92,
-							payload: {
-								filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
-								symbolQualifiedName: "CodeIndexEngineV2.search",
-								codeChunk: "search(query, limit)",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				if (query === "parse chunk service build chunk variants") {
-					return [
-						{
-							id: "4",
-							score: 0.88,
-							payload: {
-								filePath: "src/services/code-index-v2/pipeline/ParseChunkService.ts",
-								codeChunk: "buildChunkVariants(chunk, relativePath)",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				if (query === "embed upsert worker create embeddings variant pairs") {
-					return [
-						{
-							id: "5",
-							score: 0.87,
-							payload: {
-								filePath: "src/services/code-index-v2/pipeline/EmbedUpsertWorker.ts",
-								codeChunk: "createEmbeddings(variantPairs.map(...))",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				if (query === "code index parser adapter build search text summary") {
-					return [
-						{
-							id: "6",
-							score: 0.86,
-							payload: {
-								filePath: "src/services/code-index-v2/adapters/CodeIndexParserAdapter.ts",
-								codeChunk: "buildSearchText(...)",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				if (query === "Qdrant REST vector store adapter search payload variant type") {
-					return [
-						{
-							id: "7",
-							score: 0.85,
-							payload: {
-								filePath: "src/services/code-index-v2/adapters/QdrantRestVectorStoreAdapter.ts",
-								codeChunk: "variantType",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				if (query === "schema.ts CREATE TABLE chunk_variants") {
-					return [
-						{
-							id: "8",
-							score: 0.84,
-							payload: {
-								filePath: "src/services/code-index-v2/store/schema.ts",
-								codeChunk: "CREATE TABLE chunk_variants",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				if (query === "low value file filtering code index") {
-					return [
-						{
-							id: "9",
-							score: 0.83,
-							payload: {
-								filePath: "src/services/code-index/shared/low-value-files.ts",
-								codeChunk: "isLowValueCodeIndexPath(...)",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				if (query === "runCodeIndexEvalForCurrentWorkspace register commands") {
-					return [
-						{
-							id: "10",
-							score: 0.82,
-							payload: {
-								filePath: "src/activate/registerCommands.ts",
-								symbolQualifiedName: "runCodeIndexEvalForCurrentWorkspace",
-								codeChunk: "runCodeIndexEvalForCurrentWorkspace(...)",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				if (query === "code index popover save settings clear index") {
-					return [
-						{
-							id: "11",
-							score: 0.81,
-							payload: {
-								filePath: "webview-ui/src/components/chat/CodeIndexPopover.tsx",
-								codeChunk: "handleSaveSettings()",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				if (query === "codebase search results display parent context sibling context") {
-					return [
-						{
-							id: "12",
-							score: 0.8,
-							payload: {
-								filePath: "webview-ui/src/components/chat/CodebaseSearchResultsDisplay.tsx",
-								codeChunk: "Parent Context",
-								startLine: 1,
-								endLine: 1,
-							},
-						},
-					]
-				}
-
-				return []
 			}),
 		}
 
@@ -250,15 +114,22 @@ describe("runCodeIndexEvalForCurrentWorkspace", () => {
 			provider: mockProvider,
 		})
 
-		expect(mockManager.searchIndex).toHaveBeenCalledWith("codebase search tool output formatting", 5)
-		expect(mockManager.searchIndex).toHaveBeenCalledWith("search active chunks lexically metadata store", 5)
-		expect(mockManager.searchIndex).toHaveBeenCalledWith("CodeIndexEngineV2 search reranking", 5)
-		expect(mockManager.searchIndex).toHaveBeenCalledWith("schema.ts CREATE TABLE chunk_variants", 5)
-		expect(mockManager.searchIndex).toHaveBeenCalledWith("runCodeIndexEvalForCurrentWorkspace register commands", 5)
+		expect(mockManager.searchIndexDebug).toHaveBeenCalledWith("codebase search tool output formatting", 5)
+		expect(mockManager.searchIndexDebug).toHaveBeenCalledWith("schema.ts CREATE TABLE chunk_variants", 5)
+		expect(mockManager.searchIndexDebug).toHaveBeenCalledWith(
+			"runCodeIndexEvalForCurrentWorkspace register commands",
+			5,
+		)
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
-			"[CodeIndexEval] Running Roo Code retrieval benchmark against the current workspace index (12 queries)...",
+			`[CodeIndexEval] Running Roo Code retrieval benchmark against the current workspace index (${rooCodeBenchmarkFixtures.length} queries)...`,
+		)
+		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(expect.stringContaining("[CodeIndexEval] Query 1/"))
+		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
+			expect.stringContaining("complete: [codebase-search-tool]"),
 		)
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(expect.stringContaining("Code Index Retrieval Eval"))
+		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(expect.stringContaining("Stage Comparison"))
+		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(expect.stringContaining("Performance"))
 		expect(mockOutputChannel.show).toHaveBeenCalledWith(true)
 	})
 

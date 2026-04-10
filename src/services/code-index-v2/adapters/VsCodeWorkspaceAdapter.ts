@@ -16,16 +16,52 @@ import {
 	WorkspaceFileStat,
 } from "./WorkspaceAdapter"
 
+type GitIgnoreMatcher = {
+	baseDir: string
+	ignore: Ignore
+}
+
+type DirectoryTraversalEntry = {
+	dirPath: string
+	gitIgnoreMatchers: GitIgnoreMatcher[]
+}
+
 export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
+	private static readonly DEFAULT_IGNORED_GENERATED_DIRECTORY_SEGMENTS = new Set([
+		"dist",
+		"out",
+		"bin",
+		".turbo",
+		"build",
+		"coverage",
+	])
+	private static readonly OVERRIDABLE_SHARED_IGNORED_DIRECTORY_SEGMENTS = new Set(["dist", "out"])
+	private static readonly NON_OVERRIDABLE_SHARED_IGNORED_DIRECTORY_SEGMENTS = new Set([
+		"node_modules",
+		"__pycache__",
+		"env",
+		"venv",
+		"bundle",
+		"vendor",
+		"tmp",
+		"temp",
+		"deps",
+		"pkg",
+		"Pods",
+		".git",
+	])
+
 	private readonly ignoreController: RooIgnoreController
-	private readonly ignoreInstance: Ignore
+	private rootGitIgnoreMatcher?: GitIgnoreMatcher
 
 	constructor(
 		private readonly workspacePath: string,
-		private readonly options: { respectGitIgnore?: boolean } = {},
+		private readonly options: {
+			respectGitIgnore?: boolean
+			includeDefaultIgnoredGeneratedPaths?: boolean
+		} = {},
 	) {
 		this.ignoreController = new RooIgnoreController(workspacePath)
-		this.ignoreInstance = ignore()
 	}
 
 	async initialize(): Promise<void> {
@@ -35,13 +71,9 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 			return
 		}
 
-		try {
-			const gitignorePath = path.join(this.workspacePath, ".gitignore")
-			const content = await fs.readFile(gitignorePath, "utf8")
-			this.ignoreInstance.add(content)
-			this.ignoreInstance.add(".gitignore")
-		} catch {
-			// No .gitignore is fine.
+		const rootGitIgnoreMatcher = await this.loadGitIgnoreMatcher(this.workspacePath)
+		if (rootGitIgnoreMatcher) {
+			this.rootGitIgnoreMatcher = rootGitIgnoreMatcher
 		}
 	}
 
@@ -58,7 +90,10 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 		let discoveredFiles = 0
 		let isPartial = false
 		let processedDirectories = 0
-		const directoryStack: string[] = [this.workspacePath]
+		const rootMatchers = this.rootGitIgnoreMatcher ? [this.rootGitIgnoreMatcher] : []
+		const directoryStack: DirectoryTraversalEntry[] = [
+			{ dirPath: this.workspacePath, gitIgnoreMatchers: rootMatchers },
+		]
 		const emitProgress = () =>
 			onProgress?.({
 				discoveredFiles,
@@ -72,7 +107,7 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 				break
 			}
 
-			const currentDir = directoryStack.pop()!
+			const { dirPath: currentDir, gitIgnoreMatchers } = directoryStack.pop()!
 			let dir: Dir | undefined
 
 			try {
@@ -93,8 +128,12 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 					}
 
 					if (entry.isDirectory()) {
-						if (this.shouldDescendIntoDirectory(relativePath, normalizedPath)) {
-							directoryStack.push(normalizedPath)
+						if (this.shouldDescendIntoDirectory(relativePath, normalizedPath, gitIgnoreMatchers)) {
+							const childGitIgnoreMatchers = await this.extendGitIgnoreMatchers(
+								normalizedPath,
+								gitIgnoreMatchers,
+							)
+							directoryStack.push({ dirPath: normalizedPath, gitIgnoreMatchers: childGitIgnoreMatchers })
 						}
 						continue
 					}
@@ -103,7 +142,7 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 						continue
 					}
 
-					if (!this.isCandidateFilePath(relativePath, normalizedPath)) {
+					if (!this.isCandidateFilePath(relativePath, normalizedPath, gitIgnoreMatchers)) {
 						continue
 					}
 
@@ -155,7 +194,8 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 	isCandidateFile(filePath: string): boolean {
 		const normalizedPath = path.normalize(filePath)
 		const relativePath = generateRelativeFilePath(normalizedPath, this.workspacePath)
-		return this.isCandidateFilePath(relativePath, normalizedPath)
+		const gitIgnoreMatchers = this.rootGitIgnoreMatcher ? [this.rootGitIgnoreMatcher] : []
+		return this.isCandidateFilePath(relativePath, normalizedPath, gitIgnoreMatchers)
 	}
 
 	private getConfiguredMaxFiles(): number {
@@ -166,26 +206,35 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 		}
 	}
 
-	private shouldDescendIntoDirectory(relativePath: string, absolutePath: string): boolean {
-		const ignorePath = this.normalizeForIgnore(relativePath)
-
+	private shouldDescendIntoDirectory(
+		relativePath: string,
+		absolutePath: string,
+		gitIgnoreMatchers: GitIgnoreMatcher[],
+	): boolean {
 		if (!this.ignoreController.validateAccess(absolutePath)) {
 			return false
 		}
 
-		if (isPathInIgnoredDirectory(relativePath)) {
+		if (this.isDefaultIgnoredGeneratedPath(relativePath)) {
 			return false
 		}
 
-		if (this.ignoreInstance.ignores(ignorePath)) {
+		if (this.isIgnoredBySharedDirectoryRules(relativePath)) {
+			return false
+		}
+
+		if (this.isIgnoredByGitIgnore(absolutePath, gitIgnoreMatchers)) {
 			return false
 		}
 
 		return true
 	}
 
-	private isCandidateFilePath(relativePath: string, absolutePath: string): boolean {
-		const ignorePath = this.normalizeForIgnore(relativePath)
+	private isCandidateFilePath(
+		relativePath: string,
+		absolutePath: string,
+		gitIgnoreMatchers: GitIgnoreMatcher[],
+	): boolean {
 		const extension = path.extname(absolutePath).toLowerCase()
 
 		if (!scannerExtensions.includes(extension)) {
@@ -196,7 +245,11 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 			return false
 		}
 
-		if (isPathInIgnoredDirectory(relativePath)) {
+		if (this.isDefaultIgnoredGeneratedPath(relativePath)) {
+			return false
+		}
+
+		if (this.isIgnoredBySharedDirectoryRules(relativePath)) {
 			return false
 		}
 
@@ -204,11 +257,108 @@ export class VsCodeWorkspaceAdapter implements WorkspaceAdapter {
 			return false
 		}
 
-		if (this.ignoreInstance.ignores(ignorePath)) {
+		if (this.isIgnoredByGitIgnore(absolutePath, gitIgnoreMatchers)) {
 			return false
 		}
 
 		return true
+	}
+
+	private async extendGitIgnoreMatchers(
+		directoryPath: string,
+		parentMatchers: GitIgnoreMatcher[],
+	): Promise<GitIgnoreMatcher[]> {
+		if (this.options.respectGitIgnore === false) {
+			return parentMatchers
+		}
+
+		const matcher = await this.loadGitIgnoreMatcher(directoryPath)
+		if (!matcher) {
+			return parentMatchers
+		}
+
+		return [...parentMatchers, matcher]
+	}
+
+	private async loadGitIgnoreMatcher(directoryPath: string): Promise<GitIgnoreMatcher | undefined> {
+		try {
+			const gitignorePath = path.join(directoryPath, ".gitignore")
+			const content = await fs.readFile(gitignorePath, "utf8")
+			const matcher = ignore()
+			matcher.add(content)
+			matcher.add(".gitignore")
+			return {
+				baseDir: path.normalize(directoryPath),
+				ignore: matcher,
+			}
+		} catch {
+			return undefined
+		}
+	}
+
+	private isIgnoredByGitIgnore(absolutePath: string, matchers: GitIgnoreMatcher[]): boolean {
+		if (this.options.respectGitIgnore === false || matchers.length === 0) {
+			return false
+		}
+
+		let ignored = false
+		for (const matcher of matchers) {
+			const relativeToMatcher = path.relative(matcher.baseDir, absolutePath)
+			if (!relativeToMatcher || relativeToMatcher.startsWith("..")) {
+				continue
+			}
+
+			const testResult = matcher.ignore.test(this.normalizeForIgnore(relativeToMatcher))
+			if (testResult.ignored) {
+				ignored = true
+			}
+			if (testResult.unignored) {
+				ignored = false
+			}
+		}
+
+		return ignored
+	}
+
+	private isDefaultIgnoredGeneratedPath(relativePath: string): boolean {
+		if (this.options.includeDefaultIgnoredGeneratedPaths) {
+			return false
+		}
+
+		const segments = this.normalizeForIgnore(relativePath)
+			.split("/")
+			.filter((segment) => segment.length > 0)
+
+		return segments.some((segment) =>
+			VsCodeWorkspaceAdapter.DEFAULT_IGNORED_GENERATED_DIRECTORY_SEGMENTS.has(segment),
+		)
+	}
+
+	private isIgnoredBySharedDirectoryRules(relativePath: string): boolean {
+		if (!isPathInIgnoredDirectory(relativePath)) {
+			return false
+		}
+
+		if (!this.options.includeDefaultIgnoredGeneratedPaths) {
+			return true
+		}
+
+		const segments = this.normalizeForIgnore(relativePath)
+			.split("/")
+			.filter((segment) => segment.length > 0)
+
+		const hasNonOverridableIgnoredSegment = segments.some(
+			(segment) =>
+				segment.startsWith(".") ||
+				VsCodeWorkspaceAdapter.NON_OVERRIDABLE_SHARED_IGNORED_DIRECTORY_SEGMENTS.has(segment),
+		)
+		if (hasNonOverridableIgnoredSegment) {
+			return true
+		}
+
+		return !segments.some((segment) =>
+			VsCodeWorkspaceAdapter.OVERRIDABLE_SHARED_IGNORED_DIRECTORY_SEGMENTS.has(segment),
+		)
 	}
 
 	private normalizeForIgnore(relativePath: string): string {

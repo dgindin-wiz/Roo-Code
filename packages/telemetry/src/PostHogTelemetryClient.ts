@@ -1,5 +1,5 @@
+import { createRequire } from "node:module"
 import { PostHog } from "posthog-node"
-import * as vscode from "vscode"
 
 import {
 	type TelemetryProperties,
@@ -16,6 +16,17 @@ import {
 
 import { BaseTelemetryClient } from "./BaseTelemetryClient"
 
+type VSCodeModule = typeof import("vscode")
+
+const require = createRequire(import.meta.url)
+
+let vscodeModule: VSCodeModule | undefined
+try {
+	vscodeModule = require("vscode") as VSCodeModule
+} catch {
+	vscodeModule = undefined
+}
+
 /**
  * PostHogTelemetryClient handles telemetry event tracking for the Roo Code extension.
  * Uses PostHog analytics to track user interactions and system events.
@@ -23,7 +34,7 @@ import { BaseTelemetryClient } from "./BaseTelemetryClient"
  */
 export class PostHogTelemetryClient extends BaseTelemetryClient {
 	private client: PostHog
-	private distinctId: string = vscode.env.machineId
+	private distinctId: string = vscodeModule?.env.machineId ?? "sidecar-process"
 	// Git repository properties that should be filtered out
 	private readonly gitPropertyNames = ["repositoryUrl", "repositoryName", "defaultBranch"]
 
@@ -148,7 +159,14 @@ export class PostHogTelemetryClient extends BaseTelemetryClient {
 		this.telemetryEnabled = false
 
 		// First check global telemetry level - telemetry should only be enabled when level is "all".
-		const telemetryLevel = vscode.workspace.getConfiguration("telemetry").get<string>("telemetryLevel", "all")
+		const telemetryLevel = vscodeModule?.workspace
+			.getConfiguration("telemetry")
+			.get<string>("telemetryLevel", "all")
+		if (!vscodeModule) {
+			this.telemetryEnabled = false
+			this.client.optOut()
+			return
+		}
 		const globalTelemetryEnabled = telemetryLevel === "all"
 
 		// We only enable telemetry if global vscode telemetry is enabled.

@@ -1,6 +1,7 @@
 import path, { resolve } from "path"
 import fs from "fs"
 import { execSync } from "child_process"
+import { builtinModules } from "module"
 
 import { defineConfig, type PluginOption, type Plugin } from "vite"
 import react from "@vitejs/plugin-react"
@@ -51,9 +52,47 @@ const persistPortPlugin = (): Plugin => ({
 	},
 })
 
+const nodeBuiltins = new Set(builtinModules.map((moduleName) => moduleName.replace(/^node:/, "")))
+const forbiddenBrowserImports = new Set(
+	[...nodeBuiltins, "fs/promises", "path", "os", "child_process", "readline"].map((moduleName) =>
+		moduleName.replace(/^node:/, ""),
+	),
+)
+const browserSourceRoots = [resolve(__dirname, "src"), resolve(__dirname, "../src")].map(
+	(dir) => dir.replace(/\\/g, "/") + "/",
+)
+
+const nodeBuiltinGuardPlugin = (): Plugin => ({
+	name: "node-builtin-guard",
+	resolveId(source, importer) {
+		if (!importer || source === "vscode") {
+			return null
+		}
+
+		const normalizedImporter = importer.replace(/\\/g, "/")
+		const isBrowserSource =
+			browserSourceRoots.some((root) => normalizedImporter.startsWith(root)) &&
+			!normalizedImporter.includes("/node_modules/")
+
+		if (!isBrowserSource) {
+			return null
+		}
+
+		const normalizedSource = source.replace(/^node:/, "")
+		if (!forbiddenBrowserImports.has(normalizedSource)) {
+			return null
+		}
+
+		throw new Error(
+			`Node builtin "${source}" cannot be imported from browser-targeted source: ${normalizedImporter}`,
+		)
+	},
+})
+
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
 	let outDir = "../src/webview-ui/build"
+	const enableWebviewSourceMaps = process.env.ROO_ENABLE_WEBVIEW_SOURCE_MAPS === "true"
 
 	const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "src", "package.json"), "utf8"))
 	const gitSha = getGitSha()
@@ -63,7 +102,9 @@ export default defineConfig(({ mode }) => {
 		"process.env.VSCODE_TEXTMATE_DEBUG": JSON.stringify(process.env.VSCODE_TEXTMATE_DEBUG),
 		"process.env.PKG_NAME": JSON.stringify(pkg.name),
 		"process.env.PKG_VERSION": JSON.stringify(pkg.version),
+		"process.env.PKG_BUILD_TIMESTAMP": JSON.stringify(new Date().toISOString()),
 		"process.env.PKG_OUTPUT_CHANNEL": JSON.stringify("Roo-Code"),
+		"process.env.PKG_ENABLE_WEBVIEW_SOURCE_MAPS": JSON.stringify(enableWebviewSourceMaps ? "true" : "false"),
 		...(gitSha ? { "process.env.PKG_SHA": JSON.stringify(gitSha) } : {}),
 	}
 
@@ -89,9 +130,13 @@ export default defineConfig(({ mode }) => {
 		}),
 		tailwindcss(),
 		persistPortPlugin(),
+		nodeBuiltinGuardPlugin(),
 		wasmPlugin(),
-		sourcemapPlugin(),
 	]
+
+	if (enableWebviewSourceMaps) {
+		plugins.push(sourcemapPlugin())
+	}
 
 	return {
 		plugins,
@@ -106,16 +151,12 @@ export default defineConfig(({ mode }) => {
 			outDir,
 			emptyOutDir: true,
 			reportCompressedSize: false,
-			// Generate complete source maps with original TypeScript sources
-			sourcemap: true,
-			// Ensure source maps are properly included in the build
+			sourcemap: enableWebviewSourceMaps,
 			minify: mode === "production" ? "esbuild" : false,
 			// Use a single combined CSS bundle so all webviews share styles
 			cssCodeSplit: false,
 			rollupOptions: {
-				// Externalize vscode module - it's imported by file-search.ts which is
-				// dynamically imported by roo-config/index.ts, but should never be bundled
-				// in the webview since it's not available in the browser context
+				// The VS Code API is provided at runtime by the host and should not be bundled.
 				external: ["vscode"],
 				input: {
 					index: resolve(__dirname, "index.html"),
@@ -147,6 +188,26 @@ export default defineConfig(({ mode }) => {
 						return "assets/[name][extname]"
 					},
 					manualChunks: (id, { getModuleInfo }) => {
+						if (
+							id.includes("/src/components/settings/") ||
+							id.includes("/src/components/history/") ||
+							id.includes("/src/components/marketplace/") ||
+							id.includes("/src/components/cloud/")
+						) {
+							return "tab-features"
+						}
+
+						if (
+							id.includes("node_modules/react-markdown") ||
+							id.includes("node_modules/remark-gfm") ||
+							id.includes("node_modules/remark-math") ||
+							id.includes("node_modules/rehype-katex") ||
+							id.includes("node_modules/katex") ||
+							id.includes("node_modules/shiki")
+						) {
+							return "rich-rendering"
+						}
+
 						// Consolidate all mermaid code and its direct large dependencies (like dagre)
 						// into a single chunk. The 'channel.js' error often points to dagre.
 						if (

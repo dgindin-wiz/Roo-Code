@@ -1,28 +1,22 @@
-import React, { useCallback, useEffect, useRef, useState, useMemo } from "react"
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react"
 import { useEvent } from "react-use"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 
 import { type ExtensionMessage, TelemetryEventName } from "@roo-code/types"
 
 import TranslationProvider from "./i18n/TranslationContext"
-import { MarketplaceViewStateManager } from "./components/marketplace/MarketplaceViewStateManager"
 
 import { vscode } from "./utils/vscode"
 import { telemetryClient } from "./utils/TelemetryClient"
 import { initializeSourceMaps, exposeSourceMapsForDebugging } from "./utils/sourceMapInitializer"
 import { ExtensionStateContextProvider, useExtensionState } from "./context/ExtensionStateContext"
 import ChatView, { ChatViewRef } from "./components/chat/ChatView"
-import HistoryView from "./components/history/HistoryView"
-import SettingsView, { SettingsViewRef } from "./components/settings/SettingsView"
-import WelcomeView from "./components/welcome/WelcomeViewProvider"
-import { MarketplaceView } from "./components/marketplace/MarketplaceView"
-import { CheckpointRestoreDialog } from "./components/chat/CheckpointRestoreDialog"
-import { DeleteMessageDialog, EditMessageDialog } from "./components/chat/MessageModificationConfirmationDialog"
+import type { SettingsViewRef } from "./components/settings/SettingsView"
 import ErrorBoundary from "./components/ErrorBoundary"
-import { CloudView } from "./components/cloud/CloudView"
 import { useAddNonInteractiveClickListener } from "./components/ui/hooks/useNonInteractiveClick"
 import { TooltipProvider } from "./components/ui/tooltip"
 import { STANDARD_TOOLTIP_DELAY } from "./components/ui/standard-tooltip"
+import { MarketplaceViewStateManager } from "./components/marketplace/MarketplaceViewStateManager"
 
 type Tab = "settings" | "history" | "chat" | "marketplace" | "cloud"
 
@@ -40,10 +34,6 @@ interface EditMessageDialogState {
 	images?: string[]
 }
 
-// Memoize dialog components to prevent unnecessary re-renders
-const MemoizedDeleteMessageDialog = React.memo(DeleteMessageDialog)
-const MemoizedEditMessageDialog = React.memo(EditMessageDialog)
-const MemoizedCheckpointRestoreDialog = React.memo(CheckpointRestoreDialog)
 const tabsByMessageAction: Partial<Record<NonNullable<ExtensionMessage["action"]>, Tab>> = {
 	chatButtonClicked: "chat",
 	settingsButtonClicked: "settings",
@@ -51,6 +41,36 @@ const tabsByMessageAction: Partial<Record<NonNullable<ExtensionMessage["action"]
 	marketplaceButtonClicked: "marketplace",
 	cloudButtonClicked: "cloud",
 }
+
+const HistoryView = lazy(() => import("./components/history/HistoryView"))
+const SettingsView = lazy(() => import("./components/settings/SettingsView"))
+const WelcomeView = lazy(() => import("./components/welcome/WelcomeViewProvider"))
+const MarketplaceView = lazy(() =>
+	import("./components/marketplace/MarketplaceView").then((module) => ({ default: module.MarketplaceView })),
+)
+const CloudView = lazy(() => import("./components/cloud/CloudView").then((module) => ({ default: module.CloudView })))
+const CheckpointRestoreDialog = lazy(() =>
+	import("./components/chat/CheckpointRestoreDialog").then((module) => ({ default: module.CheckpointRestoreDialog })),
+)
+const DeleteMessageDialog = lazy(() =>
+	import("./components/chat/MessageModificationConfirmationDialog").then((module) => ({
+		default: module.DeleteMessageDialog,
+	})),
+)
+const EditMessageDialog = lazy(() =>
+	import("./components/chat/MessageModificationConfirmationDialog").then((module) => ({
+		default: module.EditMessageDialog,
+	})),
+)
+
+const postBootMarker = (marker: string) => {
+	vscode.postMessage({
+		type: "webviewBootMarker" as any,
+		text: marker,
+	})
+}
+
+const TabFallback = ({ label }: { label: string }) => <div style={{ padding: "12px 16px", opacity: 0.75 }}>{label}</div>
 
 const App = () => {
 	const {
@@ -68,11 +88,9 @@ const App = () => {
 		mdmCompliant,
 	} = useExtensionState()
 
-	// Create a persistent state manager
-	const marketplaceStateManager = useMemo(() => new MarketplaceViewStateManager(), [])
-
 	const [showAnnouncement, setShowAnnouncement] = useState(false)
 	const [tab, setTab] = useState<Tab>("chat")
+	const marketplaceStateManagerRef = useRef<MarketplaceViewStateManager | null>(null)
 
 	const [deleteMessageDialogState, setDeleteMessageDialogState] = useState<DeleteMessageDialogState>({
 		isOpen: false,
@@ -90,6 +108,10 @@ const App = () => {
 
 	const settingsRef = useRef<SettingsViewRef>(null)
 	const chatViewRef = useRef<ChatViewRef>(null)
+
+	useEffect(() => {
+		postBootMarker("app-shell-mounted")
+	}, [])
 
 	const switchTab = useCallback(
 		(newTab: Tab) => {
@@ -115,7 +137,6 @@ const App = () => {
 
 	const [currentSection, setCurrentSection] = useState<string | undefined>(undefined)
 	const [currentMarketplaceTab, setCurrentMarketplaceTab] = useState<string | undefined>(undefined)
-
 	const onMessage = useCallback(
 		(e: MessageEvent) => {
 			const message: ExtensionMessage = e.data
@@ -171,6 +192,12 @@ const App = () => {
 	useEvent("message", onMessage)
 
 	useEffect(() => {
+		if (didHydrateState) {
+			postBootMarker("extension-state-hydrated")
+		}
+	}, [didHydrateState])
+
+	useEffect(() => {
 		if (shouldShowAnnouncement && tab === "chat") {
 			setShowAnnouncement(true)
 			vscode.postMessage({ type: "didShowAnnouncement" })
@@ -179,25 +206,39 @@ const App = () => {
 
 	useEffect(() => {
 		if (didHydrateState) {
-			telemetryClient.updateTelemetryState(telemetrySetting, telemetryKey, machineId)
+			const timer = window.setTimeout(() => {
+				telemetryClient.updateTelemetryState(telemetrySetting, telemetryKey, machineId)
+				postBootMarker("telemetry-state-synced")
+			}, 2_000)
+
+			return () => window.clearTimeout(timer)
 		}
 	}, [telemetrySetting, telemetryKey, machineId, didHydrateState])
 
-	// Tell the extension that we are ready to receive messages.
-	useEffect(() => vscode.postMessage({ type: "webviewDidLaunch" }), [])
+	useEffect(() => {
+		if (!didHydrateState) {
+			return
+		}
+		postBootMarker(`tab-mounted:${tab}`)
+		if (tab === "chat") {
+			postBootMarker("chat-surface-mounted")
+		}
+	}, [didHydrateState, tab])
 
 	// Initialize source map support for better error reporting
 	useEffect(() => {
-		// Initialize source maps for better error reporting in production
-		initializeSourceMaps()
-
-		// Expose source map debugging utilities in production
-		if (process.env.NODE_ENV === "production") {
-			exposeSourceMapsForDebugging()
+		if (process.env.PKG_ENABLE_WEBVIEW_SOURCE_MAPS !== "true") {
+			return
 		}
 
-		// Log initialization for debugging
-		console.debug("App initialized with source map support")
+		const timer = window.setTimeout(() => {
+			initializeSourceMaps()
+			exposeSourceMapsForDebugging()
+			postBootMarker("source-map-debug-enabled")
+			console.debug("App initialized")
+		}, 1_500)
+
+		return () => window.clearTimeout(timer)
 	}, [])
 
 	// Focus the WebView when non-interactive content is clicked (only in editor/tab mode)
@@ -220,30 +261,48 @@ const App = () => {
 		return null
 	}
 
-	// Do not conditionally load ChatView, it's expensive and there's state we
-	// don't want to lose (user input, disableInput, askResponse promise, etc.)
+	const getMarketplaceStateManager = () => {
+		if (!marketplaceStateManagerRef.current) {
+			marketplaceStateManagerRef.current = new MarketplaceViewStateManager()
+			postBootMarker("marketplace-state-manager-created")
+		}
+		return marketplaceStateManagerRef.current
+	}
+
 	return showWelcome ? (
-		<WelcomeView />
+		<Suspense fallback={<TabFallback label="Loading welcome..." />}>
+			<WelcomeView />
+		</Suspense>
 	) : (
 		<>
-			{tab === "history" && <HistoryView onDone={() => switchTab("chat")} />}
 			{tab === "settings" && (
-				<SettingsView ref={settingsRef} onDone={() => setTab("chat")} targetSection={currentSection} />
+				<Suspense fallback={<TabFallback label="Loading settings..." />}>
+					<SettingsView ref={settingsRef} onDone={() => setTab("chat")} targetSection={currentSection} />
+				</Suspense>
+			)}
+			{tab === "history" && (
+				<Suspense fallback={<TabFallback label="Loading history..." />}>
+					<HistoryView onDone={() => switchTab("chat")} />
+				</Suspense>
 			)}
 			{tab === "marketplace" && (
-				<MarketplaceView
-					stateManager={marketplaceStateManager}
-					onDone={() => switchTab("chat")}
-					targetTab={currentMarketplaceTab as "mcp" | "mode" | undefined}
-				/>
+				<Suspense fallback={<TabFallback label="Loading marketplace..." />}>
+					<MarketplaceView
+						stateManager={getMarketplaceStateManager()}
+						onDone={() => switchTab("chat")}
+						targetTab={currentMarketplaceTab as "mcp" | "mode" | undefined}
+					/>
+				</Suspense>
 			)}
 			{tab === "cloud" && (
-				<CloudView
-					userInfo={cloudUserInfo}
-					isAuthenticated={cloudIsAuthenticated}
-					cloudApiUrl={cloudApiUrl}
-					organizations={cloudOrganizations}
-				/>
+				<Suspense fallback={<TabFallback label="Loading cloud..." />}>
+					<CloudView
+						userInfo={cloudUserInfo}
+						isAuthenticated={cloudIsAuthenticated}
+						cloudApiUrl={cloudApiUrl}
+						organizations={cloudOrganizations}
+					/>
+				</Suspense>
 			)}
 			<ChatView
 				ref={chatViewRef}
@@ -251,64 +310,80 @@ const App = () => {
 				showAnnouncement={showAnnouncement}
 				hideAnnouncement={() => setShowAnnouncement(false)}
 			/>
-			{deleteMessageDialogState.hasCheckpoint ? (
-				<MemoizedCheckpointRestoreDialog
-					open={deleteMessageDialogState.isOpen}
-					type="delete"
-					hasCheckpoint={deleteMessageDialogState.hasCheckpoint}
-					onOpenChange={(open: boolean) => setDeleteMessageDialogState((prev) => ({ ...prev, isOpen: open }))}
-					onConfirm={(restoreCheckpoint: boolean) => {
-						vscode.postMessage({
-							type: "deleteMessageConfirm",
-							messageTs: deleteMessageDialogState.messageTs,
-							restoreCheckpoint,
-						})
-						setDeleteMessageDialogState((prev) => ({ ...prev, isOpen: false }))
-					}}
-				/>
-			) : (
-				<MemoizedDeleteMessageDialog
-					open={deleteMessageDialogState.isOpen}
-					onOpenChange={(open: boolean) => setDeleteMessageDialogState((prev) => ({ ...prev, isOpen: open }))}
-					onConfirm={() => {
-						vscode.postMessage({
-							type: "deleteMessageConfirm",
-							messageTs: deleteMessageDialogState.messageTs,
-						})
-						setDeleteMessageDialogState((prev) => ({ ...prev, isOpen: false }))
-					}}
-				/>
+			{deleteMessageDialogState.isOpen && (
+				<Suspense fallback={null}>
+					{deleteMessageDialogState.hasCheckpoint ? (
+						<CheckpointRestoreDialog
+							open={deleteMessageDialogState.isOpen}
+							type="delete"
+							hasCheckpoint={deleteMessageDialogState.hasCheckpoint}
+							onOpenChange={(open: boolean) =>
+								setDeleteMessageDialogState((prev) => ({ ...prev, isOpen: open }))
+							}
+							onConfirm={(restoreCheckpoint: boolean) => {
+								vscode.postMessage({
+									type: "deleteMessageConfirm",
+									messageTs: deleteMessageDialogState.messageTs,
+									restoreCheckpoint,
+								})
+								setDeleteMessageDialogState((prev) => ({ ...prev, isOpen: false }))
+							}}
+						/>
+					) : (
+						<DeleteMessageDialog
+							open={deleteMessageDialogState.isOpen}
+							onOpenChange={(open: boolean) =>
+								setDeleteMessageDialogState((prev) => ({ ...prev, isOpen: open }))
+							}
+							onConfirm={() => {
+								vscode.postMessage({
+									type: "deleteMessageConfirm",
+									messageTs: deleteMessageDialogState.messageTs,
+								})
+								setDeleteMessageDialogState((prev) => ({ ...prev, isOpen: false }))
+							}}
+						/>
+					)}
+				</Suspense>
 			)}
-			{editMessageDialogState.hasCheckpoint ? (
-				<MemoizedCheckpointRestoreDialog
-					open={editMessageDialogState.isOpen}
-					type="edit"
-					hasCheckpoint={editMessageDialogState.hasCheckpoint}
-					onOpenChange={(open: boolean) => setEditMessageDialogState((prev) => ({ ...prev, isOpen: open }))}
-					onConfirm={(restoreCheckpoint: boolean) => {
-						vscode.postMessage({
-							type: "editMessageConfirm",
-							messageTs: editMessageDialogState.messageTs,
-							text: editMessageDialogState.text,
-							restoreCheckpoint,
-						})
-						setEditMessageDialogState((prev) => ({ ...prev, isOpen: false }))
-					}}
-				/>
-			) : (
-				<MemoizedEditMessageDialog
-					open={editMessageDialogState.isOpen}
-					onOpenChange={(open: boolean) => setEditMessageDialogState((prev) => ({ ...prev, isOpen: open }))}
-					onConfirm={() => {
-						vscode.postMessage({
-							type: "editMessageConfirm",
-							messageTs: editMessageDialogState.messageTs,
-							text: editMessageDialogState.text,
-							images: editMessageDialogState.images,
-						})
-						setEditMessageDialogState((prev) => ({ ...prev, isOpen: false }))
-					}}
-				/>
+			{editMessageDialogState.isOpen && (
+				<Suspense fallback={null}>
+					{editMessageDialogState.hasCheckpoint ? (
+						<CheckpointRestoreDialog
+							open={editMessageDialogState.isOpen}
+							type="edit"
+							hasCheckpoint={editMessageDialogState.hasCheckpoint}
+							onOpenChange={(open: boolean) =>
+								setEditMessageDialogState((prev) => ({ ...prev, isOpen: open }))
+							}
+							onConfirm={(restoreCheckpoint: boolean) => {
+								vscode.postMessage({
+									type: "editMessageConfirm",
+									messageTs: editMessageDialogState.messageTs,
+									text: editMessageDialogState.text,
+									restoreCheckpoint,
+								})
+								setEditMessageDialogState((prev) => ({ ...prev, isOpen: false }))
+							}}
+						/>
+					) : (
+						<EditMessageDialog
+							open={editMessageDialogState.isOpen}
+							onOpenChange={(open: boolean) =>
+								setEditMessageDialogState((prev) => ({ ...prev, isOpen: open }))
+							}
+							onConfirm={() => {
+								vscode.postMessage({
+									type: "editMessageConfirm",
+									messageTs: editMessageDialogState.messageTs,
+									text: editMessageDialogState.text,
+									images: editMessageDialogState.images,
+								})
+								setEditMessageDialogState((prev) => ({ ...prev, isOpen: false }))
+							}}
+						/>
+					)}
+				</Suspense>
 			)}
 		</>
 	)

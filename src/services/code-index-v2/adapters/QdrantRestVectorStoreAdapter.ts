@@ -16,6 +16,10 @@ interface QdrantSearchPoint {
 }
 
 export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
+	private static readonly MAX_TRANSPORT_ATTEMPTS = 3
+	private static readonly TRANSPORT_RETRY_DELAY_MS = 150
+	private static readonly MAX_HTTP_ATTEMPTS = 3
+	private static readonly HTTP_RETRY_DELAY_MS = 250
 	private readonly collectionName: string
 	private readonly baseUrl: string
 	private transport: IsolatedFetch
@@ -185,23 +189,16 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 	}
 
 	private async getCollection(signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
-		let response: Awaited<ReturnType<IsolatedFetch["fetch"]>>
-		try {
-			response = await this.transport.fetch(`${this.baseUrl}/collections/${this.collectionName}`, {
+		const resourcePath = `/collections/${this.collectionName}`
+		const response = await this.fetchWithRetryableHttpStatuses(
+			resourcePath,
+			{
 				method: "GET",
 				headers: this.buildHeaders(),
 				signal,
-			})
-		} catch (error) {
-			const formattedError = this.formatTransportError(error)
-			IndexDebugLoggerV2.log("basic", "QdrantRestVectorStoreAdapter", "qdrant-transport-failed", {
-				component: "QdrantRestVectorStoreAdapter",
-				workspacePath: this.workspacePath,
-				jobId: `GET /collections/${this.collectionName}`,
-				errorMessage: formattedError.message,
-			})
-			throw formattedError
-		}
+			},
+			`GET ${resourcePath}`,
+		)
 
 		if (response.status === 404) {
 			return undefined
@@ -243,24 +240,16 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 		init: { method: string; body?: unknown },
 		signal?: AbortSignal,
 	): Promise<T> {
-		let response: Awaited<ReturnType<IsolatedFetch["fetch"]>>
-		try {
-			response = await this.transport.fetch(`${this.baseUrl}${resourcePath}`, {
+		const response = await this.fetchWithRetryableHttpStatuses(
+			resourcePath,
+			{
 				method: init.method,
 				headers: this.buildHeaders(),
 				body: init.body ? JSON.stringify(init.body) : undefined,
 				signal,
-			})
-		} catch (error) {
-			const formattedError = this.formatTransportError(error)
-			IndexDebugLoggerV2.log("basic", "QdrantRestVectorStoreAdapter", "qdrant-transport-failed", {
-				component: "QdrantRestVectorStoreAdapter",
-				workspacePath: this.workspacePath,
-				jobId: `${init.method} ${resourcePath}`,
-				errorMessage: formattedError.message,
-			})
-			throw formattedError
-		}
+			},
+			`${init.method} ${resourcePath}`,
+		)
 
 		if (!response.ok) {
 			const body = await response.text().catch(() => "")
@@ -277,6 +266,51 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 
 		const body = (await response.json()) as QdrantEnvelope<T>
 		return body.result as T
+	}
+
+	private async fetchWithRetryableHttpStatuses(
+		resourcePath: string,
+		init: Parameters<IsolatedFetch["fetch"]>[1],
+		jobId: string,
+	): Promise<Awaited<ReturnType<IsolatedFetch["fetch"]>>> {
+		for (let attempt = 1; attempt <= QdrantRestVectorStoreAdapter.MAX_HTTP_ATTEMPTS; attempt++) {
+			let response: Awaited<ReturnType<IsolatedFetch["fetch"]>>
+			try {
+				response = await this.executeTransportRequest(`${this.baseUrl}${resourcePath}`, init, jobId)
+			} catch (error) {
+				const formattedError = this.formatTransportError(error)
+				IndexDebugLoggerV2.log("basic", "QdrantRestVectorStoreAdapter", "qdrant-transport-failed", {
+					component: "QdrantRestVectorStoreAdapter",
+					workspacePath: this.workspacePath,
+					jobId,
+					errorMessage: formattedError.message,
+					rawErrorMessage: this.getRawTransportErrorMessage(error),
+					rawErrorCode: this.getTransportErrorCode(error),
+					rawCauseCode: this.getTransportCauseCode(error),
+				})
+				throw formattedError
+			}
+
+			if (
+				!this.isRetryableHttpStatus(response.status) ||
+				attempt >= QdrantRestVectorStoreAdapter.MAX_HTTP_ATTEMPTS
+			) {
+				return response
+			}
+
+			IndexDebugLoggerV2.log("basic", "QdrantRestVectorStoreAdapter", "qdrant-http-retry", {
+				component: "QdrantRestVectorStoreAdapter",
+				workspacePath: this.workspacePath,
+				jobId,
+				attempt,
+				maxAttempts: QdrantRestVectorStoreAdapter.MAX_HTTP_ATTEMPTS,
+				statusCode: response.status,
+				statusText: response.statusText || "n/a",
+			})
+			await this.delay(QdrantRestVectorStoreAdapter.HTTP_RETRY_DELAY_MS * attempt)
+		}
+
+		throw new Error(`Qdrant request exhausted retries (${jobId})`)
 	}
 
 	private isPayloadValid(payload: Record<string, unknown> | null | undefined): payload is Payload {
@@ -303,27 +337,103 @@ export class QdrantRestVectorStoreAdapter implements VectorStoreAdapter {
 		}
 	}
 
-	private formatTransportError(error: unknown): Error {
-		const message = error instanceof Error ? error.message : String(error)
-		const code =
-			typeof error === "object" && error && "code" in error
-				? String((error as { code?: unknown }).code ?? "")
-				: ""
-		const causeCode =
-			typeof error === "object" &&
+	private async executeTransportRequest(
+		url: string,
+		init: Parameters<IsolatedFetch["fetch"]>[1],
+		jobId: string,
+	): Promise<Awaited<ReturnType<IsolatedFetch["fetch"]>>> {
+		let lastError: unknown
+		for (let attempt = 1; attempt <= QdrantRestVectorStoreAdapter.MAX_TRANSPORT_ATTEMPTS; attempt++) {
+			try {
+				return await this.transport.fetch(url, init)
+			} catch (error) {
+				lastError = error
+				if (
+					!this.isRetryableTransportError(error) ||
+					attempt >= QdrantRestVectorStoreAdapter.MAX_TRANSPORT_ATTEMPTS
+				) {
+					break
+				}
+
+				IndexDebugLoggerV2.log("basic", "QdrantRestVectorStoreAdapter", "qdrant-transport-retry", {
+					component: "QdrantRestVectorStoreAdapter",
+					workspacePath: this.workspacePath,
+					jobId,
+					attempt,
+					maxAttempts: QdrantRestVectorStoreAdapter.MAX_TRANSPORT_ATTEMPTS,
+					rawErrorMessage: this.getRawTransportErrorMessage(error),
+					rawErrorCode: this.getTransportErrorCode(error),
+					rawCauseCode: this.getTransportCauseCode(error),
+				})
+				await this.delay(QdrantRestVectorStoreAdapter.TRANSPORT_RETRY_DELAY_MS * attempt)
+			}
+		}
+
+		throw lastError instanceof Error ? lastError : new Error(String(lastError))
+	}
+
+	private isRetryableTransportError(error: unknown): boolean {
+		if (error instanceof Error && error.name === "AbortError") {
+			return false
+		}
+
+		const combined = [
+			this.getRawTransportErrorMessage(error),
+			this.getTransportErrorCode(error),
+			this.getTransportCauseCode(error),
+		]
+			.join(" ")
+			.toUpperCase()
+
+		return (
+			combined.includes("ECONNREFUSED") ||
+			combined.includes("ECONNRESET") ||
+			combined.includes("EPIPE") ||
+			combined.includes("ETIMEDOUT") ||
+			combined.includes("UND_ERR_CONNECT") ||
+			combined.includes("UND_ERR_SOCKET")
+		)
+	}
+
+	private isRetryableHttpStatus(status: number): boolean {
+		return status === 408 || status === 429 || (status >= 500 && status <= 599)
+	}
+
+	private getRawTransportErrorMessage(error: unknown): string {
+		return error instanceof Error ? error.message : String(error)
+	}
+
+	private getTransportErrorCode(error: unknown): string {
+		return typeof error === "object" && error && "code" in error
+			? String((error as { code?: unknown }).code ?? "")
+			: ""
+	}
+
+	private getTransportCauseCode(error: unknown): string {
+		return typeof error === "object" &&
 			error &&
 			"cause" in error &&
 			(error as { cause?: unknown }).cause &&
 			typeof (error as { cause?: unknown }).cause === "object" &&
 			"code" in ((error as { cause?: unknown }).cause as object)
-				? String(((error as { cause?: unknown }).cause as { code?: unknown }).code ?? "")
-				: ""
+			? String(((error as { cause?: unknown }).cause as { code?: unknown }).code ?? "")
+			: ""
+	}
+
+	private async delay(ms: number): Promise<void> {
+		await new Promise((resolve) => setTimeout(resolve, ms))
+	}
+
+	private formatTransportError(error: unknown): Error {
+		const message = this.getRawTransportErrorMessage(error)
+		const code = this.getTransportErrorCode(error)
+		const causeCode = this.getTransportCauseCode(error)
 		const combined = `${message} ${code} ${causeCode}`.toUpperCase()
 
 		if (error instanceof Error && error.name === "AbortError") {
 			return new Error(`Request to Qdrant at ${this.baseUrl} was aborted`)
 		}
-		if (combined.includes("ECONNREFUSED") || message.includes("fetch failed")) {
+		if (combined.includes("ECONNREFUSED")) {
 			return new Error(`Could not connect to Qdrant at ${this.baseUrl} (connection refused)`)
 		}
 		if (combined.includes("ENOTFOUND") || combined.includes("EAI_AGAIN")) {

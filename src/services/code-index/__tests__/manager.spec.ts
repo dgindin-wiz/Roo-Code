@@ -1,6 +1,6 @@
 import { CodeIndexManager } from "../manager"
 import { CodeIndexServiceFactory } from "../service-factory"
-import type { MockedClass } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi, type MockedClass } from "vitest"
 import * as path from "path"
 
 const { mockCodeIndexEngineV2, MockedCodeIndexEngineV2Class } = vi.hoisted(() => {
@@ -9,6 +9,7 @@ const { mockCodeIndexEngineV2, MockedCodeIndexEngineV2Class } = vi.hoisted(() =>
 		refreshAll: vi.fn().mockResolvedValue(undefined),
 		stop: vi.fn().mockResolvedValue(undefined),
 		clear: vi.fn().mockResolvedValue(undefined),
+		clearDatabase: vi.fn().mockResolvedValue(undefined),
 		search: vi.fn().mockResolvedValue([]),
 		enqueuePathsChanged: vi.fn().mockResolvedValue(undefined),
 		getStatus: vi.fn().mockResolvedValue({
@@ -77,6 +78,9 @@ vi.mock("vscode", () => {
 				get: vi.fn((key: string, defaultValue: unknown) => {
 					if (key === "codeIndex.respectGitIgnore") {
 						return true
+					}
+					if (key === "codeIndex.includeDefaultIgnoredGeneratedPaths") {
+						return false
 					}
 					if (key === "codeIndex.embeddingLaneConcurrency") {
 						return 2
@@ -182,6 +186,7 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 		mockCodeIndexEngineV2.refreshAll.mockResolvedValue(undefined)
 		mockCodeIndexEngineV2.stop.mockResolvedValue(undefined)
 		mockCodeIndexEngineV2.clear.mockResolvedValue(undefined)
+		mockCodeIndexEngineV2.clearDatabase.mockResolvedValue(undefined)
 		mockCodeIndexEngineV2.search.mockResolvedValue([])
 		mockCodeIndexEngineV2.enqueuePathsChanged.mockResolvedValue(undefined)
 		mockCodeIndexEngineV2.getStatus.mockResolvedValue({
@@ -226,6 +231,7 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 	})
 
 	afterEach(() => {
+		vi.useRealTimers()
 		CodeIndexManager.disposeAll()
 	})
 
@@ -407,7 +413,7 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			vi.spyOn(manager, "selectedEngine", "get").mockReturnValue("v2" as any)
 		})
 
-		it("initializes and starts the v2 engine when selected", async () => {
+		it("leaves v2 engine idle until indexing is started explicitly", async () => {
 			const mockContextProxy = { refreshSecrets: vi.fn() } as any
 
 			const result = await manager.initialize(mockContextProxy)
@@ -419,9 +425,8 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 				mockConfigManager,
 				expect.any(Object),
 			)
-			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
-			expect(mockCodeIndexEngineV2.getStatus).toHaveBeenCalledTimes(1)
-			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "Code Index V2 ready")
+			expect(mockCodeIndexEngineV2.start).not.toHaveBeenCalled()
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "Code Index V2 is ready to start.")
 		})
 
 		it("delegates start, search, and clear to the v2 engine", async () => {
@@ -460,6 +465,111 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 
 			await expect(manager.stopIndexing()).resolves.toBeUndefined()
 			expect(mockCodeIndexEngineV2.stop).toHaveBeenCalledTimes(1)
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "Indexing stopped.")
+		})
+
+		it("manual start bypasses an already scheduled deferred startup timer", async () => {
+			vi.useFakeTimers()
+			const mockContextProxy = { refreshSecrets: vi.fn() } as any
+
+			await manager.initialize(mockContextProxy)
+			;(manager as any).scheduleDeferredV2Start()
+			await manager.startIndexing()
+
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+
+			await vi.advanceTimersByTimeAsync(6_000)
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+		})
+
+		it("startup watchdog stops runaway startup runs and avoids immediate restart thrash", async () => {
+			vi.useFakeTimers()
+			const mockContextProxy = { refreshSecrets: vi.fn() } as any
+			let rejectStart: ((reason?: unknown) => void) | undefined
+			mockCodeIndexEngineV2.start.mockImplementationOnce(
+				() =>
+					new Promise<void>((_resolve, reject) => {
+						rejectStart = reject
+					}),
+			)
+			mockCodeIndexEngineV2.stop.mockImplementationOnce(async () => {
+				rejectStart?.(new Error("Stopped by user."))
+			})
+			const memoryUsageSpy = vi.spyOn(process, "memoryUsage").mockReturnValue({
+				rss: 950 * 1024 * 1024,
+				heapTotal: 0,
+				heapUsed: 0,
+				external: 0,
+				arrayBuffers: 0,
+			})
+
+			await manager.initialize(mockContextProxy)
+			;(manager as any).scheduleDeferredV2Start()
+			await vi.advanceTimersByTimeAsync(8_000)
+			await Promise.resolve()
+
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+			expect(mockCodeIndexEngineV2.stop).toHaveBeenCalledTimes(1)
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith(
+				"Standby",
+				"Startup indexing paused after extension host memory reached 950 MB.",
+			)
+
+			await vi.advanceTimersByTimeAsync(120_000)
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+
+			memoryUsageSpy.mockRestore()
+		})
+
+		it("manual start bypasses startup watchdog cooldown after a paused startup run", async () => {
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+			;(manager as any)._v2StartupCooldownUntil = Date.now() + 60_000
+			;(manager as any)._startupV2AbortMessage =
+				"Startup indexing paused after extension host memory reached 950 MB."
+			mockCodeIndexEngineV2.start.mockReset().mockResolvedValueOnce(undefined)
+			mockCodeIndexEngineV2.getStatus.mockReset().mockResolvedValueOnce({
+				engine: "v2",
+				state: "idle",
+				message: "V2 updated",
+			})
+
+			await manager.startIndexing()
+
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Indexing", "Code Index V2 is running...")
+		})
+
+		it("waits for an in-flight v2 stop before manual restart", async () => {
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+			;(manager as any)._v2EngineStarted = true
+
+			let resolveStop: (() => void) | undefined
+			mockCodeIndexEngineV2.stop.mockImplementationOnce(
+				() =>
+					new Promise<void>((resolve) => {
+						resolveStop = resolve
+					}),
+			)
+			mockCodeIndexEngineV2.start.mockReset().mockResolvedValueOnce(undefined)
+			mockCodeIndexEngineV2.getStatus.mockReset().mockResolvedValueOnce({
+				engine: "v2",
+				state: "idle",
+				message: "V2 restarted after stop",
+			})
+
+			const stopPromise = (manager as any).stopV2Engine()
+			const restartPromise = manager.startIndexing()
+
+			await Promise.resolve()
+			expect(mockCodeIndexEngineV2.start).not.toHaveBeenCalled()
+
+			resolveStop?.()
+			await stopPromise
+			await restartPromise
+
+			expect(mockCodeIndexEngineV2.stop).toHaveBeenCalledTimes(1)
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Indexing", "Code Index V2 is running...")
 		})
 
 		it("preserves structured warning and resume counts in manager status", async () => {
@@ -501,7 +611,7 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 
 		it("surfaces indexed-with-warnings status from a restarted v2 engine", async () => {
 			;(manager as any)._engineV2 = mockCodeIndexEngineV2
-			mockCodeIndexEngineV2.getStatus.mockResolvedValueOnce({
+			mockCodeIndexEngineV2.getStatus.mockReset().mockResolvedValueOnce({
 				engine: "v2",
 				state: "idle",
 				message:
@@ -512,7 +622,7 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 
 			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
 			expect(mockCodeIndexEngineV2.getStatus).toHaveBeenCalledTimes(1)
-			expect(mockStateManager.setSystemState).toHaveBeenCalledWith(
+			expect(mockStateManager.setSystemState).toHaveBeenLastCalledWith(
 				"Standby",
 				"V2 mapped 66,017 files, refreshed 57,625 changed files, and synced 210,709 chunks with warnings (3 parser-failed files, 5 degraded files, 1 failed file)",
 			)
@@ -526,6 +636,48 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 
 			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Indexing", "Code Index V2 is running...")
 			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Error", "resume adoption failed")
+		})
+
+		it("rearms a manual v2 start when the engine reports a stale stopped status", async () => {
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+			mockCodeIndexEngineV2.start.mockReset().mockResolvedValue(undefined)
+			mockCodeIndexEngineV2.stop.mockReset().mockResolvedValue(undefined)
+			mockCodeIndexEngineV2.getStatus
+				.mockReset()
+				.mockResolvedValueOnce({
+					engine: "v2",
+					state: "idle",
+					message: "Indexing stopped.",
+				})
+				.mockResolvedValueOnce({
+					engine: "v2",
+					state: "idle",
+					message: "V2 restarted after stale stop",
+				})
+
+			await manager.startIndexing()
+
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(2)
+			expect(mockCodeIndexEngineV2.stop).toHaveBeenCalledTimes(1)
+			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "V2 restarted after stale stop")
+		})
+
+		it("recovers v2 error state before manual restart", async () => {
+			const mockContextProxy = { refreshSecrets: vi.fn() } as any
+			;(manager as any)._contextProxy = mockContextProxy
+			const recoverSpy = vi.spyOn(manager, "recoverFromError").mockResolvedValueOnce(undefined)
+			const initializeSpy = vi.spyOn(manager, "initialize").mockResolvedValueOnce({ requiresRestart: false })
+			mockStateManager.getCurrentStatus.mockReturnValueOnce({
+				systemStatus: "Error",
+				message: "Failed to fetch Qdrant collection info: 408 Request Timeout",
+			})
+			;(manager as any)._engineV2 = mockCodeIndexEngineV2
+
+			await manager.startIndexing()
+
+			expect(recoverSpy).toHaveBeenCalledTimes(1)
+			expect(initializeSpy).toHaveBeenCalledWith(mockContextProxy)
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
 		})
 
 		it("treats a user stop abort as standby instead of error", async () => {
@@ -602,10 +754,10 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 
 			// Mock config manager
 			const mockConfigManager = {
-				loadConfiguration: vitest.fn().mockResolvedValue({ requiresRestart: false }),
+				loadConfiguration: vi.fn().mockResolvedValue({ requiresRestart: false }),
 				isFeatureConfigured: true,
 				isFeatureEnabled: true,
-				getConfig: vitest.fn().mockReturnValue({
+				getConfig: vi.fn().mockReturnValue({
 					isConfigured: true,
 					embedderProvider: "openai",
 					modelId: "text-embedding-3-small",
@@ -1101,6 +1253,70 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			expect(mockOrchestrator.stopIndexing).toHaveBeenCalled()
 			expect(mockOrchestrator.clearIndexData).toHaveBeenCalled()
 			expect(mockCacheManager.clearCacheFile).toHaveBeenCalled()
+		})
+
+		it("resets V2 startup state so manual start works after clear", async () => {
+			vi.spyOn(manager, "selectedEngine", "get").mockReturnValue("v2" as any)
+
+			const mockContextProxy = {
+				getGlobalState: vi.fn((key: string) =>
+					key === "codebaseIndexConfig"
+						? {
+								codebaseIndexEnabled: true,
+								codebaseIndexQdrantUrl: "http://localhost:6333",
+								codebaseIndexEmbedderProvider: "openai",
+								codebaseIndexEmbedderModelId: "text-embedding-3-small",
+							}
+						: undefined,
+				),
+				getSecret: vi.fn((key: string) => (key === "codeIndexOpenAiKey" ? "test-openai-key" : undefined)),
+				refreshSecrets: vi.fn().mockResolvedValue(undefined),
+				setValue: vi.fn(),
+			} as any
+
+			await manager.initialize(mockContextProxy)
+			;(manager as any)._v2EngineStarted = true
+			;(manager as any)._v2EngineStartPromise = Promise.resolve()
+			;(manager as any)._startupV2StartPromise = Promise.resolve()
+			;(manager as any)._v2StartupCooldownUntil = Date.now() + 60_000
+			;(manager as any)._startupV2AbortMessage =
+				"Startup indexing paused after extension host memory reached 974 MB."
+
+			await manager.clearIndexData()
+			await manager.startIndexing()
+			await Promise.resolve()
+
+			expect(mockCodeIndexEngineV2.clear).toHaveBeenCalledTimes(1)
+			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
+			expect((manager as any)._v2EngineStarted).toBe(true)
+			expect((manager as any)._v2StartupCooldownUntil).toBe(0)
+			expect((manager as any)._startupV2AbortMessage).toBeUndefined()
+		})
+
+		it("delegates full database clears to the V2 engine database path", async () => {
+			vi.spyOn(manager, "selectedEngine", "get").mockReturnValue("v2" as any)
+
+			const mockContextProxy = {
+				getGlobalState: vi.fn((key: string) =>
+					key === "codebaseIndexConfig"
+						? {
+								codebaseIndexEnabled: true,
+								codebaseIndexQdrantUrl: "http://localhost:6333",
+								codebaseIndexEmbedderProvider: "openai",
+								codebaseIndexEmbedderModelId: "text-embedding-3-small",
+							}
+						: undefined,
+				),
+				getSecret: vi.fn((key: string) => (key === "codeIndexOpenAiKey" ? "test-openai-key" : undefined)),
+				refreshSecrets: vi.fn().mockResolvedValue(undefined),
+				setValue: vi.fn(),
+			} as any
+
+			await manager.initialize(mockContextProxy)
+			await manager.clearIndexDatabase()
+
+			expect(mockCodeIndexEngineV2.clearDatabase).toHaveBeenCalledTimes(1)
+			expect(mockCodeIndexEngineV2.clear).not.toHaveBeenCalled()
 		})
 	})
 

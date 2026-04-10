@@ -20,3 +20,21 @@ export interface CodeIndexV2MemorySnapshot {
 	externalMB: number
 	arrayBuffersMB?: number
 }
+
+export interface CodeIndexV2CpuSnapshot {
+	processPercent?: number
+}
+
+export interface CodeIndexV2GpuSnapshot {
+	sampler?: string
+	utilizationPercent?: number
+	rendererUtilizationPercent?: number
+	tilerUtilizationPercent?: number
+	deviceUtilizationPercent?: number
+	inUseBytes?: number
+	allocatedBytes?: number
+	memoryPressurePercent?: number
+	powerW?: number
+	temperatureC?: number
+	sampleAgeMs?: number
+}

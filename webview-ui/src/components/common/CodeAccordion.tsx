@@ -5,7 +5,7 @@ import { getLanguageFromPath } from "@src/utils/getLanguageFromPath"
 import { formatPathTooltip } from "@src/utils/formatPathTooltip"
 
 import { ToolUseBlock, ToolUseBlockHeader } from "./ToolUseBlock"
-import CodeBlock from "./CodeBlock"
+import LazyCodeBlock from "./LazyCodeBlock"
 import { PathTooltip } from "../ui/PathTooltip"
 import DiffView from "./DiffView"
 
@@ -120,7 +120,7 @@ const CodeAccordion = ({
 					{inferredLanguage === "diff" ? (
 						<DiffView source={source} filePath={path} />
 					) : (
-						<CodeBlock source={source} language={inferredLanguage} />
+						<LazyCodeBlock source={source} language={inferredLanguage} />
 					)}
 				</div>
 			)}

@@ -18,9 +18,15 @@ import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 import { getConfiguredCodeIndexEngine } from "../code-index-v2/settings"
 import { CODE_INDEX_V2_ENGINE_ID, CodeIndexEngineKind } from "../code-index-v2/shared/constants"
-import { CodeIndexEngineV2, ICodeIndexEngine, IndexDebugLoggerV2 } from "../code-index-v2"
+import { CodeIndexDebugSearchTrace, CodeIndexEngineV2, ICodeIndexEngine, IndexDebugLoggerV2 } from "../code-index-v2"
 
 export class CodeIndexManager {
+	private static readonly V2_STARTUP_IDLE_DELAY_MS = 6_000
+	private static readonly V2_STARTUP_RETRY_COOLDOWN_MS = 60_000
+	private static readonly V2_STARTUP_WATCHDOG_INTERVAL_MS = 2_000
+	private static readonly V2_STARTUP_STALL_TIMEOUT_MS = 30_000
+	private static readonly V2_STARTUP_MEMORY_LIMIT_MB = 900
+
 	// --- Singleton Implementation ---
 	private static instances = new Map<string, CodeIndexManager>() // Map workspace path to instance
 
@@ -35,6 +41,15 @@ export class CodeIndexManager {
 
 	// Flag to prevent race conditions during error recovery
 	private _isRecoveringFromError = false
+	private _deferredV2StartTimer: ReturnType<typeof setTimeout> | undefined
+	private _deferredV2StartProgressTimer: ReturnType<typeof setInterval> | undefined
+	private _deferredV2StartScheduledAt = 0
+	private _startupV2StartPromise: Promise<void> | undefined
+	private _v2EngineStartPromise: Promise<void> | undefined
+	private _v2EngineStopPromise: Promise<void> | undefined
+	private _v2EngineStarted = false
+	private _v2StartupCooldownUntil = 0
+	private _startupV2AbortMessage: string | undefined
 
 	public static getInstance(context: vscode.ExtensionContext, workspacePath?: string): CodeIndexManager | undefined {
 		// Resolve the workspace folder to get both fsPath and the real URI
@@ -273,25 +288,17 @@ export class CodeIndexManager {
 				workspacePath: this.workspacePath,
 			})
 
-			this._stateManager.setSystemState("Indexing", "Initializing Code Index V2...")
-			try {
-				await this._engineV2.start()
-				const status = await this._engineV2.getStatus()
-				const latestState = this._stateManager.getCurrentStatus()?.systemStatus
-				if (latestState !== "Indexed") {
-					this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
-				}
-			} catch (error) {
-				if (this.isUserStopAbort(error)) {
-					this._stateManager.setSystemState("Standby", "Indexing stopped.")
-					return { requiresRestart: false }
-				}
-				this._stateManager.setSystemState(
-					"Error",
-					error instanceof Error ? error.message : "Code Index V2 failed to initialize",
-				)
-				throw error
+			if (this.isV2StartPendingOrRunning()) {
+				return { requiresRestart: false }
 			}
+
+			if (this.isV2StartupCooldownActive()) {
+				this._stateManager.setSystemState("Standby", this.getV2StartupCooldownMessage())
+				return { requiresRestart: false }
+			}
+
+			this.cancelDeferredV2Start()
+			this._stateManager.setSystemState("Standby", "Code Index V2 is ready to start.")
 			return { requiresRestart: false }
 		}
 
@@ -349,26 +356,18 @@ export class CodeIndexManager {
 		}
 
 		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
-			this.assertInitialized()
-			this._stateManager.setSystemState("Indexing", "Code Index V2 is running...")
-			try {
-				await this._engineV2!.start()
-				const status = await this._engineV2!.getStatus()
-				const latestState = this._stateManager.getCurrentStatus()?.systemStatus
-				if (latestState !== "Indexed") {
-					this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
+			const currentStatus = this.getCurrentStatus()
+			if (currentStatus.systemStatus === "Error") {
+				await this.recoverFromError()
+
+				if (this._contextProxy) {
+					await this.initialize(this._contextProxy)
 				}
-			} catch (error) {
-				if (this.isUserStopAbort(error)) {
-					this._stateManager.setSystemState("Standby", "Indexing stopped.")
-					return
-				}
-				this._stateManager.setSystemState(
-					"Error",
-					error instanceof Error ? error.message : "Code Index V2 failed to start",
-				)
-				throw error
 			}
+
+			this.assertInitialized()
+			this.cancelDeferredV2Start()
+			await this.startV2Engine("manual")
 			return
 		}
 
@@ -400,6 +399,7 @@ export class CodeIndexManager {
 				return
 			}
 			this.assertInitialized()
+			this.cancelDeferredV2Start()
 			this._stateManager.setSystemState("Indexing", "Refreshing the workspace index...")
 			try {
 				await this._engineV2!.refreshAll()
@@ -434,9 +434,22 @@ export class CodeIndexManager {
 	 */
 	public async stopIndexing(): Promise<void> {
 		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			IndexDebugLoggerV2.log("basic", "CodeIndexManager", "v2-stop-requested", {
+				engine: this.selectedEngine,
+				workspacePath: this.workspacePath,
+			})
+			this.cancelDeferredV2Start()
+			this._v2StartupCooldownUntil = Date.now() + CodeIndexManager.V2_STARTUP_RETRY_COOLDOWN_MS
+			this._stateManager.setSystemState("Stopping", "Stopping indexing...")
 			if (this._engineV2) {
 				await this.stopV2Engine()
 			}
+			this._v2EngineStarted = false
+			this._stateManager.setSystemState("Standby", "Indexing stopped.")
+			IndexDebugLoggerV2.log("basic", "CodeIndexManager", "v2-stop-complete", {
+				engine: this.selectedEngine,
+				workspacePath: this.workspacePath,
+			})
 			return
 		}
 
@@ -514,6 +527,7 @@ export class CodeIndexManager {
 	 * Flushes any pending cache writes to prevent data loss on extension deactivation.
 	 */
 	public dispose(): void {
+		this.cancelDeferredV2Start()
 		void this.stopIndexing()
 		// Flush pending debounced cache writes so they aren't lost on exit.
 		// Fire-and-forget since dispose() is synchronous but flush() is async.
@@ -536,7 +550,29 @@ export class CodeIndexManager {
 		this.assertInitialized()
 
 		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			this.cancelDeferredV2Start()
 			await this._engineV2!.clear()
+			this.resetV2StartupState()
+			return
+		}
+
+		// Stop any in-progress scan before clearing data to prevent
+		// the running scan from writing to the collection while we delete it.
+		await this.stopIndexing()
+		await this._orchestrator!.clearIndexData()
+		await this._cacheManager!.clearCacheFile()
+	}
+
+	public async clearIndexDatabase(): Promise<void> {
+		if (!this.isFeatureEnabled) {
+			return
+		}
+		this.assertInitialized()
+
+		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+			this.cancelDeferredV2Start()
+			await (this._engineV2!.clearDatabase?.() ?? this._engineV2!.clear())
+			this.resetV2StartupState()
 			return
 		}
 
@@ -548,6 +584,14 @@ export class CodeIndexManager {
 	}
 
 	// --- Private Helpers ---
+
+	private resetV2StartupState(): void {
+		this._v2EngineStarted = false
+		this._v2EngineStartPromise = undefined
+		this._startupV2StartPromise = undefined
+		this._v2StartupCooldownUntil = 0
+		this._startupV2AbortMessage = undefined
+	}
 
 	public getCurrentStatus() {
 		const status = this._stateManager.getCurrentStatus()
@@ -641,6 +685,19 @@ export class CodeIndexManager {
 
 		const directoryPrefix = typeof directoryPrefixOrLimit === "string" ? directoryPrefixOrLimit : undefined
 		return this._searchService!.searchIndex(query, directoryPrefix)
+	}
+
+	public async searchIndexDebug(query: string, limit: number): Promise<CodeIndexDebugSearchTrace | undefined> {
+		if (!this.isFeatureEnabled) {
+			return undefined
+		}
+
+		this.assertInitialized()
+		if (this.selectedEngine !== CODE_INDEX_V2_ENGINE_ID || !this._engineV2?.searchDebug) {
+			return undefined
+		}
+
+		return this._engineV2.searchDebug(query, limit)
 	}
 
 	/**
@@ -748,11 +805,26 @@ export class CodeIndexManager {
 			// If feature is disabled, stop the service (including any active scan)
 			if (!isFeatureEnabled) {
 				if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+					this.cancelDeferredV2Start()
 					await this.stopV2Engine()
 				} else {
 					await this.stopIndexing()
 				}
 				this._stateManager.setSystemState("Standby", "Code indexing is disabled")
+				return
+			}
+
+			if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
+				if (requiresRestart && isFeatureEnabled && isFeatureConfigured) {
+					this.cancelDeferredV2Start()
+					await this.stopV2Engine()
+					if (this.isWorkspaceEnabled) {
+						this._stateManager.setSystemState(
+							"Standby",
+							"Code Index V2 needs to restart. Start indexing to continue.",
+						)
+					}
+				}
 				return
 			}
 
@@ -787,17 +859,278 @@ export class CodeIndexManager {
 		}
 
 		const engine = this._engineV2
-		await engine.stop()
-
-		if (options?.clearReference) {
-			if (this._engineV2 === engine) {
+		if (this._v2EngineStopPromise) {
+			await this._v2EngineStopPromise
+			if (options?.clearReference && this._engineV2 === engine) {
 				this._engineV2 = undefined
 			}
+			return
 		}
+
+		const stopPromise = engine.stop().finally(() => {
+			this._v2EngineStarted = false
+			if (this._v2EngineStopPromise === stopPromise) {
+				this._v2EngineStopPromise = undefined
+			}
+			if (options?.clearReference && this._engineV2 === engine) {
+				this._engineV2 = undefined
+			}
+		})
+
+		this._v2EngineStopPromise = stopPromise
+		await stopPromise
 	}
 
 	private isUserStopAbort(error: unknown): boolean {
 		const message = error instanceof Error ? error.message : String(error)
 		return /stopped by user|aborted/i.test(message)
+	}
+
+	private scheduleDeferredV2Start(): void {
+		if (
+			this.selectedEngine !== CODE_INDEX_V2_ENGINE_ID ||
+			!this.isFeatureEnabled ||
+			!this.isWorkspaceEnabled ||
+			this._isRecoveringFromError ||
+			this.isV2StartPendingOrRunning() ||
+			this.isV2StartupCooldownActive()
+		) {
+			return
+		}
+
+		this._deferredV2StartTimer = setTimeout(() => {
+			this._deferredV2StartTimer = undefined
+			this.cancelDeferredV2StartProgressTimer()
+			void this.runDeferredV2Start()
+		}, CodeIndexManager.V2_STARTUP_IDLE_DELAY_MS)
+		this._deferredV2StartScheduledAt = Date.now()
+		this.startDeferredV2StartProgressTimer()
+		IndexDebugLoggerV2.log("basic", "CodeIndexManager", "startup-idle-wait-scheduled", {
+			engine: this.selectedEngine,
+			workspacePath: this.workspacePath,
+			idleDelayMs: CodeIndexManager.V2_STARTUP_IDLE_DELAY_MS,
+		})
+	}
+
+	private cancelDeferredV2Start(): void {
+		this.cancelDeferredV2StartProgressTimer()
+		if (!this._deferredV2StartTimer) {
+			return
+		}
+
+		clearTimeout(this._deferredV2StartTimer)
+		this._deferredV2StartTimer = undefined
+	}
+
+	private startDeferredV2StartProgressTimer(): void {
+		this.cancelDeferredV2StartProgressTimer()
+		this._deferredV2StartProgressTimer = setInterval(() => {
+			const scheduledAt = this._deferredV2StartScheduledAt
+			const elapsedMs = scheduledAt > 0 ? Date.now() - scheduledAt : undefined
+			const remainingMs =
+				elapsedMs === undefined ? undefined : Math.max(CodeIndexManager.V2_STARTUP_IDLE_DELAY_MS - elapsedMs, 0)
+			IndexDebugLoggerV2.log("basic", "CodeIndexManager", "startup-idle-wait", {
+				engine: this.selectedEngine,
+				workspacePath: this.workspacePath,
+				elapsedMs,
+				remainingMs,
+			})
+		}, 2_000)
+	}
+
+	private cancelDeferredV2StartProgressTimer(): void {
+		if (!this._deferredV2StartProgressTimer) {
+			return
+		}
+
+		clearInterval(this._deferredV2StartProgressTimer)
+		this._deferredV2StartProgressTimer = undefined
+		this._deferredV2StartScheduledAt = 0
+	}
+
+	private async runDeferredV2Start(): Promise<void> {
+		if (
+			this.selectedEngine !== CODE_INDEX_V2_ENGINE_ID ||
+			!this.isFeatureEnabled ||
+			!this.isWorkspaceEnabled ||
+			this._isRecoveringFromError ||
+			this.isV2StartupCooldownActive()
+		) {
+			return
+		}
+
+		IndexDebugLoggerV2.log("basic", "CodeIndexManager", "startup-idle-wait-complete", {
+			engine: this.selectedEngine,
+			workspacePath: this.workspacePath,
+		})
+		await this.startV2Engine("startup")
+	}
+
+	private async startV2Engine(source: "startup" | "manual"): Promise<void> {
+		if (!this._engineV2) {
+			throw new Error("Code Index V2 not initialized")
+		}
+
+		IndexDebugLoggerV2.log("basic", "CodeIndexManager", "v2-start-requested", {
+			engine: this.selectedEngine,
+			workspacePath: this.workspacePath,
+			source,
+		})
+
+		if (this._v2EngineStopPromise) {
+			await this._v2EngineStopPromise
+		}
+
+		if (this._v2EngineStartPromise) {
+			await this._v2EngineStartPromise
+			return
+		}
+
+		const startPromise = this.runV2EngineStart(source)
+		this._v2EngineStartPromise = startPromise.finally(() => {
+			if (this._v2EngineStartPromise === startPromise) {
+				this._v2EngineStartPromise = undefined
+			}
+		})
+
+		if (source === "startup") {
+			this._startupV2StartPromise = this._v2EngineStartPromise.finally(() => {
+				this._startupV2StartPromise = undefined
+			})
+			await this._startupV2StartPromise
+			return
+		}
+
+		await this._v2EngineStartPromise
+	}
+
+	private async runV2EngineStart(source: "startup" | "manual"): Promise<void> {
+		this._startupV2AbortMessage = undefined
+		this._stateManager.setSystemState(
+			"Indexing",
+			source === "startup" ? "Code Index V2 is starting in the background..." : "Code Index V2 is running...",
+		)
+
+		const disposeWatchdog = source === "startup" ? this.startV2StartupWatchdog() : undefined
+
+		try {
+			await this._engineV2!.start()
+			let status = await this._engineV2!.getStatus()
+			if (this.shouldRearmStoppedV2Start(status, source)) {
+				IndexDebugLoggerV2.log("basic", "CodeIndexManager", "v2-start-rearm-after-stale-stop", {
+					engine: this.selectedEngine,
+					workspacePath: this.workspacePath,
+					source,
+					state: status.state,
+					message: status.message,
+				})
+				await this.stopV2Engine()
+				await this._engineV2!.start()
+				status = await this._engineV2!.getStatus()
+			}
+			this._v2EngineStarted = status.state !== "error" && !this.isStoppedV2Status(status)
+			const latestState = this._stateManager.getCurrentStatus()?.systemStatus
+			if (latestState !== "Indexed") {
+				this._stateManager.setSystemState("Standby", status.message ?? "Code Index V2 initialized")
+			}
+		} catch (error) {
+			this._v2EngineStarted = false
+			if (this.isUserStopAbort(error)) {
+				this._stateManager.setSystemState("Standby", this._startupV2AbortMessage ?? "Indexing stopped.")
+				return
+			}
+			this._stateManager.setSystemState(
+				"Error",
+				error instanceof Error ? error.message : "Code Index V2 failed to start",
+			)
+			throw error
+		} finally {
+			disposeWatchdog?.()
+		}
+	}
+
+	private shouldRearmStoppedV2Start(
+		status: Awaited<ReturnType<ICodeIndexEngine["getStatus"]>>,
+		source: "startup" | "manual",
+	): boolean {
+		return source === "manual" && this.isStoppedV2Status(status)
+	}
+
+	private isStoppedV2Status(status: Awaited<ReturnType<ICodeIndexEngine["getStatus"]>>): boolean {
+		return status.state === "idle" && /indexing stopped/i.test(status.message ?? "")
+	}
+
+	private startV2StartupWatchdog(): () => void {
+		let lastSnapshot = this.getStartupProgressSnapshot()
+		let lastProgressAt = Date.now()
+		let triggered = false
+		const interval = setInterval(() => {
+			if (triggered || !this._engineV2) {
+				return
+			}
+
+			const nextSnapshot = this.getStartupProgressSnapshot()
+			if (nextSnapshot !== lastSnapshot) {
+				lastSnapshot = nextSnapshot
+				lastProgressAt = Date.now()
+			}
+
+			const rssMb = Math.round(process.memoryUsage().rss / (1024 * 1024))
+			let abortMessage: string | undefined
+			if (rssMb >= CodeIndexManager.V2_STARTUP_MEMORY_LIMIT_MB) {
+				abortMessage = `Startup indexing paused after extension host memory reached ${rssMb} MB.`
+			} else if (Date.now() - lastProgressAt >= CodeIndexManager.V2_STARTUP_STALL_TIMEOUT_MS) {
+				abortMessage = "Startup indexing paused because it stopped making progress."
+			}
+
+			if (!abortMessage) {
+				return
+			}
+
+			triggered = true
+			this._startupV2AbortMessage = abortMessage
+			this._v2StartupCooldownUntil = Date.now() + CodeIndexManager.V2_STARTUP_RETRY_COOLDOWN_MS
+			this._v2EngineStarted = false
+			this._stateManager.setSystemState("Standby", abortMessage)
+			void this.stopV2Engine()
+		}, CodeIndexManager.V2_STARTUP_WATCHDOG_INTERVAL_MS)
+
+		return () => clearInterval(interval)
+	}
+
+	private getStartupProgressSnapshot(): string {
+		const status = this._stateManager.getCurrentStatus()
+		return JSON.stringify({
+			systemStatus: status?.systemStatus,
+			message: status?.message,
+			phase: status?.phase,
+			detailedStage: status?.detailedStage,
+			processedItems: status?.processedItems,
+			totalItems: status?.totalItems,
+			processedFiles: status?.processedFiles,
+			totalFiles: status?.totalFiles,
+			currentItemUnit: status?.currentItemUnit,
+		})
+	}
+
+	private isV2StartPendingOrRunning(): boolean {
+		const systemStatus = this._stateManager.getCurrentStatus()?.systemStatus
+		return Boolean(
+			this._deferredV2StartTimer ||
+				this._v2EngineStartPromise ||
+				this._startupV2StartPromise ||
+				this._v2EngineStarted ||
+				systemStatus === "Indexing" ||
+				systemStatus === "Stopping" ||
+				systemStatus === "Indexed",
+		)
+	}
+
+	private isV2StartupCooldownActive(): boolean {
+		return Date.now() < this._v2StartupCooldownUntil
+	}
+
+	private getV2StartupCooldownMessage(): string {
+		return this._startupV2AbortMessage ?? "Startup indexing is paused to keep VS Code responsive."
 	}
 }

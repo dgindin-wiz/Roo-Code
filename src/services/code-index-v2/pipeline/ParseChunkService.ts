@@ -3,6 +3,19 @@ import { ParserAdapter } from "../adapters/ParserAdapter"
 import { WorkspaceAdapter } from "../adapters/WorkspaceAdapter"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { MetadataStore } from "../store/MetadataStore"
+import { buildChunkVariants, ParsedChunkUpsertInput } from "./ParseExecution"
+
+interface ParseExecutor {
+	parseRevision(input: {
+		runId: string
+		revisionId: string
+		normalizedPath: string
+		maxFileSizeBytes?: number
+		laneId?: number
+		signal?: AbortSignal
+	}): Promise<{ chunks: ParsedChunkUpsertInput[]; parseLatencyMs: number }>
+	dispose?(): Promise<void>
+}
 
 export interface ParseChunkSummary {
 	runId: string
@@ -18,19 +31,25 @@ export class ParseChunkService {
 	private static readonly MAX_PARSE_ATTEMPTS = 3
 	private static readonly RETRY_DELAY_BASE_MS = 250
 	private static readonly RETRY_DELAY_MAX_MS = 2_000
+	private static readonly PARSE_CONCURRENCY = 4
 
 	constructor(
 		private readonly metadataStore: MetadataStore,
 		private readonly workspaceAdapter: WorkspaceAdapter,
 		private readonly parserAdapter: ParserAdapter,
 		private readonly resolveMaxFileSizeBytes?: (relativePath: string) => number,
+		private readonly parseExecutor?: ParseExecutor,
 	) {}
+
+	async dispose(): Promise<void> {
+		await this.parseExecutor?.dispose?.()
+	}
 
 	async run(
 		runId: string,
 		signal?: AbortSignal,
 		onProgress?: (progress: { parsedRevisions: number; parsedChunks: number }) => void,
-		options?: { limit?: number },
+		options?: { limit?: number; concurrency?: number },
 	): Promise<ParseChunkSummary> {
 		const workspaceId = this.metadataStore.getWorkspaceId()
 		const revisions = await this.metadataStore.getRevisionsByState(workspaceId, "hashed", {
@@ -44,40 +63,51 @@ export class ParseChunkService {
 		let terminalFailedRevisions = 0
 		const parsedRevisionIds: string[] = []
 
-		for (const revision of revisions) {
-			if (revision.runId !== runId) {
-				continue
-			}
+		let nextRevisionIndex = 0
+		const configuredConcurrency = Math.max(
+			1,
+			Math.trunc(options?.concurrency ?? ParseChunkService.PARSE_CONCURRENCY),
+		)
+		const workerCount = Math.min(configuredConcurrency, revisions.length || 1)
+		await Promise.all(
+			Array.from({ length: workerCount }, async () => {
+				while (nextRevisionIndex < revisions.length) {
+					const revision = revisions[nextRevisionIndex++]
+					if (!revision) {
+						return
+					}
 
-			if (signal?.aborted) {
-				throw new Error("Parse/chunk stage aborted")
-			}
+					if (signal?.aborted) {
+						throw new Error("Parse/chunk stage aborted")
+					}
 
-			const result = await this.parseRevisionWithRetries(revision, signal)
-			retryingRevisions += result.retriesScheduled
-			if (result.status === "terminal_failed") {
-				terminalFailedRevisions++
-				continue
-			}
-			if (result.status === "missing") {
-				continue
-			}
+					const result = await this.parseRevisionWithRetries(revision, signal, nextRevisionIndex)
+					retryingRevisions += result.retriesScheduled
+					if (result.status === "terminal_failed") {
+						terminalFailedRevisions++
+						continue
+					}
+					if (result.status === "missing") {
+						continue
+					}
 
-			parsedRevisions++
-			parsedChunks += result.parsedChunks
-			parsedRevisionIds.push(revision.revisionId)
+					parsedRevisions++
+					parsedChunks += result.parsedChunks
+					parsedRevisionIds.push(revision.revisionId)
 
-			onProgress?.({ parsedRevisions, parsedChunks })
+					onProgress?.({ parsedRevisions, parsedChunks })
 
-			if (parsedRevisions === 1 || parsedRevisions % 100 === 0) {
-				IndexDebugLoggerV2.log("basic", "ParseChunkService", "parse-chunk-progress", {
-					component: "ParseChunkService",
-					workspacePath: this.workspaceAdapter.getWorkspacePath(),
-					runId,
-					jobId: `${parsedRevisions}:${parsedChunks}:${terminalFailedRevisions}`,
-				})
-			}
-		}
+					if (parsedRevisions === 1 || parsedRevisions % 100 === 0) {
+						IndexDebugLoggerV2.log("basic", "ParseChunkService", "parse-chunk-progress", {
+							component: "ParseChunkService",
+							workspacePath: this.workspaceAdapter.getWorkspacePath(),
+							runId,
+							jobId: `${parsedRevisions}:${parsedChunks}:${terminalFailedRevisions}`,
+						})
+					}
+				}
+			}),
+		)
 
 		IndexDebugLoggerV2.log("basic", "ParseChunkService", "parse-chunk-complete", {
 			component: "ParseChunkService",
@@ -100,6 +130,7 @@ export class ParseChunkService {
 	private async parseRevisionWithRetries(
 		revision: Awaited<ReturnType<MetadataStore["getRevisionsByState"]>>[number],
 		signal?: AbortSignal,
+		laneId = 1,
 	): Promise<
 		| {
 				status: "parsed"
@@ -126,12 +157,26 @@ export class ParseChunkService {
 			}
 
 			try {
-				const content = await this.workspaceAdapter.readFile(revision.normalizedPath)
-				const chunks = await this.parserAdapter.parseFile({
-					filePath: revision.normalizedPath,
-					content,
-					maxFileSizeBytes: this.resolveMaxFileSizeBytes?.(revision.relativePath),
-				})
+				const maxFileSizeBytes = this.resolveMaxFileSizeBytes?.(revision.relativePath)
+				const chunks = this.parseExecutor
+					? (
+							await this.parseExecutor.parseRevision({
+								runId: revision.runId,
+								revisionId: revision.revisionId,
+								normalizedPath: revision.normalizedPath,
+								maxFileSizeBytes,
+								laneId,
+								signal,
+							})
+						).chunks
+					: await (async () => {
+							const content = await this.workspaceAdapter.readFile(revision.normalizedPath)
+							return this.parserAdapter.parseFile({
+								filePath: revision.normalizedPath,
+								content,
+								maxFileSizeBytes,
+							})
+						})()
 
 				const insertedChunks = await this.metadataStore.upsertChunks(
 					chunks.map((chunk) => ({
@@ -153,13 +198,13 @@ export class ParseChunkService {
 					})),
 				)
 				await this.metadataStore.upsertChunkVariants(
-					insertedChunks.flatMap((chunk) => this.buildChunkVariants(chunk, revision.relativePath)),
+					insertedChunks.flatMap((chunk) => buildChunkVariants(chunk, revision.relativePath)),
 				)
 				await this.metadataStore.markRevisionState(revision.revisionId, "parsed")
 
 				return {
 					status: "parsed",
-					parsedChunks: chunks.length,
+					parsedChunks: insertedChunks.length,
 					retriesScheduled,
 				}
 			} catch (error) {
@@ -204,59 +249,6 @@ export class ParseChunkService {
 			parsedChunks: 0,
 			retriesScheduled,
 		}
-	}
-
-	private buildChunkVariants(
-		chunk: Awaited<ReturnType<MetadataStore["upsertChunks"]>>[number],
-		relativePath: string,
-	): Parameters<MetadataStore["upsertChunkVariants"]>[0] {
-		const variants: Parameters<MetadataStore["upsertChunkVariants"]>[0] = [
-			{
-				chunkId: chunk.chunkId,
-				variantType: "raw_code",
-				content: chunk.searchText ?? chunk.content,
-				contentHash: createHash("sha256")
-					.update(chunk.searchText ?? chunk.content)
-					.digest("hex"),
-				tokenEstimate: chunk.tokenEstimate ?? null,
-				state: "parsed",
-			},
-		]
-
-		const signature = this.buildSymbolSignatureVariant(chunk, relativePath)
-		if (signature) {
-			variants.push({
-				chunkId: chunk.chunkId,
-				variantType: "symbol_signature",
-				content: signature,
-				contentHash: createHash("sha256").update(signature).digest("hex"),
-				state: "parsed",
-			})
-		}
-
-		return variants
-	}
-
-	private buildSymbolSignatureVariant(
-		chunk: Awaited<ReturnType<MetadataStore["upsertChunks"]>>[number],
-		relativePath: string,
-	): string | null {
-		const symbolName = chunk.symbolQualifiedName ?? chunk.symbolName
-		if (!symbolName) {
-			return null
-		}
-
-		const parts = [
-			chunk.language ?? "unknown",
-			chunk.chunkKind ?? "chunk",
-			symbolName,
-			`path ${relativePath}`,
-			`lines ${chunk.startLine}-${chunk.endLine}`,
-		]
-		if (chunk.parentSymbolName && chunk.parentSymbolName !== symbolName) {
-			parts.push(`parent ${chunk.parentSymbolName}`)
-		}
-		return parts.join(" | ")
 	}
 
 	private isMissingFileError(error: unknown): boolean {

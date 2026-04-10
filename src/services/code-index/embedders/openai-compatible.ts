@@ -417,16 +417,23 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 				}
 				const requestLatencyMs = Date.now() - requestStartedAt
 
-				// Decode base64 embeddings to number[] in a single pass —
-				// no intermediate object spread or second .map() needed.
-				const embeddings = response.data.map((item: EmbeddingItem) => {
+				// Decode base64 embeddings in a single pass and avoid extra map/object churn
+				// on the extension-host thread during large indexing runs.
+				const embeddings = new Array<number[]>(response.data.length)
+				for (let index = 0; index < response.data.length; index++) {
+					const item = response.data[index]
 					if (typeof item.embedding === "string") {
 						const buffer = Buffer.from(item.embedding, "base64")
 						const float32 = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4)
-						return Array.from(float32) as number[]
+						const decoded = new Array<number>(float32.length)
+						for (let valueIndex = 0; valueIndex < float32.length; valueIndex++) {
+							decoded[valueIndex] = float32[valueIndex]!
+						}
+						embeddings[index] = decoded
+					} else {
+						embeddings[index] = item.embedding as number[]
 					}
-					return item.embedding as number[]
-				})
+				}
 
 				return {
 					embeddings: embeddings,

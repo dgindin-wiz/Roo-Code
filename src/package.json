@@ -161,6 +161,21 @@
 				"category": "%configuration.title%"
 			},
 			{
+				"command": "roo-cline.startCodeIndexing",
+				"title": "%command.startCodeIndexing.title%",
+				"category": "%configuration.title%"
+			},
+			{
+				"command": "roo-cline.stopCodeIndexing",
+				"title": "%command.stopCodeIndexing.title%",
+				"category": "%configuration.title%"
+			},
+			{
+				"command": "roo-cline.forceStopCodeIndexing",
+				"title": "%command.forceStopCodeIndexing.title%",
+				"category": "%configuration.title%"
+			},
+			{
 				"command": "roo-cline.focusInput",
 				"title": "%command.focusInput.title%",
 				"category": "%configuration.title%"
@@ -435,6 +450,11 @@
 					"type": "boolean",
 					"default": true,
 					"description": "%settings.codeIndex.respectGitIgnore.description%"
+				},
+				"roo-cline.codeIndex.includeDefaultIgnoredGeneratedPaths": {
+					"type": "boolean",
+					"default": false,
+					"description": "%settings.codeIndex.includeDefaultIgnoredGeneratedPaths.description%"
 				},
 				"roo-cline.debug": {
 					"type": "boolean",

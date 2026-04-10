@@ -19,6 +19,18 @@ import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 import { sanitizeErrorMessage } from "../shared/validation-helpers"
 
+function captureCodeIndexErrorTelemetry(error: unknown, location: string) {
+	if (!TelemetryService.hasInstance()) {
+		return
+	}
+
+	TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
+		error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+		stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
+		location,
+	})
+}
+
 /**
  * Implementation of the code parser interface
  */
@@ -75,11 +87,7 @@ export class CodeParser implements ICodeParser {
 				fileHash = this.createFileHash(content)
 			} catch (error) {
 				console.error(`Error reading file ${filePath}:`, error)
-				TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
-					error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
-					stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
-					location: "parseFile",
-				})
+				captureCodeIndexErrorTelemetry(error, "parseFile")
 				return []
 			}
 		}
@@ -183,11 +191,7 @@ export class CodeParser implements ICodeParser {
 					await this._withParserLoadTimeout(pendingLoad, ext)
 				} catch (error) {
 					console.error(`Error in pending parser load for ${filePath}:`, error)
-					TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
-						error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
-						stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
-						location: "parseContent:loadParser",
-					})
+					captureCodeIndexErrorTelemetry(error, "parseContent:loadParser")
 					return []
 				}
 			} else {
@@ -200,11 +204,7 @@ export class CodeParser implements ICodeParser {
 					}
 				} catch (error) {
 					console.error(`Error loading language parser for ${filePath}:`, error)
-					TelemetryService.instance.captureEvent(TelemetryEventName.CODE_INDEX_ERROR, {
-						error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
-						stack: error instanceof Error ? sanitizeErrorMessage(error.stack || "") : undefined,
-						location: "parseContent:loadParser",
-					})
+					captureCodeIndexErrorTelemetry(error, "parseContent:loadParser")
 					return []
 				} finally {
 					this.pendingLoads.delete(ext)

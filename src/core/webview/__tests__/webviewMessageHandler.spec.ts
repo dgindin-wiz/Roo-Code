@@ -968,6 +968,46 @@ describe("webviewMessageHandler - indexing flows", () => {
 			}),
 		})
 	})
+
+	it("clears the full index database and immediately posts the reset status", async () => {
+		const mockManager = {
+			clearIndexDatabase: vi.fn().mockResolvedValue(undefined),
+			getCurrentStatus: vi.fn().mockReturnValue({
+				systemStatus: "Standby",
+				message: "Index database cleared successfully.",
+				processedItems: 0,
+				totalItems: 0,
+				currentItemUnit: "blocks",
+				warningDetails: [],
+				resumedRetryJobs: 0,
+				resumedPendingJobs: 0,
+				retryingParseRevisions: 0,
+				terminalFailedParseRevisions: 0,
+				degradedRevisions: 0,
+				terminalFailedRevisions: 0,
+				terminallyFailedChunks: 0,
+				retryingChunks: 0,
+			}),
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "clearIndexDatabase",
+		} as any)
+
+		expect(mockManager.clearIndexDatabase).toHaveBeenCalledTimes(1)
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenNthCalledWith(1, {
+			type: "indexCleared",
+			values: { success: true },
+		})
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenNthCalledWith(2, {
+			type: "indexingStatusUpdate",
+			values: expect.objectContaining({
+				systemStatus: "Standby",
+				message: "Index database cleared successfully.",
+			}),
+		})
+	})
 })
 
 describe("webviewMessageHandler - deleteCustomMode", () => {

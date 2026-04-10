@@ -15,6 +15,11 @@ import { AlertTriangle } from "lucide-react"
 import {
 	type IndexingStatus,
 	type IndexingDetailedStage,
+	type IndexingHealthState,
+	type IndexingPipelineSnapshot,
+	type IndexingServiceId,
+	type IndexingServiceSnapshot,
+	type IndexingServiceState,
 	type EmbedderProvider,
 	CODEBASE_INDEX_DEFAULTS,
 } from "@roo-code/types"
@@ -72,23 +77,6 @@ function formatEtaForDisplay(ms: number): string {
 	return `~${hours}h ${remainingMinutes}m remaining`
 }
 
-function getTelemetryTokenCategory(token: string): string | null {
-	if (token.includes("chunks/sec")) return "throughput"
-	if (token.includes("avg batch")) return "avg-batch"
-	if (token.includes("sync batches")) return "sync-batches"
-	if (token.startsWith("CPU ")) return "cpu"
-
-	if (token.startsWith("Memory ")) {
-		const normalized = token.toLowerCase()
-		if (normalized.includes(" rss")) return "memory-rss"
-		if (normalized.includes(" ext")) return "memory-ext"
-		if (normalized.includes(" heap")) return "memory-heap"
-		return "memory"
-	}
-
-	return null
-}
-
 function formatCountLabel(count: number, singular: string, plural: string): string {
 	return `${count.toLocaleString()} ${count === 1 ? singular : plural}`
 }
@@ -128,11 +116,155 @@ function formatModifiedTime(mtimeMs: number | null): string | null {
 	return `Modified ${new Date(mtimeMs).toLocaleString()}`
 }
 
+function formatBuildTimestamp(value: string | undefined): string {
+	if (!value) {
+		return "Unknown build time"
+	}
+
+	const parsed = new Date(value)
+	if (Number.isNaN(parsed.getTime())) {
+		return value
+	}
+
+	return parsed.toLocaleString()
+}
+
 function computeApprovedMaxBytes(sizeBytes: number): number {
 	return Math.max(Math.ceil(sizeBytes * 1.2), sizeBytes + 256 * 1024)
 }
 
+type CodeIndexPopoverTab = "overview" | "settings"
+
+export function getDefaultCodeIndexPopoverTab(
+	indexingEnabled: boolean,
+	pipeline?: IndexingPipelineSnapshot,
+): CodeIndexPopoverTab {
+	return indexingEnabled && Boolean(pipeline) ? "overview" : "settings"
+}
+
+export function shouldExpandIndexServiceCard(state: IndexingServiceState): boolean {
+	return state === "running" || state === "warning" || state === "failed"
+}
+
+function getIndexingOverallStateLabel(pipeline?: IndexingPipelineSnapshot): string {
+	switch (pipeline?.overallState) {
+		case "running":
+			return "Running"
+		case "completed":
+			return pipeline.preservedFromPreviousRun ? "Last run" : "Completed"
+		case "stopped":
+			return "Stopped"
+		case "failed":
+			return "Failed"
+		case "idle":
+		default:
+			return "Idle"
+	}
+}
+
+function getIndexingRunModeLabel(pipeline?: IndexingPipelineSnapshot): string {
+	switch (pipeline?.runMode) {
+		case "start":
+			return "Start"
+		case "refresh":
+			return "Refresh"
+		case "reconcile":
+			return "Reconcile"
+		case "resume":
+			return "Resume"
+		default:
+			return "Unknown"
+	}
+}
+
+function getHealthLabel(health: IndexingHealthState | undefined): string {
+	switch (health) {
+		case "healthy":
+			return "Healthy"
+		case "watch":
+			return "Watch"
+		case "critical":
+			return "Critical"
+		default:
+			return "Unknown"
+	}
+}
+
+function getHealthToneClass(health: IndexingHealthState | undefined): string {
+	switch (health) {
+		case "healthy":
+			return "border-emerald-500/25 bg-emerald-500/10 text-emerald-200"
+		case "watch":
+			return "border-amber-500/25 bg-amber-500/10 text-amber-200"
+		case "critical":
+			return "border-red-500/25 bg-red-500/10 text-red-200"
+		default:
+			return "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground"
+	}
+}
+
+function getServiceStateLabel(state: IndexingServiceState): string {
+	switch (state) {
+		case "running":
+			return "Running"
+		case "completed":
+			return "Completed"
+		case "warning":
+			return "Warning"
+		case "failed":
+			return "Failed"
+		case "skipped":
+			return "Skipped"
+		default:
+			return "Pending"
+	}
+}
+
+function getServiceStateToneClass(state: IndexingServiceState): string {
+	switch (state) {
+		case "running":
+			return "border-sky-500/25 bg-sky-500/10 text-sky-200"
+		case "completed":
+			return "border-emerald-500/25 bg-emerald-500/10 text-emerald-200"
+		case "warning":
+			return "border-amber-500/25 bg-amber-500/10 text-amber-200"
+		case "failed":
+			return "border-red-500/25 bg-red-500/10 text-red-200"
+		case "skipped":
+			return "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.03)] text-vscode-descriptionForeground"
+		default:
+			return "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.03)] text-vscode-descriptionForeground"
+	}
+}
+
+function getHealthDotClass(health: IndexingHealthState | undefined): string {
+	switch (health) {
+		case "healthy":
+			return "bg-emerald-400"
+		case "watch":
+			return "bg-amber-400"
+		case "critical":
+			return "bg-red-400"
+		default:
+			return "bg-vscode-descriptionForeground/60"
+	}
+}
+
+function formatServiceProgress(service: IndexingServiceSnapshot): string | null {
+	if (service.indeterminate) {
+		return service.progressUnit ? `In progress • ${service.progressUnit}` : "In progress"
+	}
+	if (service.progressCurrent == null || service.progressTotal == null) {
+		return null
+	}
+	const progressUnit = service.progressUnit ?? "items"
+	return `${service.progressCurrent.toLocaleString()} / ${service.progressTotal.toLocaleString()} ${progressUnit}`
+}
+
 export function getIndexingHeadline(indexingStatus: IndexingStatus, isCurrentStandby: boolean, t: any): string {
+	if (indexingStatus.pipeline?.summary?.headline) {
+		return indexingStatus.pipeline.summary.headline
+	}
 	if (isCurrentStandby) {
 		return t("settings:codeIndex.liveWatcherHeadline")
 	}
@@ -171,6 +303,126 @@ export function getIndexingHeadline(indexingStatus: IndexingStatus, isCurrentSta
 				return "Checking workspace files"
 			}
 			return (indexingStatus.message ?? "").split("\n")[0] ?? ""
+	}
+}
+
+function getLegacyRunSummarySupplementalLines(
+	indexingStatus: IndexingStatus,
+	isCurrentStandby: boolean,
+	t: any,
+	displayedOversizedCount: number,
+): string[] {
+	const statusLines = (indexingStatus.message ?? "")
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean)
+
+	if (isCurrentStandby) {
+		return [
+			getLiveWatcherCurrentLine(indexingStatus, statusLines[0], displayedOversizedCount),
+			getLiveWatcherRefreshLine(indexingStatus, statusLines[0]) ?? t("settings:codeIndex.liveWatcherDetail"),
+		].filter((line): line is string => Boolean(line))
+	}
+
+	if (indexingStatus.systemStatus !== "Indexing") {
+		return statusLines.slice(1, 3)
+	}
+
+	const detailLines = statusLines.slice(1)
+	const summaryLine =
+		detailLines.find(
+			(line) =>
+				line.includes("Parsing ") || line.includes("Streaming ") || line.includes("candidate files found"),
+		) ?? detailLines[0]
+	const runtimeLine =
+		detailLines.find((line) => line.includes(" MB RSS") || line.includes("chunks/sec") || line.includes("CPU ")) ??
+		detailLines[1]
+
+	return [summaryLine, runtimeLine].filter((line): line is string => Boolean(line)).slice(0, 2)
+}
+
+function getLegacyRunSummaryProgressLabel(indexingStatus: IndexingStatus): string {
+	switch (indexingStatus.detailedStage) {
+		case "preparing":
+			return "Initializing index engine"
+		case "reconciling":
+			return indexingStatus.isBackgroundReconcile ? "Verifying index freshness" : "Reconciling workspace state"
+		case "discovering": {
+			const discoveredFiles = indexingStatus.processedItems ?? 0
+			const rawEstimatedTotal = Math.max(indexingStatus.totalItems ?? 0, discoveredFiles, 1)
+			const estimatedTotal =
+				rawEstimatedTotal <= discoveredFiles
+					? Math.max(Math.ceil(discoveredFiles * 1.1), discoveredFiles + 1)
+					: rawEstimatedTotal
+			return `${discoveredFiles.toLocaleString()} found • ~${estimatedTotal.toLocaleString()} estimated`
+		}
+		case "hashing_initial":
+		case "comparing_signatures": {
+			const checkedFiles = indexingStatus.processedItems ?? 0
+			const totalFiles = Math.max(indexingStatus.totalItems ?? 0, checkedFiles, 1)
+			return `${checkedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} checked`
+		}
+		case "parsing": {
+			const parsedFiles = indexingStatus.processedItems ?? 0
+			const totalFiles = Math.max(indexingStatus.totalItems ?? 0, parsedFiles, 1)
+			return `${parsedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} files`
+		}
+		case "planning_vectors":
+			return indexingStatus.hasKnownVectorWork ? "Preparing vector workload" : "Checking for vector work"
+		case "embedding":
+			if (!indexingStatus.hasStartedVectorSync) {
+				return "Preparing vector workload"
+			}
+			return `${(indexingStatus.blocksEmbedded ?? 0).toLocaleString()} / ${(indexingStatus.totalBlocks ?? 0).toLocaleString()} blocks`
+		case "deleting_vectors":
+			return "Removing stale vectors"
+		default:
+			if (indexingStatus.phase === "embedding" && indexingStatus.hasStartedVectorSync) {
+				return `${(indexingStatus.blocksEmbedded ?? 0).toLocaleString()} / ${(indexingStatus.totalBlocks ?? 0).toLocaleString()} blocks`
+			}
+			if (indexingStatus.phase === "scanning") {
+				const processed = indexingStatus.processedItems ?? 0
+				const total = Math.max(indexingStatus.totalItems ?? 0, processed, 1)
+				return `${processed.toLocaleString()} / ${total.toLocaleString()} files`
+			}
+			return ""
+	}
+}
+
+export function getRunSummaryDisplay(
+	indexingStatus: IndexingStatus,
+	isCurrentStandby: boolean,
+	t: any,
+	displayedOversizedCount = 0,
+): {
+	headline: string
+	progressLine?: string
+	secondaryLine?: string
+} {
+	const pipelineSummary = indexingStatus.pipeline?.summary
+	if (pipelineSummary) {
+		return {
+			headline: pipelineSummary.headline,
+			progressLine: pipelineSummary.progressLabel,
+			secondaryLine: pipelineSummary.secondaryLabel,
+		}
+	}
+
+	const headline = getIndexingHeadline(indexingStatus, isCurrentStandby, t)
+	const supplementalLines = getLegacyRunSummarySupplementalLines(
+		indexingStatus,
+		isCurrentStandby,
+		t,
+		displayedOversizedCount,
+	)
+	const legacyProgressLabel = getLegacyRunSummaryProgressLabel(indexingStatus)
+	const progressLine = legacyProgressLabel || supplementalLines[0]
+	const secondaryLine = supplementalLines.find((line) => line !== progressLine)
+
+	return {
+		headline,
+		progressLine,
+		secondaryLine,
 	}
 }
 
@@ -231,58 +483,6 @@ export function getProgressStageLabel(stage?: IndexingDetailedStage, phase?: Ind
 			return "Cleanup pass"
 		default:
 			return phase === "embedding" ? "Embedding pass" : "Workspace pass"
-	}
-}
-
-function parseTelemetryToken(token: string): {
-	label: string
-	value: string
-	emphasis?: "numeric" | "text"
-} {
-	if (token.startsWith("Memory ")) {
-		return {
-			label: "Memory",
-			value: token.replace(/^Memory\s+/, ""),
-			emphasis: "numeric",
-		}
-	}
-
-	if (token.startsWith("CPU ")) {
-		return {
-			label: "CPU",
-			value: token.replace(/^CPU\s+/, ""),
-			emphasis: "numeric",
-		}
-	}
-
-	if (token.includes("chunks/sec")) {
-		return {
-			label: "Throughput",
-			value: token,
-			emphasis: "numeric",
-		}
-	}
-
-	if (token.includes("avg batch")) {
-		return {
-			label: "Avg batch",
-			value: token,
-			emphasis: "numeric",
-		}
-	}
-
-	if (token.includes("sync batches")) {
-		return {
-			label: "Sync batches",
-			value: token,
-			emphasis: "numeric",
-		}
-	}
-
-	return {
-		label: "Status",
-		value: token,
-		emphasis: "text",
 	}
 }
 
@@ -439,8 +639,17 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 }) => {
 	const SECRET_PLACEHOLDER = "••••••••••••••••"
 	const { t } = useAppTranslation()
-	const { codebaseIndexConfig, codebaseIndexModels, cwd, apiConfiguration } = useExtensionState()
+	const { codebaseIndexConfig, codebaseIndexModels, cwd, apiConfiguration, debug, renderContext } =
+		useExtensionState()
+	const rooVersion = process.env.PKG_VERSION ?? "unknown"
+	const rooBuildTimestamp = formatBuildTimestamp(process.env.PKG_BUILD_TIMESTAMP)
 	const [open, setOpen] = useState(false)
+	const [activeTab, setActiveTab] = useState<CodeIndexPopoverTab>(
+		getDefaultCodeIndexPopoverTab(
+			codebaseIndexConfig?.codebaseIndexEnabled ?? true,
+			externalIndexingStatus.pipeline,
+		),
+	)
 	const [isAdvancedSettingsOpen, setIsAdvancedSettingsOpen] = useState(false)
 	const [isSetupSettingsOpen, setIsSetupSettingsOpen] = useState(false)
 	const setupSectionRef = useRef<HTMLDivElement | null>(null)
@@ -495,8 +704,34 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const [warningSort, setWarningSort] = useState<"severity" | "recent" | "path">("severity")
 	const [retryWarningsPending, setRetryWarningsPending] = useState(false)
 	const [retryingWarningPath, setRetryingWarningPath] = useState<string | null>(null)
+	const [serviceExpansionOverrides, setServiceExpansionOverrides] = useState<
+		Partial<Record<IndexingServiceId, boolean>>
+	>({})
 	const { copyWithFeedback, showCopyFeedback } = useCopyToClipboard()
 	const saveFeedbackTimerRef = useRef<number | null>(null)
+	const rooDebugInfo = useMemo(() => {
+		if (typeof window === "undefined") {
+			return {
+				origin: "",
+				webviewId: "",
+			}
+		}
+
+		try {
+			const url = new URL(window.location.href)
+			const host = url.host
+			const webviewId = url.searchParams.get("id") ?? (host && host !== "vscode-webview" ? host : "")
+			return {
+				origin: url.origin,
+				webviewId,
+			}
+		} catch {
+			return {
+				origin: "",
+				webviewId: "",
+			}
+		}
+	}, [])
 
 	// Form validation state
 	const [formErrors, setFormErrors] = useState<Record<string, string>>({})
@@ -639,6 +874,12 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		window.addEventListener("message", handleMessage)
 		return () => window.removeEventListener("message", handleMessage)
 	}, [open])
+
+	useEffect(() => {
+		if (!currentSettings.codebaseIndexEnabled && activeTab === "overview") {
+			setActiveTab("settings")
+		}
+	}, [activeTab, currentSettings.codebaseIndexEnabled])
 
 	const showSaveError = useCallback(
 		(message?: string) => {
@@ -1102,8 +1343,43 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		})
 	}
 
+	const pipelineSnapshot = indexingStatus.pipeline
+	const pipelineSummary = pipelineSnapshot?.summary
+	const showDebugSection = debug || currentSettings.codebaseIndexDebugLogging
+	const completedAtLabel = useMemo(() => {
+		if (!pipelineSnapshot?.lastCompletedAt) {
+			return null
+		}
+		return new Date(pipelineSnapshot.lastCompletedAt).toLocaleString()
+	}, [pipelineSnapshot?.lastCompletedAt])
+	const getIsServiceExpanded = useCallback(
+		(service: IndexingServiceSnapshot) =>
+			serviceExpansionOverrides[service.id] ?? shouldExpandIndexServiceCard(service.state),
+		[serviceExpansionOverrides],
+	)
+
 	const detailedStage = indexingStatus.detailedStage
+	const displayedOversizedCount = Math.max(indexingStatus.oversizedFiles ?? 0, oversizedDetailsState.actionable)
+	const isCurrentStandby = useMemo(
+		() =>
+			(indexingStatus.systemStatus === "Standby" &&
+				/^(?:V2 is current(?: across| after a partial scan of)|V2 mapped )/.test(
+					indexingStatus.message ?? "",
+				)) ||
+			(indexingStatus.systemStatus === "Indexed" &&
+				/^(?:Index up-to-date(?:\.| —|$)|V2 mapped |V2 refresh re-evaluated |V2 is current across )/.test(
+					indexingStatus.message ?? "",
+				)),
+		[indexingStatus.message, indexingStatus.systemStatus],
+	)
+	const runSummaryDisplay = useMemo(
+		() => getRunSummaryDisplay(indexingStatus, isCurrentStandby, t, displayedOversizedCount),
+		[indexingStatus, isCurrentStandby, t, displayedOversizedCount],
+	)
 	const progressPercentage = useMemo(() => {
+		if (pipelineSummary?.progressPercent != null) {
+			return Math.min(100, Math.max(0, Math.round(pipelineSummary.progressPercent)))
+		}
 		if (
 			detailedStage === "embedding" &&
 			indexingStatus.hasStartedVectorSync &&
@@ -1136,144 +1412,22 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		indexingStatus.totalBlocks,
 		indexingStatus.processedItems,
 		indexingStatus.totalItems,
+		pipelineSummary?.progressPercent,
 	])
 
 	const transformStyleString = `translateX(-${100 - progressPercentage}%)`
-	const statusLines = useMemo(
-		() =>
-			(indexingStatus.message ?? "")
-				.split("\n")
-				.map((line) => line.trim())
-				.filter(Boolean),
-		[indexingStatus.message],
-	)
-	const isCurrentStandby = useMemo(
-		() =>
-			(indexingStatus.systemStatus === "Standby" &&
-				/^(?:V2 is current(?: across| after a partial scan of)|V2 mapped )/.test(
-					indexingStatus.message ?? "",
-				)) ||
-			(indexingStatus.systemStatus === "Indexed" &&
-				/^(?:Index up-to-date(?:\.| —|$)|V2 mapped |V2 refresh re-evaluated |V2 is current across )/.test(
-					indexingStatus.message ?? "",
-				)),
-		[indexingStatus.message, indexingStatus.systemStatus],
-	)
-	const statusHeadline = useMemo(
-		() => getIndexingHeadline(indexingStatus, isCurrentStandby, t),
-		[indexingStatus, isCurrentStandby, t],
-	)
-	const displayedOversizedCount = Math.max(indexingStatus.oversizedFiles ?? 0, oversizedDetailsState.actionable)
-	const statusSupplementalLines = useMemo(() => {
-		if (isCurrentStandby) {
-			return [
-				getLiveWatcherCurrentLine(indexingStatus, statusLines[0], displayedOversizedCount),
-				getLiveWatcherRefreshLine(indexingStatus, statusLines[0]) ?? t("settings:codeIndex.liveWatcherDetail"),
-			].filter(Boolean)
+	const isIndeterminateEmbeddingProgress = useMemo(() => {
+		if (pipelineSummary) {
+			return Boolean(pipelineSummary.indeterminate)
 		}
-		if (indexingStatus.systemStatus !== "Indexing") {
-			return statusLines.slice(1, 3)
-		}
-
-		const detailLines = statusLines.slice(1)
-		const summaryLine =
-			detailLines.find(
-				(line) =>
-					line.includes("Parsing ") || line.includes("Streaming ") || line.includes("candidate files found"),
-			) ?? detailLines[0]
-		const runtimeLine =
-			detailLines.find(
-				(line) => line.includes(" MB RSS") || line.includes("chunks/sec") || line.includes("CPU "),
-			) ?? detailLines[1]
-
-		return [summaryLine, runtimeLine].filter(Boolean).slice(0, 2)
-	}, [displayedOversizedCount, indexingStatus, isCurrentStandby, statusLines, t])
-	const progressCaption = useMemo(() => {
-		switch (detailedStage) {
-			case "preparing":
-				return "Initializing index engine"
-			case "reconciling":
-				return indexingStatus.isBackgroundReconcile
-					? "Verifying index freshness"
-					: "Reconciling workspace state"
-			case "discovering": {
-				const discoveredFiles = indexingStatus.processedItems ?? 0
-				const rawEstimatedTotal = Math.max(indexingStatus.totalItems ?? 0, discoveredFiles, 1)
-				const estimatedTotal =
-					rawEstimatedTotal <= discoveredFiles
-						? Math.max(Math.ceil(discoveredFiles * 1.1), discoveredFiles + 1)
-						: rawEstimatedTotal
-				return `${discoveredFiles.toLocaleString()} found • ~${estimatedTotal.toLocaleString()} estimated`
-			}
-			case "hashing_initial": {
-				const checkedFiles = indexingStatus.processedItems ?? 0
-				const totalFiles = Math.max(indexingStatus.totalItems ?? 0, checkedFiles, 1)
-				return `${checkedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} checked`
-			}
-			case "comparing_signatures": {
-				const checkedFiles = indexingStatus.processedItems ?? 0
-				const totalFiles = Math.max(indexingStatus.totalItems ?? 0, checkedFiles, 1)
-				return `${checkedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} checked`
-			}
-			case "parsing": {
-				const parsedFiles = indexingStatus.processedItems ?? 0
-				const totalFiles = Math.max(indexingStatus.totalItems ?? 0, parsedFiles, 1)
-				return `${parsedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} files`
-			}
-			case "planning_vectors":
-				return indexingStatus.hasKnownVectorWork ? "Preparing vector workload" : "Checking for vector work"
-			case "embedding":
-				if (!indexingStatus.hasStartedVectorSync) {
-					return "Preparing vector workload"
-				}
-				return `${(indexingStatus.blocksEmbedded ?? 0).toLocaleString()} / ${(indexingStatus.totalBlocks ?? 0).toLocaleString()} blocks`
-			case "deleting_vectors":
-				return "Removing stale vectors"
-			default:
-				if (indexingStatus.phase === "embedding" && indexingStatus.hasStartedVectorSync) {
-					return `${(indexingStatus.blocksEmbedded ?? 0).toLocaleString()} / ${(indexingStatus.totalBlocks ?? 0).toLocaleString()} blocks`
-				}
-				if (indexingStatus.phase === "scanning") {
-					const processed = indexingStatus.processedItems ?? 0
-					const total = Math.max(indexingStatus.totalItems ?? 0, processed, 1)
-					return `${processed.toLocaleString()} / ${total.toLocaleString()} files`
-				}
-		}
-		return ""
-	}, [
-		detailedStage,
-		indexingStatus.hasKnownVectorWork,
-		indexingStatus.hasStartedVectorSync,
-		indexingStatus.isBackgroundReconcile,
-		indexingStatus.blocksEmbedded,
-		indexingStatus.phase,
-		indexingStatus.processedItems,
-		indexingStatus.totalBlocks,
-		indexingStatus.totalItems,
-	])
-	const isIndeterminateEmbeddingProgress = useMemo(
-		() =>
+		return (
 			indexingStatus.systemStatus === "Indexing" &&
 			(detailedStage === "preparing" ||
 				detailedStage === "reconciling" ||
 				detailedStage === "planning_vectors" ||
-				(detailedStage === "embedding" && !indexingStatus.hasStartedVectorSync)),
-		[detailedStage, indexingStatus.hasStartedVectorSync, indexingStatus.systemStatus],
-	)
-	const estimationMetaTokens = useMemo(() => {
-		if (indexingStatus.systemStatus !== "Indexing") {
-			return []
-		}
-
-		const tokens: string[] = []
-		if (indexingStatus.estimationConfidence) {
-			tokens.push(`${indexingStatus.estimationConfidence} confidence`)
-		}
-		if (indexingStatus.isBackpressured) {
-			tokens.push("Waiting on embeddings")
-		}
-		return tokens
-	}, [indexingStatus.estimationConfidence, indexingStatus.isBackpressured, indexingStatus.systemStatus])
+				(detailedStage === "embedding" && !indexingStatus.hasStartedVectorSync))
+		)
+	}, [detailedStage, indexingStatus.hasStartedVectorSync, indexingStatus.systemStatus, pipelineSummary])
 	const resilienceHighlights = useMemo(() => {
 		const resumedPendingJobs = indexingStatus.resumedPendingJobs ?? 0
 		const warningItems = [
@@ -1333,56 +1487,6 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		],
 		[],
 	)
-	const statusTokens = useMemo(
-		() =>
-			statusSupplementalLines
-				.filter((line): line is string => Boolean(line))
-				.flatMap((line) => line.split(" • "))
-				.map((token) => token.trim())
-				.filter((token): token is string => Boolean(token)),
-		[statusSupplementalLines],
-	)
-	const identityTokens = useMemo(
-		() =>
-			statusTokens.filter(
-				(token) =>
-					token !== statusLines[0] &&
-					!token.includes("chunks/sec") &&
-					!token.includes("avg batch") &&
-					!token.includes("sync batches") &&
-					!token.startsWith("Memory ") &&
-					!token.startsWith("CPU ") &&
-					!token.includes("candidate files found") &&
-					!token.includes("Parsing ") &&
-					!token.includes("Streaming "),
-			),
-		[statusLines, statusTokens],
-	)
-	const telemetryTokens = useMemo(() => {
-		const latestByCategory = new Map<string, string>()
-
-		for (const token of statusTokens) {
-			const category = getTelemetryTokenCategory(token)
-			if (category) {
-				latestByCategory.set(category, token)
-			}
-		}
-
-		const orderedCategories = [
-			"memory-ext",
-			"memory-heap",
-			"memory-rss",
-			"cpu",
-			"throughput",
-			"avg-batch",
-			"sync-batches",
-			"memory",
-		]
-
-		return orderedCategories
-			.map((category) => latestByCategory.get(category))
-			.filter((token): token is string => Boolean(token))
-	}, [statusTokens])
 	const shouldShowRefreshAction =
 		currentSettings.codebaseIndexEnabled && (indexingStatus.systemStatus === "Indexed" || isCurrentStandby)
 	const shouldShowStartAction =
@@ -1432,6 +1536,101 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const numericTextClass = "[font-variant-numeric:tabular-nums] tabular-nums whitespace-nowrap text-right"
 	const stableChipClass =
 		"flex min-h-[34px] min-w-0 items-center rounded-xl border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.02)] px-3 py-1.5 text-[11px] text-vscode-descriptionForeground/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] sm:rounded-full"
+	const clearIndexAction = (
+		<AlertDialog>
+			<AlertDialogTrigger asChild>
+				<Button variant="secondary" className={footerDestructiveButtonClass}>
+					{t("settings:codeIndex.clearIndexDataButton")}
+				</Button>
+			</AlertDialogTrigger>
+			<AlertDialogContent>
+				<AlertDialogHeader>
+					<AlertDialogTitle>{t("settings:codeIndex.clearDataDialog.title")}</AlertDialogTitle>
+					<AlertDialogDescription>
+						{t("settings:codeIndex.clearDataDialog.description")}
+					</AlertDialogDescription>
+				</AlertDialogHeader>
+				<AlertDialogFooter>
+					<AlertDialogCancel>{t("settings:codeIndex.clearDataDialog.cancelButton")}</AlertDialogCancel>
+					<AlertDialogAction onClick={() => vscode.postMessage({ type: "clearIndexData" })}>
+						{t("settings:codeIndex.clearDataDialog.confirmButton")}
+					</AlertDialogAction>
+				</AlertDialogFooter>
+			</AlertDialogContent>
+		</AlertDialog>
+	)
+	const clearDatabaseAction = (
+		<AlertDialog>
+			<AlertDialogTrigger asChild>
+				<Button variant="secondary" className={footerDestructiveButtonClass}>
+					{t("settings:codeIndex.clearIndexDatabaseButton")}
+				</Button>
+			</AlertDialogTrigger>
+			<AlertDialogContent>
+				<AlertDialogHeader>
+					<AlertDialogTitle>{t("settings:codeIndex.clearDatabaseDialog.title")}</AlertDialogTitle>
+					<AlertDialogDescription>
+						{t("settings:codeIndex.clearDatabaseDialog.description")}
+					</AlertDialogDescription>
+				</AlertDialogHeader>
+				<AlertDialogFooter>
+					<AlertDialogCancel>{t("settings:codeIndex.clearDatabaseDialog.cancelButton")}</AlertDialogCancel>
+					<AlertDialogAction onClick={() => vscode.postMessage({ type: "clearIndexDatabase" })}>
+						{t("settings:codeIndex.clearDatabaseDialog.confirmButton")}
+					</AlertDialogAction>
+				</AlertDialogFooter>
+			</AlertDialogContent>
+		</AlertDialog>
+	)
+	const runActionButtons = (
+		<div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap">
+			{shouldShowStartAction && (
+				<Button
+					variant="outline"
+					className={footerSecondaryButtonClass}
+					onClick={() => vscode.postMessage({ type: "startIndexing" })}
+					disabled={saveStatus === "saving" || hasUnsavedChanges}>
+					{t("settings:codeIndex.startIndexingButton")}
+				</Button>
+			)}
+
+			{shouldShowRefreshAction && (
+				<Button
+					variant="outline"
+					className={footerSecondaryButtonClass}
+					onClick={() => vscode.postMessage({ type: "fullRefreshIndexData" })}
+					disabled={saveStatus === "saving" || hasUnsavedChanges}>
+					{isCurrentStandby
+						? t("settings:codeIndex.refreshIndexButton")
+						: t("settings:codeIndex.reindexButton")}
+				</Button>
+			)}
+
+			{currentSettings.codebaseIndexEnabled && indexingStatus.systemStatus === "Indexing" && (
+				<Button
+					variant="destructive"
+					className={footerDestructiveButtonClass}
+					onClick={() => vscode.postMessage({ type: "stopIndexing" })}>
+					{t("settings:codeIndex.stopIndexingButton")}
+				</Button>
+			)}
+
+			{currentSettings.codebaseIndexEnabled && indexingStatus.systemStatus === "Stopping" && (
+				<Button variant="destructive" className={footerDestructiveButtonClass} disabled>
+					{t("settings:codeIndex.stoppingButton")}
+				</Button>
+			)}
+
+			{currentSettings.codebaseIndexEnabled &&
+				indexingStatus.systemStatus !== "Indexing" &&
+				indexingStatus.systemStatus !== "Stopping" && (
+					<>
+						{clearIndexAction}
+						{clearDatabaseAction}
+					</>
+				)}
+		</div>
+	)
 
 	return (
 		<>
@@ -1442,6 +1641,13 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 						// User is trying to close the popover
 						handlePopoverClose()
 					} else {
+						setActiveTab(
+							getDefaultCodeIndexPopoverTab(
+								currentSettings.codebaseIndexEnabled,
+								externalIndexingStatus.pipeline,
+							),
+						)
+						setServiceExpansionOverrides({})
 						setOpen(newOpen)
 					}
 				}}>
@@ -1476,594 +1682,726 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 					</div>
 
 					<div className="flex-1 min-h-0 overflow-y-auto overscroll-contain px-5 py-5 pb-8">
-						{/* Status Section */}
-						<div className="space-y-2">
-							<div className={sectionLabelClass}>{t("settings:codeIndex.statusTitle")}</div>
-							<div className={`${surfaceCardClass} h-[13rem] overflow-hidden p-4`}>
-								<div className="h-full overflow-y-auto pr-1">
-									<div className="flex items-start gap-3">
-										<span
-											className={cn(
-												"mt-1.5 inline-block h-2.5 w-2.5 shrink-0 rounded-full shadow-[0_0_12px_rgba(245,158,11,0.35)]",
-												{
-													"bg-gray-400":
-														indexingStatus.systemStatus === "Standby" && !isCurrentStandby,
-													"bg-yellow-500 animate-pulse":
-														indexingStatus.systemStatus === "Indexing",
-													"bg-green-500":
-														indexingStatus.systemStatus === "Indexed" || isCurrentStandby,
-													"bg-amber-500 animate-pulse":
-														indexingStatus.systemStatus === "Stopping",
-													"bg-red-500": indexingStatus.systemStatus === "Error",
-												},
-											)}
-										/>
-										<div className="min-w-0 flex-1">
-											<div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-vscode-descriptionForeground/70">
-												{isCurrentStandby
-													? t("settings:codeIndex.liveWatcherHeadline")
-													: t(
-															`settings:codeIndex.indexingStatuses.${indexingStatus.systemStatus.toLowerCase()}`,
-														)}
-											</div>
-											{statusHeadline && (
-												<div className="mt-1 min-h-[2.5rem] text-[15px] font-semibold leading-5 tracking-[-0.01em]">
-													{statusHeadline}
-												</div>
-											)}
-											{(statusSupplementalLines.length > 0 ||
-												resilienceHighlights.resumedPendingJobs > 0 ||
-												resilienceHighlights.warningItems.length > 0) && (
-												<div className="mt-2 space-y-2">
-													{statusSupplementalLines[0] && (
-														<div className="min-h-[1.5rem] text-[12px] leading-5 text-vscode-descriptionForeground">
-															{statusSupplementalLines[0]}
-														</div>
-													)}
-													{(identityTokens.length > 0 || estimationMetaTokens.length > 0) && (
-														<div className="flex flex-wrap gap-1.5">
-															{identityTokens.slice(0, 3).map((token) => (
-																<span
-																	key={token}
-																	className="max-w-full rounded-xl border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[11px] leading-4 text-vscode-descriptionForeground/92 break-words sm:rounded-full">
-																	{token}
-																</span>
-															))}
-															{estimationMetaTokens.map((token) => (
-																<span
-																	key={token}
-																	className="max-w-full rounded-xl border border-vscode-dropdown-border/80 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[11px] leading-4 text-vscode-descriptionForeground/92 break-words sm:rounded-full">
-																	{token}
-																</span>
-															))}
-														</div>
-													)}
-													{telemetryTokens.length > 0 && (
-														<div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-															{telemetryTokens.slice(0, 4).map((token) =>
-																(() => {
-																	const parsedToken = parseTelemetryToken(token)
-																	return (
-																		<div
-																			key={token}
-																			className="flex min-h-[56px] flex-col justify-between rounded-xl border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.018)] px-3 py-2.5 text-vscode-descriptionForeground/88 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
-																			<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
-																				{parsedToken.label}
-																			</div>
-																			<div
-																				className={cn(
-																					"mt-2 min-w-0 break-words text-[12px] leading-4 tracking-[-0.01em] text-vscode-foreground/92",
-																					parsedToken.emphasis ===
-																						"numeric" &&
-																						"tabular-nums [font-variant-numeric:tabular-nums]",
-																				)}>
-																				{parsedToken.value}
-																			</div>
-																		</div>
-																	)
-																})(),
-															)}
-														</div>
-													)}
-													{(resilienceHighlights.resumedPendingJobs > 0 ||
-														resilienceHighlights.warningItems.length > 0) && (
-														<div className="space-y-2">
-															{resilienceHighlights.resumedPendingJobs > 0 && (
-																<div className="rounded-xl border border-sky-500/20 bg-[rgba(80,168,255,0.08)] px-3 py-2 text-[11px] leading-4 text-vscode-foreground/92">
-																	Resuming{" "}
-																	{resilienceHighlights.resumedPendingJobs.toLocaleString()}{" "}
-																	unfinished
-																	{" indexing "}
-																	{resilienceHighlights.resumedPendingJobs === 1
-																		? "job"
-																		: "jobs"}{" "}
-																	from the previous run
+						<div className="mb-4 flex items-center gap-2 rounded-xl border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.02)] p-1.5">
+							<Button
+								type="button"
+								variant="ghost"
+								size="sm"
+								className={cn(
+									"h-9 flex-1 rounded-lg text-sm",
+									activeTab === "overview"
+										? "bg-[rgba(80,168,255,0.14)] text-vscode-foreground"
+										: "text-vscode-descriptionForeground hover:bg-[rgba(255,255,255,0.05)]",
+								)}
+								onClick={() => setActiveTab("overview")}>
+								Overview
+							</Button>
+							<Button
+								type="button"
+								variant="ghost"
+								size="sm"
+								className={cn(
+									"h-9 flex-1 rounded-lg text-sm",
+									activeTab === "settings"
+										? "bg-[rgba(80,168,255,0.14)] text-vscode-foreground"
+										: "text-vscode-descriptionForeground hover:bg-[rgba(255,255,255,0.05)]",
+								)}
+								onClick={() => setActiveTab("settings")}>
+								Settings
+							</Button>
+						</div>
+
+						{activeTab === "overview" && (
+							<div className="space-y-4">
+								<div className="space-y-2">
+									<div className={sectionLabelClass}>Run Summary</div>
+									<div className={`${surfaceCardClass} p-4`}>
+										<div className="flex items-start gap-3">
+											<span
+												className={cn(
+													"mt-1.5 inline-block h-2.5 w-2.5 shrink-0 rounded-full shadow-[0_0_12px_rgba(245,158,11,0.35)]",
+													{
+														"bg-gray-400":
+															indexingStatus.systemStatus === "Standby" &&
+															!isCurrentStandby,
+														"bg-yellow-500 animate-pulse":
+															indexingStatus.systemStatus === "Indexing",
+														"bg-green-500":
+															indexingStatus.systemStatus === "Indexed" ||
+															isCurrentStandby,
+														"bg-amber-500 animate-pulse":
+															indexingStatus.systemStatus === "Stopping",
+														"bg-red-500": indexingStatus.systemStatus === "Error",
+													},
+												)}
+											/>
+											<div className="min-w-0 flex-1 space-y-3">
+												<div>
+													<div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-vscode-descriptionForeground/70">
+														{pipelineSnapshot
+															? getIndexingOverallStateLabel(pipelineSnapshot)
+															: t("settings:codeIndex.statusTitle")}
+													</div>
+													<div className="mt-1 text-[16px] font-semibold leading-5 tracking-[-0.01em] text-vscode-foreground">
+														{runSummaryDisplay.headline || "Code index overview"}
+													</div>
+													{(runSummaryDisplay.progressLine ||
+														runSummaryDisplay.secondaryLine) && (
+														<div className="mt-2 space-y-1 text-[12px] leading-5 text-vscode-descriptionForeground">
+															{runSummaryDisplay.progressLine && (
+																<div className="text-vscode-foreground/92">
+																	{runSummaryDisplay.progressLine}
 																</div>
 															)}
-															{resilienceHighlights.warningItems.length > 0 && (
-																<div className="rounded-xl border border-amber-500/20 bg-[rgba(245,158,11,0.08)] px-3 py-2">
-																	<div className="flex items-center gap-2 text-[11px] font-medium text-vscode-foreground/92">
-																		<AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
-																		<span>Indexing warnings</span>
-																	</div>
-																	<div className="mt-2 flex flex-wrap gap-1.5">
-																		{resilienceHighlights.warningItems.map(
-																			(item) => (
-																				<span
-																					key={item}
-																					className="rounded-full border border-amber-500/20 bg-[rgba(255,255,255,0.05)] px-2.5 py-1 text-[11px] leading-none text-vscode-descriptionForeground/96">
-																					{item}
-																				</span>
-																			),
+															{runSummaryDisplay.secondaryLine && (
+																<div>{runSummaryDisplay.secondaryLine}</div>
+															)}
+														</div>
+													)}
+												</div>
+
+												<div className="flex flex-wrap gap-1.5">
+													{pipelineSnapshot && (
+														<>
+															<span
+																className={`rounded-full border px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.1em] ${getHealthToneClass(pipelineSnapshot.overallHealth)}`}>
+																{getHealthLabel(pipelineSnapshot.overallHealth)}
+															</span>
+															<span className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.1em] text-vscode-descriptionForeground">
+																{getIndexingRunModeLabel(pipelineSnapshot)}
+															</span>
+														</>
+													)}
+													{indexingStatus.estimatedTimeRemainingMs != null ? (
+														<span
+															className={cn(
+																stableChipClass,
+																"min-h-[30px] px-2.5 py-1 text-[10px]",
+															)}>
+															{formatEtaForDisplay(
+																indexingStatus.estimatedTimeRemainingMs,
+															)}
+														</span>
+													) : completedAtLabel ? (
+														<span className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[10px] text-vscode-descriptionForeground">
+															Completed {completedAtLabel}
+														</span>
+													) : null}
+												</div>
+
+												{indexingStatus.systemStatus === "Indexing" && (
+													<div className="space-y-2">
+														<div className="flex items-center gap-2">
+															<ProgressPrimitive.Root
+																className="relative h-2.5 w-full min-w-[80px] overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]"
+																value={progressPercentage}>
+																<ProgressPrimitive.Indicator
+																	className={cn(
+																		"h-full w-full flex-1 bg-[linear-gradient(90deg,rgba(80,168,255,0.9),rgba(128,203,255,0.92))] transition-transform duration-300 ease-in-out",
+																		isIndeterminateEmbeddingProgress &&
+																			"animate-pulse opacity-75",
+																	)}
+																	style={{
+																		transform: isIndeterminateEmbeddingProgress
+																			? "translateX(-72%)"
+																			: transformStyleString,
+																	}}
+																/>
+															</ProgressPrimitive.Root>
+															<span
+																className={cn(
+																	"min-w-[3.75rem] text-xs font-medium text-vscode-descriptionForeground",
+																	numericTextClass,
+																)}>
+																{isIndeterminateEmbeddingProgress
+																	? "..."
+																	: `${progressPercentage}%`}
+															</span>
+														</div>
+													</div>
+												)}
+
+												<div className="pt-1">{runActionButtons}</div>
+											</div>
+										</div>
+									</div>
+								</div>
+
+								<div className="space-y-2">
+									<div className={sectionLabelClass}>Services</div>
+									<div className="grid gap-3 sm:grid-cols-2">
+										{pipelineSnapshot?.services?.map((service) => {
+											const expanded = getIsServiceExpanded(service)
+											const visibleMetrics = expanded
+												? service.metrics
+												: service.metrics.slice(0, 4)
+											return (
+												<div key={service.id} className={`${surfaceCardClass} overflow-hidden`}>
+													<button
+														type="button"
+														onClick={() =>
+															setServiceExpansionOverrides((prev) => ({
+																...prev,
+																[service.id]: !(
+																	prev[service.id] ??
+																	shouldExpandIndexServiceCard(service.state)
+																),
+															}))
+														}
+														className="flex w-full items-start justify-between gap-3 px-4 py-4 text-left transition-colors hover:bg-[rgba(255,255,255,0.02)]">
+														<div className="min-w-0 flex-1">
+															<div className="flex items-center gap-2">
+																<span
+																	className={`inline-block h-2.5 w-2.5 rounded-full ${getHealthDotClass(service.health)}`}
+																/>
+																<span className="text-[13px] font-semibold tracking-[-0.01em] text-vscode-foreground">
+																	{service.title}
+																</span>
+															</div>
+															<div className="mt-1 text-[12px] leading-4 text-vscode-descriptionForeground">
+																{service.summary}
+															</div>
+														</div>
+														<div className="flex shrink-0 flex-col items-end gap-1">
+															<span
+																className={`rounded-full border px-2 py-1 text-[10px] font-medium uppercase tracking-[0.1em] ${getServiceStateToneClass(service.state)}`}>
+																{getServiceStateLabel(service.state)}
+															</span>
+															{service.issueCount ? (
+																<span className="text-[10px] text-vscode-descriptionForeground">
+																	{service.issueCount.toLocaleString()} issues
+																</span>
+															) : null}
+														</div>
+													</button>
+													<div className="space-y-3 px-4 pb-4">
+														{formatServiceProgress(service) && (
+															<div className="space-y-2">
+																<div className="flex items-center justify-between gap-2 text-[11px] text-vscode-descriptionForeground">
+																	<span>{formatServiceProgress(service)}</span>
+																	{service.progressPercent != null &&
+																	!service.indeterminate ? (
+																		<span className={numericTextClass}>
+																			{service.progressPercent}%
+																		</span>
+																	) : (
+																		<span>
+																			{service.indeterminate ? "Active" : "n/a"}
+																		</span>
+																	)}
+																</div>
+																<ProgressPrimitive.Root
+																	className="relative h-2 overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]"
+																	value={service.progressPercent ?? undefined}>
+																	<ProgressPrimitive.Indicator
+																		className={cn(
+																			"h-full w-full flex-1 bg-[linear-gradient(90deg,rgba(80,168,255,0.9),rgba(128,203,255,0.92))] transition-transform duration-300 ease-in-out",
+																			service.indeterminate &&
+																				"animate-pulse opacity-75",
 																		)}
+																		style={{
+																			transform:
+																				service.indeterminate ||
+																				service.progressPercent == null
+																					? "translateX(-72%)"
+																					: `translateX(-${100 - service.progressPercent}%)`,
+																		}}
+																	/>
+																</ProgressPrimitive.Root>
+															</div>
+														)}
+														{service.detail && (
+															<div className="text-[11px] leading-4 text-vscode-descriptionForeground">
+																{service.detail}
+															</div>
+														)}
+														<div className="grid gap-2 sm:grid-cols-2">
+															{visibleMetrics.map((metric) => (
+																<div
+																	key={`${service.id}:${metric.key}`}
+																	className="rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] px-3 py-2.5">
+																	<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
+																		{metric.label}
 																	</div>
-																	{(warningDetailsState.total > 0 ||
-																		warningDetailsState.loading ||
-																		warningDetailsBootstrapped) && (
-																		<div className="mt-3 space-y-2">
-																			<div className="flex items-center justify-between gap-2">
-																				<div>
-																					<div className="text-[11px] font-medium text-vscode-foreground/90">
-																						Affected files
-																					</div>
-																					<div className="mt-1 text-[10px] text-vscode-descriptionForeground/85">
-																						Showing{" "}
-																						{warningDetails.length.toLocaleString()}{" "}
-																						of{" "}
-																						{warningDetailsState.total.toLocaleString()}{" "}
-																						matching files
-																					</div>
-																				</div>
+																	<div
+																		className={cn(
+																			"mt-2 text-[12px] leading-4 tracking-[-0.01em]",
+																			metric.tone === "good"
+																				? "text-emerald-200"
+																				: metric.tone === "warning"
+																					? "text-amber-200"
+																					: metric.tone === "critical"
+																						? "text-red-200"
+																						: "text-vscode-foreground/92",
+																		)}>
+																		{metric.value}
+																	</div>
+																</div>
+															))}
+														</div>
+														<button
+															type="button"
+															onClick={() =>
+																setServiceExpansionOverrides((prev) => ({
+																	...prev,
+																	[service.id]: !(
+																		prev[service.id] ??
+																		shouldExpandIndexServiceCard(service.state)
+																	),
+																}))
+															}
+															className="text-[11px] font-medium text-vscode-descriptionForeground transition-colors hover:text-vscode-foreground">
+															{expanded ? "Hide details" : "Show details"}
+														</button>
+													</div>
+												</div>
+											)
+										}) ?? (
+											<div
+												className={`${surfaceCardClass} px-4 py-5 text-[12px] leading-5 text-vscode-descriptionForeground`}>
+												Indexing services will appear here when a run starts.
+											</div>
+										)}
+									</div>
+								</div>
+
+								<div className="space-y-2">
+									<div className={sectionLabelClass}>Exceptions &amp; Review</div>
+									<div className="space-y-3">
+										{(resilienceHighlights.resumedPendingJobs > 0 ||
+											resilienceHighlights.warningItems.length > 0) && (
+											<div className={`${surfaceCardClass} p-3`}>
+												<div className="flex items-start justify-between gap-3">
+													<div>
+														<div className="flex items-center gap-2 text-[12px] font-medium text-vscode-foreground">
+															<AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
+															<span>Indexing warnings</span>
+														</div>
+														<div className="mt-1 text-[11px] leading-4 text-vscode-descriptionForeground">
+															Keep retries and degraded files separate from the live
+															service panels.
+														</div>
+													</div>
+													{resilienceHighlights.resumedPendingJobs > 0 && (
+														<span className="rounded-full border border-sky-500/25 bg-[rgba(80,168,255,0.1)] px-2.5 py-1 text-[10px] uppercase tracking-[0.1em] text-sky-200">
+															Resuming{" "}
+															{resilienceHighlights.resumedPendingJobs.toLocaleString()}
+														</span>
+													)}
+												</div>
+												{resilienceHighlights.warningItems.length > 0 && (
+													<div className="mt-3 flex flex-wrap gap-1.5">
+														{resilienceHighlights.warningItems.map((item) => (
+															<span
+																key={item}
+																className="rounded-full border border-amber-500/20 bg-[rgba(255,255,255,0.05)] px-2.5 py-1 text-[11px] leading-none text-vscode-descriptionForeground/96">
+																{item}
+															</span>
+														))}
+													</div>
+												)}
+												{(warningDetailsState.total > 0 ||
+													warningDetailsState.loading ||
+													warningDetailsBootstrapped) && (
+													<div className="mt-3 space-y-2">
+														<div className="flex items-center justify-between gap-2">
+															<div>
+																<div className="text-[11px] font-medium text-vscode-foreground/90">
+																	Affected files
+																</div>
+																<div className="mt-1 text-[10px] text-vscode-descriptionForeground/85">
+																	Showing {warningDetails.length.toLocaleString()} of{" "}
+																	{warningDetailsState.total.toLocaleString()}{" "}
+																	matching files
+																</div>
+															</div>
+															<button
+																type="button"
+																onClick={() => {
+																	setRetryWarningsPending(true)
+																	resetWarningDetailsState(warningFilter, warningSort)
+																	vscode.postMessage({
+																		type: "retryIndexingWarnings",
+																		values: {
+																			filter: warningFilter,
+																		},
+																	})
+																}}
+																disabled={
+																	retryWarningsPending ||
+																	indexingStatus.systemStatus === "Indexing"
+																}
+																className="rounded-lg border border-amber-500/30 bg-[rgba(245,158,11,0.12)] px-3 py-1.5 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(245,158,11,0.18)] disabled:cursor-default disabled:opacity-60">
+																{retryWarningsPending
+																	? "Retrying affected files..."
+																	: warningFilter === "all"
+																		? "Retry affected files only"
+																		: "Retry filtered files only"}
+															</button>
+														</div>
+														<div className="space-y-2">
+															<div className="flex flex-wrap gap-1">
+																{warningFilterOptions.map((option) => (
+																	<button
+																		key={option.value}
+																		type="button"
+																		onClick={() => {
+																			setWarningFilter(option.value)
+																			resetWarningDetailsState(
+																				option.value,
+																				warningSort,
+																			)
+																		}}
+																		className={cn(
+																			"rounded-full border px-2 py-1 text-[10px] leading-none transition-colors",
+																			warningFilter === option.value
+																				? "border-amber-400/40 bg-[rgba(245,158,11,0.18)] text-vscode-foreground"
+																				: "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground/95 hover:bg-[rgba(255,255,255,0.08)]",
+																		)}>
+																		{option.label}
+																	</button>
+																))}
+															</div>
+															<div className="flex flex-wrap gap-1">
+																{warningSortOptions.map((option) => (
+																	<button
+																		key={option.value}
+																		type="button"
+																		onClick={() => {
+																			setWarningSort(option.value)
+																			resetWarningDetailsState(
+																				warningFilter,
+																				option.value,
+																			)
+																		}}
+																		className={cn(
+																			"rounded-full border px-2 py-1 text-[10px] leading-none transition-colors",
+																			warningSort === option.value
+																				? "border-sky-400/35 bg-[rgba(80,168,255,0.16)] text-vscode-foreground"
+																				: "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground/95 hover:bg-[rgba(255,255,255,0.08)]",
+																		)}>
+																		Sort: {option.label}
+																	</button>
+																))}
+															</div>
+														</div>
+														<div className="space-y-2">
+															{warningDetails.length > 0 ? (
+																warningDetails.map((detail) => (
+																	<div
+																		key={`${detail.state}:${detail.relativePath}`}
+																		className="rounded-lg border border-vscode-dropdown-border/60 bg-[rgba(0,0,0,0.08)] px-2.5 py-2 text-[11px] leading-4">
+																		<div className="flex flex-wrap items-center gap-2">
+																			<span className="font-medium text-vscode-foreground/95">
+																				{detail.relativePath}
+																			</span>
+																			<span className="rounded-full border border-amber-500/20 bg-[rgba(255,255,255,0.05)] px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-vscode-descriptionForeground/95">
+																				{detail.category === "parser_failed"
+																					? "parser"
+																					: detail.state === "terminal_failed"
+																						? "failed"
+																						: detail.state}
+																			</span>
+																			<div className="ml-auto flex flex-wrap gap-1">
+																				<button
+																					type="button"
+																					onClick={() =>
+																						vscode.postMessage({
+																							type: "openFile",
+																							text: detail.relativePath,
+																						})
+																					}
+																					className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-2 py-0.5 text-[10px] text-vscode-descriptionForeground/95 transition-colors hover:bg-[rgba(255,255,255,0.08)]">
+																					Open
+																				</button>
+																				<button
+																					type="button"
+																					onClick={() =>
+																						void copyWithFeedback(
+																							detail.relativePath,
+																						)
+																					}
+																					className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-2 py-0.5 text-[10px] text-vscode-descriptionForeground/95 transition-colors hover:bg-[rgba(255,255,255,0.08)]">
+																					{showCopyFeedback
+																						? "Copied"
+																						: "Copy path"}
+																				</button>
 																				<button
 																					type="button"
 																					onClick={() => {
-																						setRetryWarningsPending(true)
-																						resetWarningDetailsState(
-																							warningFilter,
-																							warningSort,
+																						setRetryingWarningPath(
+																							detail.relativePath,
 																						)
 																						vscode.postMessage({
 																							type: "retryIndexingWarnings",
 																							values: {
 																								filter: warningFilter,
+																								relativePaths: [
+																									detail.relativePath,
+																								],
 																							},
 																						})
 																					}}
 																					disabled={
 																						retryWarningsPending ||
 																						indexingStatus.systemStatus ===
-																							"Indexing"
+																							"Indexing" ||
+																						retryingWarningPath ===
+																							detail.relativePath
 																					}
-																					className="rounded-lg border border-amber-500/30 bg-[rgba(245,158,11,0.12)] px-3 py-1.5 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(245,158,11,0.18)] disabled:cursor-default disabled:opacity-60">
-																					{retryWarningsPending
-																						? "Retrying affected files..."
-																						: warningFilter === "all"
-																							? "Retry affected files only"
-																							: "Retry filtered files only"}
+																					className="rounded-full border border-amber-500/30 bg-[rgba(245,158,11,0.12)] px-2 py-0.5 text-[10px] text-vscode-foreground transition-colors hover:bg-[rgba(245,158,11,0.18)] disabled:cursor-default disabled:opacity-60">
+																					{retryingWarningPath ===
+																					detail.relativePath
+																						? "Retrying..."
+																						: "Retry file"}
 																				</button>
 																			</div>
-																			<div className="space-y-2">
-																				<div className="flex flex-wrap gap-1">
-																					{warningFilterOptions.map(
-																						(option) => (
-																							<button
-																								key={option.value}
-																								type="button"
-																								onClick={() => {
-																									setWarningFilter(
-																										option.value,
-																									)
-																									resetWarningDetailsState(
-																										option.value,
-																										warningSort,
-																									)
-																								}}
-																								className={cn(
-																									"rounded-full border px-2 py-1 text-[10px] leading-none transition-colors",
-																									warningFilter ===
-																										option.value
-																										? "border-amber-400/40 bg-[rgba(245,158,11,0.18)] text-vscode-foreground"
-																										: "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground/95 hover:bg-[rgba(255,255,255,0.08)]",
-																								)}>
-																								{option.label}
-																							</button>
-																						),
-																					)}
-																				</div>
-																				<div className="flex flex-wrap gap-1">
-																					{warningSortOptions.map(
-																						(option) => (
-																							<button
-																								key={option.value}
-																								type="button"
-																								onClick={() => {
-																									setWarningSort(
-																										option.value,
-																									)
-																									resetWarningDetailsState(
-																										warningFilter,
-																										option.value,
-																									)
-																								}}
-																								className={cn(
-																									"rounded-full border px-2 py-1 text-[10px] leading-none transition-colors",
-																									warningSort ===
-																										option.value
-																										? "border-sky-400/35 bg-[rgba(80,168,255,0.16)] text-vscode-foreground"
-																										: "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground/95 hover:bg-[rgba(255,255,255,0.08)]",
-																								)}>
-																								Sort: {option.label}
-																							</button>
-																						),
-																					)}
-																				</div>
-																			</div>
-																			<div className="space-y-2">
-																				{warningDetails.length > 0 ? (
-																					warningDetails.map((detail) => (
-																						<div
-																							key={`${detail.state}:${detail.relativePath}`}
-																							className="rounded-lg border border-vscode-dropdown-border/60 bg-[rgba(0,0,0,0.08)] px-2.5 py-2 text-[11px] leading-4">
-																							<div className="flex flex-wrap items-center gap-2">
-																								<span className="font-medium text-vscode-foreground/95">
-																									{
-																										detail.relativePath
-																									}
-																								</span>
-																								<span className="rounded-full border border-amber-500/20 bg-[rgba(255,255,255,0.05)] px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-vscode-descriptionForeground/95">
-																									{detail.category ===
-																									"parser_failed"
-																										? "parser"
-																										: detail.state ===
-																											  "terminal_failed"
-																											? "failed"
-																											: detail.state}
-																								</span>
-																								<div className="ml-auto flex flex-wrap gap-1">
-																									<button
-																										type="button"
-																										onClick={() =>
-																											vscode.postMessage(
-																												{
-																													type: "openFile",
-																													text: detail.relativePath,
-																												},
-																											)
-																										}
-																										className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-2 py-0.5 text-[10px] text-vscode-descriptionForeground/95 transition-colors hover:bg-[rgba(255,255,255,0.08)]">
-																										Open
-																									</button>
-																									<button
-																										type="button"
-																										onClick={() =>
-																											void copyWithFeedback(
-																												detail.relativePath,
-																											)
-																										}
-																										className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-2 py-0.5 text-[10px] text-vscode-descriptionForeground/95 transition-colors hover:bg-[rgba(255,255,255,0.08)]">
-																										{showCopyFeedback
-																											? "Copied"
-																											: "Copy path"}
-																									</button>
-																									<button
-																										type="button"
-																										onClick={() => {
-																											setRetryingWarningPath(
-																												detail.relativePath,
-																											)
-																											vscode.postMessage(
-																												{
-																													type: "retryIndexingWarnings",
-																													values: {
-																														filter: warningFilter,
-																														relativePaths:
-																															[
-																																detail.relativePath,
-																															],
-																													},
-																												},
-																											)
-																										}}
-																										disabled={
-																											retryWarningsPending ||
-																											indexingStatus.systemStatus ===
-																												"Indexing" ||
-																											retryingWarningPath ===
-																												detail.relativePath
-																										}
-																										className="rounded-full border border-amber-500/30 bg-[rgba(245,158,11,0.12)] px-2 py-0.5 text-[10px] text-vscode-foreground transition-colors hover:bg-[rgba(245,158,11,0.18)] disabled:cursor-default disabled:opacity-60">
-																										{retryingWarningPath ===
-																										detail.relativePath
-																											? "Retrying..."
-																											: "Retry file"}
-																									</button>
-																								</div>
-																							</div>
-																							{detail.failureReason && (
-																								<div className="mt-1 text-vscode-descriptionForeground/90">
-																									{
-																										detail.failureReason
-																									}
-																								</div>
-																							)}
-																						</div>
-																					))
-																				) : (
-																					<div className="rounded-lg border border-vscode-dropdown-border/60 bg-[rgba(0,0,0,0.08)] px-2.5 py-2 text-[11px] leading-4 text-vscode-descriptionForeground/90">
-																						{warningDetailsState.loading
-																							? "Loading affected files..."
-																							: "No files match the current warning filter."}
-																					</div>
-																				)}
-																			</div>
-																			{warningDetailsState.hasMore && (
-																				<button
-																					type="button"
-																					onClick={() =>
-																						requestWarningDetails(
-																							warningDetails.length,
-																							20,
-																							warningFilter,
-																							warningSort,
-																						)
-																					}
-																					disabled={
-																						warningDetailsState.loading
-																					}
-																					className="w-full rounded-lg border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-3 py-2 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(255,255,255,0.08)] disabled:cursor-default disabled:opacity-60">
-																					{warningDetailsState.loading
-																						? "Loading affected files..."
-																						: "Load more affected files"}
-																				</button>
-																			)}
 																		</div>
-																	)}
+																		{detail.failureReason && (
+																			<div className="mt-1 text-vscode-descriptionForeground/90">
+																				{detail.failureReason}
+																			</div>
+																		)}
+																	</div>
+																))
+															) : (
+																<div className="rounded-lg border border-vscode-dropdown-border/60 bg-[rgba(0,0,0,0.08)] px-2.5 py-2 text-[11px] leading-4 text-vscode-descriptionForeground/90">
+																	{warningDetailsState.loading
+																		? "Loading affected files..."
+																		: "No files match the current warning filter."}
 																</div>
 															)}
 														</div>
-													)}
-												</div>
-											)}
-										</div>
-									</div>
-
-									{/* Index stats when indexed */}
-									{indexingStatus.systemStatus === "Indexed" &&
-										Boolean(indexingStatus.totalFiles || indexingStatus.totalBlocks) && (
-											<div className="mt-3 text-xs text-vscode-descriptionForeground">
-												{indexingStatus.totalFiles != null &&
-													t("settings:codeIndex.indexedFilesCount", {
-														count: indexingStatus.totalFiles,
-													})}
-												{indexingStatus.totalFiles != null &&
-													indexingStatus.totalBlocks != null &&
-													" · "}
-												{indexingStatus.totalBlocks != null &&
-													t("settings:codeIndex.indexedBlocksCount", {
-														count: indexingStatus.totalBlocks,
-													})}
+														{warningDetailsState.hasMore && (
+															<button
+																type="button"
+																onClick={() =>
+																	requestWarningDetails(
+																		warningDetails.length,
+																		20,
+																		warningFilter,
+																		warningSort,
+																	)
+																}
+																disabled={warningDetailsState.loading}
+																className="w-full rounded-lg border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-3 py-2 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(255,255,255,0.08)] disabled:cursor-default disabled:opacity-60">
+																{warningDetailsState.loading
+																	? "Loading affected files..."
+																	: "Load more affected files"}
+															</button>
+														)}
+													</div>
+												)}
 											</div>
 										)}
 
-									{indexingStatus.systemStatus === "Indexing" && (
-										<div className="mt-4 space-y-3">
-											<div className="grid gap-2 text-[11px] text-vscode-descriptionForeground/85 sm:grid-cols-[minmax(128px,auto)_minmax(168px,1fr)_minmax(140px,auto)]">
-												{indexingStatus.phase && (
-													<span
-														className={cn(
-															stableChipClass,
-															"justify-center text-center sm:justify-start sm:text-left",
-														)}>
-														{indexingStatus.phase === "scanning"
-															? "Workspace pass"
-															: "Embedding pass"}
-													</span>
-												)}
-												{progressCaption && (
-													<span
-														className={cn(
-															stableChipClass,
-															indexingStatus.phase === "embedding"
-																? cn(
-																		"justify-between gap-3 sm:min-w-[168px]",
-																		"tabular-nums [font-variant-numeric:tabular-nums]",
-																	)
-																: "min-w-0 justify-start whitespace-normal break-words text-left leading-4",
-														)}>
-														{progressCaption}
-													</span>
-												)}
-												{indexingStatus.estimatedTimeRemainingMs != null && (
-													<span
-														className={cn(
-															stableChipClass,
-															"justify-center sm:justify-end",
-															numericTextClass,
-														)}>
-														{formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}
-													</span>
-												)}
-											</div>
-											<div className="flex items-center gap-2">
-												<ProgressPrimitive.Root
-													className="relative h-2.5 w-full min-w-[80px] overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]"
-													value={progressPercentage}>
-													<ProgressPrimitive.Indicator
-														className={cn(
-															"h-full w-full flex-1 bg-[linear-gradient(90deg,rgba(80,168,255,0.9),rgba(128,203,255,0.92))] transition-transform duration-300 ease-in-out",
-															isIndeterminateEmbeddingProgress &&
-																"animate-pulse opacity-75",
+										{(displayedOversizedCount > 0 ||
+											oversizedDetailsState.total > 0 ||
+											oversizedDetailsState.loading) && (
+											<div className={`${surfaceCardClass} p-3`}>
+												<div className="flex items-start justify-between gap-3">
+													<div>
+														<div className="text-[12px] font-medium text-vscode-foreground">
+															Skipped oversized files
+														</div>
+														<div className="mt-1 text-[11px] leading-4 text-vscode-descriptionForeground">
+															{displayedOversizedCount.toLocaleString()} actionable files
+															are waiting for review.
+														</div>
+														{oversizedDetailsState.total > 0 && (
+															<div className="mt-1 text-[10px] leading-4 text-vscode-descriptionForeground/85">
+																{oversizedDetailsState.total.toLocaleString()} tracked
+																file{oversizedDetailsState.total === 1 ? "" : "s"} in
+																the persistent review list
+															</div>
 														)}
-														style={{
-															transform: isIndeterminateEmbeddingProgress
-																? "translateX(-72%)"
-																: transformStyleString,
-														}}
-													/>
-												</ProgressPrimitive.Root>
-												<span
-													className={cn(
-														"min-w-[3.75rem] text-xs font-medium text-vscode-descriptionForeground",
-														numericTextClass,
-													)}>
-													{isIndeterminateEmbeddingProgress
-														? "..."
-														: `${progressPercentage}%`}
-												</span>
-											</div>
-										</div>
-									)}
-								</div>
-							</div>
+													</div>
+													<div className="flex shrink-0 flex-col items-end gap-2">
+														<div className="rounded-full border border-vscode-dropdown-border/70 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-vscode-descriptionForeground">
+															Limit {currentSettings.codebaseIndexMaxFileSizeMb ?? 1} MB
+														</div>
+														<Button
+															type="button"
+															variant="outline"
+															size="sm"
+															onClick={() => {
+																setIsOversizedReviewOpen((prev) => !prev)
+																if (!oversizedDetailsBootstrapped) {
+																	requestOversizedDetails(0, 20)
+																}
+															}}>
+															{isOversizedReviewOpen
+																? "Hide review list"
+																: "Review skipped files"}
+														</Button>
+													</div>
+												</div>
 
-							{(displayedOversizedCount > 0 ||
-								oversizedDetailsState.total > 0 ||
-								oversizedDetailsState.loading) && (
-								<div className={`${surfaceCardClass} mt-5 p-3`}>
-									<div className="flex items-start justify-between gap-3">
-										<div>
-											<div className={sectionLabelClass}>Skipped Oversized Files</div>
-											<div className="mt-1 text-[15px] font-semibold tracking-[-0.01em]">
-												{displayedOversizedCount.toLocaleString()} actionable
+												{isOversizedReviewOpen && (
+													<div className="mt-3 space-y-2">
+														{oversizedDetails.length > 0 ? (
+															oversizedDetails.map((detail) => {
+																const approval = oversizedApprovalMap.get(
+																	detail.relativePath,
+																)
+																const modifiedLabel = formatModifiedTime(
+																	detail.lastModifiedMtimeMs,
+																)
+																const recommendationTone =
+																	detail.recommendation === "likely_useful"
+																		? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+																		: detail.recommendation === "probably_skip"
+																			? "border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground"
+																			: "border-amber-500/30 bg-amber-500/10 text-amber-200"
+
+																return (
+																	<div
+																		key={detail.relativePath}
+																		className="rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] p-3">
+																		<div className="flex flex-wrap items-start justify-between gap-3">
+																			<div className="min-w-0 flex-1">
+																				<div
+																					title={detail.relativePath}
+																					className="break-all text-[12px] font-medium leading-4 text-vscode-foreground">
+																					{detail.relativePath}
+																				</div>
+																				<div className="mt-1 flex flex-wrap gap-2 text-[10px] uppercase tracking-[0.08em] text-vscode-descriptionForeground">
+																					<span>
+																						{formatBytes(detail.sizeBytes)}
+																					</span>
+																					<span>
+																						{detail.status.replace(
+																							/_/g,
+																							" ",
+																						)}
+																					</span>
+																					{modifiedLabel && (
+																						<span className="normal-case tracking-normal">
+																							{modifiedLabel}
+																						</span>
+																					)}
+																					{detail.status ===
+																						"needs_reapproval" && (
+																						<span className="text-amber-300">
+																							Needs reapproval
+																						</span>
+																					)}
+																				</div>
+																				<p className="mt-2 mb-0 text-[11px] leading-4 text-vscode-descriptionForeground">
+																					{detail.reason}
+																				</p>
+																			</div>
+																			<div className="flex shrink-0 flex-col items-end gap-2">
+																				<div
+																					className={`rounded-full border px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.08em] ${recommendationTone}`}>
+																					{detail.recommendation ===
+																					"likely_useful"
+																						? "Likely useful"
+																						: detail.recommendation ===
+																							  "probably_skip"
+																							? "Probably skip"
+																							: "Review manually"}
+																				</div>
+																				{approval ? (
+																					<div className="text-right text-[10px] leading-4 text-vscode-descriptionForeground">
+																						Approved up to{" "}
+																						{formatBytes(
+																							approval.approvedMaxBytes,
+																						)}
+																					</div>
+																				) : detail.status === "skipped" ||
+																				  detail.status ===
+																						"needs_reapproval" ? (
+																					<Button
+																						type="button"
+																						variant="outline"
+																						size="sm"
+																						onClick={() =>
+																							approveOversizedFile(
+																								detail.relativePath,
+																								detail.sizeBytes,
+																							)
+																						}>
+																						Approve For Indexing
+																					</Button>
+																				) : (
+																					<div className="text-right text-[10px] leading-4 text-vscode-descriptionForeground">
+																						{detail.status === "eligible"
+																							? "Now within limit"
+																							: detail.status ===
+																								  "missing"
+																								? "File missing"
+																								: "Tracked approval"}
+																					</div>
+																				)}
+																			</div>
+																		</div>
+																	</div>
+																)
+															})
+														) : (
+															<div className="rounded-xl border border-dashed border-vscode-dropdown-border/60 px-3 py-3 text-[11px] leading-4 text-vscode-descriptionForeground">
+																{oversizedDetailsState.loading
+																	? "Loading tracked oversized files..."
+																	: "No tracked oversized files are available yet."}
+															</div>
+														)}
+														{oversizedDetailsState.hasMore && (
+															<button
+																type="button"
+																onClick={() =>
+																	requestOversizedDetails(oversizedDetails.length, 20)
+																}
+																disabled={oversizedDetailsState.loading}
+																className="w-full rounded-lg border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-3 py-2 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(255,255,255,0.08)] disabled:cursor-default disabled:opacity-60">
+																{oversizedDetailsState.loading
+																	? "Loading tracked files..."
+																	: "Load more tracked files"}
+															</button>
+														)}
+													</div>
+												)}
 											</div>
-											<div className="mt-1 text-[11px] leading-4 text-vscode-descriptionForeground">
-												Review tracked oversized files, approve the important ones, and revisit
-												them later without losing the list.
-											</div>
-											{oversizedDetailsState.total > 0 && (
-												<div className="mt-1 text-[10px] leading-4 text-vscode-descriptionForeground/85">
-													{oversizedDetailsState.total.toLocaleString()} tracked file
-													{oversizedDetailsState.total === 1 ? "" : "s"} in the persistent
-													review list
+										)}
+
+										{resilienceHighlights.warningItems.length === 0 &&
+											resilienceHighlights.resumedPendingJobs === 0 &&
+											displayedOversizedCount === 0 &&
+											oversizedDetailsState.total === 0 &&
+											!oversizedDetailsState.loading && (
+												<div
+													className={`${surfaceCardClass} px-4 py-5 text-[12px] leading-5 text-vscode-descriptionForeground`}>
+													No warnings or manual review items in the current snapshot.
 												</div>
 											)}
-										</div>
-										<div className="flex shrink-0 flex-col items-end gap-2">
-											<div className="rounded-full border border-vscode-dropdown-border/70 px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] text-vscode-descriptionForeground">
-												Limit {currentSettings.codebaseIndexMaxFileSizeMb ?? 1} MB
-											</div>
-											<Button
-												type="button"
-												variant="outline"
-												size="sm"
-												onClick={() => {
-													setIsOversizedReviewOpen((prev) => !prev)
-													if (!oversizedDetailsBootstrapped) {
-														requestOversizedDetails(0, 20)
-													}
-												}}>
-												{isOversizedReviewOpen ? "Hide Review List" : "Review Skipped Files"}
-											</Button>
+									</div>
+								</div>
+
+								{showDebugSection && (
+									<div className="space-y-2">
+										<div className={sectionLabelClass}>Debug</div>
+										<div
+											className={`${surfaceCardClass} rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] px-3 py-2 text-xs leading-5 text-vscode-descriptionForeground`}>
+											<div className="font-medium text-vscode-foreground">Roo Build</div>
+											<div>version: {rooVersion}</div>
+											<div>build: {rooBuildTimestamp}</div>
+											<div>context: {renderContext}</div>
+											<div>view: code index tuning</div>
+											{rooDebugInfo.webviewId ? (
+												<div>webview: {rooDebugInfo.webviewId}</div>
+											) : null}
+											{rooDebugInfo.origin ? <div>origin: {rooDebugInfo.origin}</div> : null}
+											{pipelineSnapshot ? (
+												<div>run mode: {getIndexingRunModeLabel(pipelineSnapshot)}</div>
+											) : null}
+											{debug ? <div>debug mode: enabled</div> : null}
 										</div>
 									</div>
+								)}
+							</div>
+						)}
 
-									{isOversizedReviewOpen && (
-										<div className="mt-3 space-y-2">
-											{oversizedDetails.length > 0 ? (
-												oversizedDetails.map((detail) => {
-													const approval = oversizedApprovalMap.get(detail.relativePath)
-													const modifiedLabel = formatModifiedTime(detail.lastModifiedMtimeMs)
-													const recommendationTone =
-														detail.recommendation === "likely_useful"
-															? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
-															: detail.recommendation === "probably_skip"
-																? "border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.04)] text-vscode-descriptionForeground"
-																: "border-amber-500/30 bg-amber-500/10 text-amber-200"
-
-													return (
-														<div
-															key={detail.relativePath}
-															className="rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] p-3">
-															<div className="flex flex-wrap items-start justify-between gap-3">
-																<div className="min-w-0 flex-1">
-																	<div
-																		title={detail.relativePath}
-																		className="break-all text-[12px] font-medium leading-4 text-vscode-foreground">
-																		{detail.relativePath}
-																	</div>
-																	<div className="mt-1 flex flex-wrap gap-2 text-[10px] uppercase tracking-[0.08em] text-vscode-descriptionForeground">
-																		<span>{formatBytes(detail.sizeBytes)}</span>
-																		<span>{detail.status.replace(/_/g, " ")}</span>
-																		{modifiedLabel && (
-																			<span className="normal-case tracking-normal">
-																				{modifiedLabel}
-																			</span>
-																		)}
-																		{detail.status === "needs_reapproval" && (
-																			<span className="text-amber-300">
-																				Needs reapproval
-																			</span>
-																		)}
-																	</div>
-																	<p className="mt-2 mb-0 text-[11px] leading-4 text-vscode-descriptionForeground">
-																		{detail.reason}
-																	</p>
-																</div>
-																<div className="flex shrink-0 flex-col items-end gap-2">
-																	<div
-																		className={`rounded-full border px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.08em] ${recommendationTone}`}>
-																		{detail.recommendation === "likely_useful"
-																			? "Likely useful"
-																			: detail.recommendation === "probably_skip"
-																				? "Probably skip"
-																				: "Review manually"}
-																	</div>
-																	{approval ? (
-																		<div className="text-right text-[10px] leading-4 text-vscode-descriptionForeground">
-																			Approved up to{" "}
-																			{formatBytes(approval.approvedMaxBytes)}
-																		</div>
-																	) : detail.status === "skipped" ||
-																	  detail.status === "needs_reapproval" ? (
-																		<Button
-																			type="button"
-																			variant="outline"
-																			size="sm"
-																			onClick={() =>
-																				approveOversizedFile(
-																					detail.relativePath,
-																					detail.sizeBytes,
-																				)
-																			}>
-																			Approve For Indexing
-																		</Button>
-																	) : (
-																		<div className="text-right text-[10px] leading-4 text-vscode-descriptionForeground">
-																			{detail.status === "eligible"
-																				? "Now within limit"
-																				: detail.status === "missing"
-																					? "File missing"
-																					: "Tracked approval"}
-																		</div>
-																	)}
-																</div>
-															</div>
-														</div>
-													)
-												})
-											) : (
-												<div className="rounded-xl border border-dashed border-vscode-dropdown-border/60 px-3 py-3 text-[11px] leading-4 text-vscode-descriptionForeground">
-													{oversizedDetailsState.loading
-														? "Loading tracked oversized files..."
-														: "No tracked oversized files are available yet."}
-												</div>
-											)}
-											{oversizedDetailsState.hasMore && (
-												<button
-													type="button"
-													onClick={() => requestOversizedDetails(oversizedDetails.length, 20)}
-													disabled={oversizedDetailsState.loading}
-													className="w-full rounded-lg border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.04)] px-3 py-2 text-[11px] font-medium text-vscode-foreground transition-colors hover:bg-[rgba(255,255,255,0.08)] disabled:cursor-default disabled:opacity-60">
-													{oversizedDetailsState.loading
-														? "Loading tracked files..."
-														: "Load more tracked files"}
-												</button>
-											)}
-										</div>
-									)}
-								</div>
-							)}
-
+						<div className={cn("space-y-2", activeTab !== "settings" && "hidden")}>
 							{/* Enable/Disable Toggle */}
 							<div className={`${surfaceCardClass} mt-5 p-3`}>
 								<div className="flex items-start justify-between gap-2.5">
@@ -2181,1249 +2519,1250 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 									</div>
 								</div>
 							)}
-						</div>
 
-						{/* Setup Settings Disclosure */}
-						<div ref={setupSectionRef} className="mt-5 scroll-mt-4">
-							<button
-								onClick={() => setIsSetupSettingsOpen(!isSetupSettingsOpen)}
-								className={disclosureButtonClass}
-								aria-expanded={isSetupSettingsOpen}>
-								<div>
-									<div className={sectionLabelClass}>Configuration</div>
-									<div className="mt-1 text-[15px] font-semibold tracking-[-0.01em]">Setup</div>
-								</div>
-								<span
-									className={`codicon codicon-${isSetupSettingsOpen ? "chevron-down" : "chevron-right"} text-vscode-descriptionForeground`}></span>
-							</button>
+							{/* Setup Settings Disclosure */}
+							<div ref={setupSectionRef} className="mt-5 scroll-mt-4">
+								<button
+									onClick={() => setIsSetupSettingsOpen(!isSetupSettingsOpen)}
+									className={disclosureButtonClass}
+									aria-expanded={isSetupSettingsOpen}>
+									<div>
+										<div className={sectionLabelClass}>Configuration</div>
+										<div className="mt-1 text-[15px] font-semibold tracking-[-0.01em]">Setup</div>
+									</div>
+									<span
+										className={`codicon codicon-${isSetupSettingsOpen ? "chevron-down" : "chevron-right"} text-vscode-descriptionForeground`}></span>
+								</button>
 
-							{isSetupSettingsOpen && (
-								<div className={disclosurePanelClass}>
-									<div className={groupedListClass}>
-										{/* Embedder Provider Section */}
-										<div className={fieldGroupClass}>
-											<label className="text-sm font-medium">
-												{t("settings:codeIndex.embedderProviderLabel")}
-											</label>
-											<Select
-												value={currentSettings.codebaseIndexEmbedderProvider}
-												onValueChange={(value: EmbedderProvider) => {
-													updateSetting("codebaseIndexEmbedderProvider", value)
-													// Clear model selection when switching providers
-													updateSetting("codebaseIndexEmbedderModelId", "")
+								{isSetupSettingsOpen && (
+									<div className={disclosurePanelClass}>
+										<div className={groupedListClass}>
+											{/* Embedder Provider Section */}
+											<div className={fieldGroupClass}>
+												<label className="text-sm font-medium">
+													{t("settings:codeIndex.embedderProviderLabel")}
+												</label>
+												<Select
+													value={currentSettings.codebaseIndexEmbedderProvider}
+													onValueChange={(value: EmbedderProvider) => {
+														updateSetting("codebaseIndexEmbedderProvider", value)
+														// Clear model selection when switching providers
+														updateSetting("codebaseIndexEmbedderModelId", "")
 
-													// Auto-populate Region and Profile when switching to Bedrock
-													// if the main API provider is also configured for Bedrock
-													if (
-														value === "bedrock" &&
-														apiConfiguration?.apiProvider === "bedrock"
-													) {
-														// Only populate if currently empty
+														// Auto-populate Region and Profile when switching to Bedrock
+														// if the main API provider is also configured for Bedrock
 														if (
-															!currentSettings.codebaseIndexBedrockRegion &&
-															apiConfiguration.awsRegion
+															value === "bedrock" &&
+															apiConfiguration?.apiProvider === "bedrock"
 														) {
-															updateSetting(
-																"codebaseIndexBedrockRegion",
-																apiConfiguration.awsRegion,
-															)
-														}
-														if (
-															!currentSettings.codebaseIndexBedrockProfile &&
-															apiConfiguration.awsProfile
-														) {
-															updateSetting(
-																"codebaseIndexBedrockProfile",
-																apiConfiguration.awsProfile,
-															)
-														}
-													}
-												}}>
-												<SelectTrigger className="w-full">
-													<SelectValue />
-												</SelectTrigger>
-												<SelectContent>
-													<SelectItem value="openai">
-														{t("settings:codeIndex.openaiProvider")}
-													</SelectItem>
-													<SelectItem value="ollama">
-														{t("settings:codeIndex.ollamaProvider")}
-													</SelectItem>
-													<SelectItem value="openai-compatible">
-														{t("settings:codeIndex.openaiCompatibleProvider")}
-													</SelectItem>
-													<SelectItem value="gemini">
-														{t("settings:codeIndex.geminiProvider")}
-													</SelectItem>
-													<SelectItem value="mistral">
-														{t("settings:codeIndex.mistralProvider")}
-													</SelectItem>
-													<SelectItem value="vercel-ai-gateway">
-														{t("settings:codeIndex.vercelAiGatewayProvider")}
-													</SelectItem>
-													<SelectItem value="bedrock">
-														{t("settings:codeIndex.bedrockProvider")}
-													</SelectItem>
-													<SelectItem value="openrouter">
-														{t("settings:codeIndex.openRouterProvider")}
-													</SelectItem>
-												</SelectContent>
-											</Select>
-										</div>
-
-										{/* Provider-specific settings */}
-										{currentSettings.codebaseIndexEmbedderProvider === "openai" && (
-											<>
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.openAiKeyLabel")}
-													</label>
-													<VSCodeTextField
-														type="password"
-														value={currentSettings.codeIndexOpenAiKey || ""}
-														onInput={(e: any) =>
-															updateSetting("codeIndexOpenAiKey", e.target.value)
-														}
-														placeholder={t("settings:codeIndex.openAiKeyPlaceholder")}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codeIndexOpenAiKey,
-														})}
-													/>
-													{formErrors.codeIndexOpenAiKey && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codeIndexOpenAiKey}
-														</p>
-													)}
-												</div>
-
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelLabel")}
-													</label>
-													<VSCodeDropdown
-														value={currentSettings.codebaseIndexEmbedderModelId}
-														onChange={(e: any) =>
-															updateSetting(
-																"codebaseIndexEmbedderModelId",
-																e.target.value,
-															)
-														}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexEmbedderModelId,
-														})}>
-														<VSCodeOption value="" className="p-2">
-															{t("settings:codeIndex.selectModel")}
-														</VSCodeOption>
-														{getAvailableModels().map((modelId) => {
-															const model =
-																codebaseIndexModels?.[
-																	currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
-																]?.[modelId]
-															return (
-																<VSCodeOption
-																	key={modelId}
-																	value={modelId}
-																	className="p-2">
-																	{modelId}{" "}
-																	{model
-																		? t("settings:codeIndex.modelDimensions", {
-																				dimension: model.dimension,
-																			})
-																		: ""}
-																</VSCodeOption>
-															)
-														})}
-													</VSCodeDropdown>
-													{formErrors.codebaseIndexEmbedderModelId && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelId}
-														</p>
-													)}
-												</div>
-											</>
-										)}
-
-										{currentSettings.codebaseIndexEmbedderProvider === "ollama" && (
-											<>
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.ollamaBaseUrlLabel")}
-													</label>
-													<VSCodeTextField
-														value={currentSettings.codebaseIndexEmbedderBaseUrl || ""}
-														onInput={(e: any) =>
-															updateSetting(
-																"codebaseIndexEmbedderBaseUrl",
-																e.target.value,
-															)
-														}
-														onBlur={(e: any) => {
-															// Set default Ollama URL if field is empty
-															if (!e.target.value.trim()) {
-																e.target.value = DEFAULT_OLLAMA_URL
+															// Only populate if currently empty
+															if (
+																!currentSettings.codebaseIndexBedrockRegion &&
+																apiConfiguration.awsRegion
+															) {
 																updateSetting(
-																	"codebaseIndexEmbedderBaseUrl",
-																	DEFAULT_OLLAMA_URL,
+																	"codebaseIndexBedrockRegion",
+																	apiConfiguration.awsRegion,
 																)
 															}
-														}}
-														placeholder={t("settings:codeIndex.ollamaUrlPlaceholder")}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexEmbedderBaseUrl,
-														})}
-													/>
-													{formErrors.codebaseIndexEmbedderBaseUrl && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderBaseUrl}
-														</p>
-													)}
-												</div>
+															if (
+																!currentSettings.codebaseIndexBedrockProfile &&
+																apiConfiguration.awsProfile
+															) {
+																updateSetting(
+																	"codebaseIndexBedrockProfile",
+																	apiConfiguration.awsProfile,
+																)
+															}
+														}
+													}}>
+													<SelectTrigger className="w-full">
+														<SelectValue />
+													</SelectTrigger>
+													<SelectContent>
+														<SelectItem value="openai">
+															{t("settings:codeIndex.openaiProvider")}
+														</SelectItem>
+														<SelectItem value="ollama">
+															{t("settings:codeIndex.ollamaProvider")}
+														</SelectItem>
+														<SelectItem value="openai-compatible">
+															{t("settings:codeIndex.openaiCompatibleProvider")}
+														</SelectItem>
+														<SelectItem value="gemini">
+															{t("settings:codeIndex.geminiProvider")}
+														</SelectItem>
+														<SelectItem value="mistral">
+															{t("settings:codeIndex.mistralProvider")}
+														</SelectItem>
+														<SelectItem value="vercel-ai-gateway">
+															{t("settings:codeIndex.vercelAiGatewayProvider")}
+														</SelectItem>
+														<SelectItem value="bedrock">
+															{t("settings:codeIndex.bedrockProvider")}
+														</SelectItem>
+														<SelectItem value="openrouter">
+															{t("settings:codeIndex.openRouterProvider")}
+														</SelectItem>
+													</SelectContent>
+												</Select>
+											</div>
 
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelLabel")}
-													</label>
-													<VSCodeTextField
-														value={currentSettings.codebaseIndexEmbedderModelId || ""}
-														onInput={(e: any) =>
-															updateSetting(
-																"codebaseIndexEmbedderModelId",
-																e.target.value,
-															)
-														}
-														placeholder={t("settings:codeIndex.modelPlaceholder")}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexEmbedderModelId,
-														})}
-													/>
-													{formErrors.codebaseIndexEmbedderModelId && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelId}
-														</p>
-													)}
-												</div>
-
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelDimensionLabel")}
-													</label>
-													<VSCodeTextField
-														value={
-															currentSettings.codebaseIndexEmbedderModelDimension?.toString() ||
-															""
-														}
-														onInput={(e: any) => {
-															const value = e.target.value
-																? parseInt(e.target.value, 10) || undefined
-																: undefined
-															updateSetting("codebaseIndexEmbedderModelDimension", value)
-														}}
-														placeholder={t("settings:codeIndex.modelDimensionPlaceholder")}
-														className={cn("w-full", {
-															"border-red-500":
-																formErrors.codebaseIndexEmbedderModelDimension,
-														})}
-													/>
-													{formErrors.codebaseIndexEmbedderModelDimension && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelDimension}
-														</p>
-													)}
-												</div>
-											</>
-										)}
-
-										{currentSettings.codebaseIndexEmbedderProvider === "openai-compatible" && (
-											<>
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.openAiCompatibleBaseUrlLabel")}
-													</label>
-													<VSCodeTextField
-														value={
-															currentSettings.codebaseIndexOpenAiCompatibleBaseUrl || ""
-														}
-														onInput={(e: any) =>
-															updateSetting(
-																"codebaseIndexOpenAiCompatibleBaseUrl",
-																e.target.value,
-															)
-														}
-														placeholder={t(
-															"settings:codeIndex.openAiCompatibleBaseUrlPlaceholder",
+											{/* Provider-specific settings */}
+											{currentSettings.codebaseIndexEmbedderProvider === "openai" && (
+												<>
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.openAiKeyLabel")}
+														</label>
+														<VSCodeTextField
+															type="password"
+															value={currentSettings.codeIndexOpenAiKey || ""}
+															onInput={(e: any) =>
+																updateSetting("codeIndexOpenAiKey", e.target.value)
+															}
+															placeholder={t("settings:codeIndex.openAiKeyPlaceholder")}
+															className={cn("w-full", {
+																"border-red-500": formErrors.codeIndexOpenAiKey,
+															})}
+														/>
+														{formErrors.codeIndexOpenAiKey && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codeIndexOpenAiKey}
+															</p>
 														)}
-														className={cn("w-full", {
-															"border-red-500":
-																formErrors.codebaseIndexOpenAiCompatibleBaseUrl,
-														})}
-													/>
-													{formErrors.codebaseIndexOpenAiCompatibleBaseUrl && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexOpenAiCompatibleBaseUrl}
-														</p>
-													)}
-												</div>
+													</div>
 
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.openAiCompatibleApiKeyLabel")}
-													</label>
-													<VSCodeTextField
-														type="password"
-														value={
-															currentSettings.codebaseIndexOpenAiCompatibleApiKey || ""
-														}
-														onInput={(e: any) =>
-															updateSetting(
-																"codebaseIndexOpenAiCompatibleApiKey",
-																e.target.value,
-															)
-														}
-														placeholder={t(
-															"settings:codeIndex.openAiCompatibleApiKeyPlaceholder",
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelLabel")}
+														</label>
+														<VSCodeDropdown
+															value={currentSettings.codebaseIndexEmbedderModelId}
+															onChange={(e: any) =>
+																updateSetting(
+																	"codebaseIndexEmbedderModelId",
+																	e.target.value,
+																)
+															}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelId,
+															})}>
+															<VSCodeOption value="" className="p-2">
+																{t("settings:codeIndex.selectModel")}
+															</VSCodeOption>
+															{getAvailableModels().map((modelId) => {
+																const model =
+																	codebaseIndexModels?.[
+																		currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
+																	]?.[modelId]
+																return (
+																	<VSCodeOption
+																		key={modelId}
+																		value={modelId}
+																		className="p-2">
+																		{modelId}{" "}
+																		{model
+																			? t("settings:codeIndex.modelDimensions", {
+																					dimension: model.dimension,
+																				})
+																			: ""}
+																	</VSCodeOption>
+																)
+															})}
+														</VSCodeDropdown>
+														{formErrors.codebaseIndexEmbedderModelId && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelId}
+															</p>
 														)}
-														className={cn("w-full", {
-															"border-red-500":
-																formErrors.codebaseIndexOpenAiCompatibleApiKey,
-														})}
-													/>
-													{formErrors.codebaseIndexOpenAiCompatibleApiKey && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexOpenAiCompatibleApiKey}
-														</p>
-													)}
-												</div>
+													</div>
+												</>
+											)}
 
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelLabel")}
-													</label>
-													<VSCodeTextField
-														value={currentSettings.codebaseIndexEmbedderModelId || ""}
-														onInput={(e: any) =>
-															updateSetting(
-																"codebaseIndexEmbedderModelId",
-																e.target.value,
-															)
-														}
-														placeholder={t("settings:codeIndex.modelPlaceholder")}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexEmbedderModelId,
-														})}
-													/>
-													{formErrors.codebaseIndexEmbedderModelId && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelId}
-														</p>
-													)}
-												</div>
-
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelDimensionLabel")}
-													</label>
-													<VSCodeTextField
-														value={
-															currentSettings.codebaseIndexEmbedderModelDimension?.toString() ||
-															""
-														}
-														onInput={(e: any) => {
-															const value = e.target.value
-																? parseInt(e.target.value, 10) || undefined
-																: undefined
-															updateSetting("codebaseIndexEmbedderModelDimension", value)
-														}}
-														placeholder={t("settings:codeIndex.modelDimensionPlaceholder")}
-														className={cn("w-full", {
-															"border-red-500":
-																formErrors.codebaseIndexEmbedderModelDimension,
-														})}
-													/>
-													{formErrors.codebaseIndexEmbedderModelDimension && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelDimension}
-														</p>
-													)}
-												</div>
-											</>
-										)}
-
-										{currentSettings.codebaseIndexEmbedderProvider === "gemini" && (
-											<>
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.geminiApiKeyLabel")}
-													</label>
-													<VSCodeTextField
-														type="password"
-														value={currentSettings.codebaseIndexGeminiApiKey || ""}
-														onInput={(e: any) =>
-															updateSetting("codebaseIndexGeminiApiKey", e.target.value)
-														}
-														placeholder={t("settings:codeIndex.geminiApiKeyPlaceholder")}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexGeminiApiKey,
-														})}
-													/>
-													{formErrors.codebaseIndexGeminiApiKey && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexGeminiApiKey}
-														</p>
-													)}
-												</div>
-
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelLabel")}
-													</label>
-													<VSCodeDropdown
-														value={currentSettings.codebaseIndexEmbedderModelId}
-														onChange={(e: any) =>
-															updateSetting(
-																"codebaseIndexEmbedderModelId",
-																e.target.value,
-															)
-														}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexEmbedderModelId,
-														})}>
-														<VSCodeOption value="" className="p-2">
-															{t("settings:codeIndex.selectModel")}
-														</VSCodeOption>
-														{getAvailableModels().map((modelId) => {
-															const model =
-																codebaseIndexModels?.[
-																	currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
-																]?.[modelId]
-															return (
-																<VSCodeOption
-																	key={modelId}
-																	value={modelId}
-																	className="p-2">
-																	{modelId}{" "}
-																	{model
-																		? t("settings:codeIndex.modelDimensions", {
-																				dimension: model.dimension,
-																			})
-																		: ""}
-																</VSCodeOption>
-															)
-														})}
-													</VSCodeDropdown>
-													{formErrors.codebaseIndexEmbedderModelId && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelId}
-														</p>
-													)}
-												</div>
-											</>
-										)}
-
-										{currentSettings.codebaseIndexEmbedderProvider === "mistral" && (
-											<>
-												<div className={fieldGroupClass}>
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.mistralApiKeyLabel")}
-													</label>
-													<VSCodeTextField
-														type="password"
-														value={currentSettings.codebaseIndexMistralApiKey || ""}
-														onInput={(e: any) =>
-															updateSetting("codebaseIndexMistralApiKey", e.target.value)
-														}
-														placeholder={t("settings:codeIndex.mistralApiKeyPlaceholder")}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexMistralApiKey,
-														})}
-													/>
-													{formErrors.codebaseIndexMistralApiKey && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexMistralApiKey}
-														</p>
-													)}
-												</div>
-
-												<div className="space-y-2">
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelLabel")}
-													</label>
-													<VSCodeDropdown
-														value={currentSettings.codebaseIndexEmbedderModelId}
-														onChange={(e: any) =>
-															updateSetting(
-																"codebaseIndexEmbedderModelId",
-																e.target.value,
-															)
-														}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexEmbedderModelId,
-														})}>
-														<VSCodeOption value="" className="p-2">
-															{t("settings:codeIndex.selectModel")}
-														</VSCodeOption>
-														{getAvailableModels().map((modelId) => {
-															const model =
-																codebaseIndexModels?.[
-																	currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
-																]?.[modelId]
-															return (
-																<VSCodeOption
-																	key={modelId}
-																	value={modelId}
-																	className="p-2">
-																	{modelId}{" "}
-																	{model
-																		? t("settings:codeIndex.modelDimensions", {
-																				dimension: model.dimension,
-																			})
-																		: ""}
-																</VSCodeOption>
-															)
-														})}
-													</VSCodeDropdown>
-													{formErrors.codebaseIndexEmbedderModelId && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelId}
-														</p>
-													)}
-												</div>
-											</>
-										)}
-
-										{currentSettings.codebaseIndexEmbedderProvider === "vercel-ai-gateway" && (
-											<>
-												<div className="space-y-2">
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.vercelAiGatewayApiKeyLabel")}
-													</label>
-													<VSCodeTextField
-														type="password"
-														value={currentSettings.codebaseIndexVercelAiGatewayApiKey || ""}
-														onInput={(e: any) =>
-															updateSetting(
-																"codebaseIndexVercelAiGatewayApiKey",
-																e.target.value,
-															)
-														}
-														placeholder={t(
-															"settings:codeIndex.vercelAiGatewayApiKeyPlaceholder",
-														)}
-														className={cn("w-full", {
-															"border-red-500":
-																formErrors.codebaseIndexVercelAiGatewayApiKey,
-														})}
-													/>
-													{formErrors.codebaseIndexVercelAiGatewayApiKey && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexVercelAiGatewayApiKey}
-														</p>
-													)}
-												</div>
-
-												<div className="space-y-2">
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelLabel")}
-													</label>
-													<VSCodeDropdown
-														value={currentSettings.codebaseIndexEmbedderModelId}
-														onChange={(e: any) =>
-															updateSetting(
-																"codebaseIndexEmbedderModelId",
-																e.target.value,
-															)
-														}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexEmbedderModelId,
-														})}>
-														<VSCodeOption value="" className="p-2">
-															{t("settings:codeIndex.selectModel")}
-														</VSCodeOption>
-														{getAvailableModels().map((modelId) => {
-															const model =
-																codebaseIndexModels?.[
-																	currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
-																]?.[modelId]
-															return (
-																<VSCodeOption
-																	key={modelId}
-																	value={modelId}
-																	className="p-2">
-																	{modelId}{" "}
-																	{model
-																		? t("settings:codeIndex.modelDimensions", {
-																				dimension: model.dimension,
-																			})
-																		: ""}
-																</VSCodeOption>
-															)
-														})}
-													</VSCodeDropdown>
-													{formErrors.codebaseIndexEmbedderModelId && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelId}
-														</p>
-													)}
-												</div>
-											</>
-										)}
-
-										{currentSettings.codebaseIndexEmbedderProvider === "bedrock" && (
-											<>
-												<div className="space-y-2">
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.bedrockRegionLabel")}
-													</label>
-													<VSCodeTextField
-														value={currentSettings.codebaseIndexBedrockRegion || ""}
-														onInput={(e: any) =>
-															updateSetting("codebaseIndexBedrockRegion", e.target.value)
-														}
-														placeholder={t("settings:codeIndex.bedrockRegionPlaceholder")}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexBedrockRegion,
-														})}
-													/>
-													{formErrors.codebaseIndexBedrockRegion && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexBedrockRegion}
-														</p>
-													)}
-												</div>
-
-												<div className="space-y-2">
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.bedrockProfileLabel")}
-														<span className="text-xs text-vscode-descriptionForeground ml-1">
-															({t("settings:codeIndex.optional")})
-														</span>
-													</label>
-													<VSCodeTextField
-														value={currentSettings.codebaseIndexBedrockProfile || ""}
-														onInput={(e: any) =>
-															updateSetting("codebaseIndexBedrockProfile", e.target.value)
-														}
-														placeholder={t("settings:codeIndex.bedrockProfilePlaceholder")}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexBedrockProfile,
-														})}
-													/>
-													{formErrors.codebaseIndexBedrockProfile && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexBedrockProfile}
-														</p>
-													)}
-													{!formErrors.codebaseIndexBedrockProfile && (
-														<p className="text-xs text-vscode-descriptionForeground mt-1 mb-0">
-															{t("settings:codeIndex.bedrockProfileDescription")}
-														</p>
-													)}
-												</div>
-
-												<div className="space-y-2">
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelLabel")}
-													</label>
-													<VSCodeDropdown
-														value={currentSettings.codebaseIndexEmbedderModelId}
-														onChange={(e: any) =>
-															updateSetting(
-																"codebaseIndexEmbedderModelId",
-																e.target.value,
-															)
-														}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexEmbedderModelId,
-														})}>
-														<VSCodeOption value="" className="p-2">
-															{t("settings:codeIndex.selectModel")}
-														</VSCodeOption>
-														{getAvailableModels().map((modelId) => {
-															const model =
-																codebaseIndexModels?.[
-																	currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
-																]?.[modelId]
-															return (
-																<VSCodeOption
-																	key={modelId}
-																	value={modelId}
-																	className="p-2">
-																	{modelId}{" "}
-																	{model
-																		? t("settings:codeIndex.modelDimensions", {
-																				dimension: model.dimension,
-																			})
-																		: ""}
-																</VSCodeOption>
-															)
-														})}
-													</VSCodeDropdown>
-													{formErrors.codebaseIndexEmbedderModelId && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelId}
-														</p>
-													)}
-												</div>
-											</>
-										)}
-
-										{currentSettings.codebaseIndexEmbedderProvider === "openrouter" && (
-											<>
-												<div className="space-y-2">
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.openRouterApiKeyLabel")}
-													</label>
-													<VSCodeTextField
-														type="password"
-														value={currentSettings.codebaseIndexOpenRouterApiKey || ""}
-														onInput={(e: any) =>
-															updateSetting(
-																"codebaseIndexOpenRouterApiKey",
-																e.target.value,
-															)
-														}
-														placeholder={t(
-															"settings:codeIndex.openRouterApiKeyPlaceholder",
-														)}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexOpenRouterApiKey,
-														})}
-													/>
-													{formErrors.codebaseIndexOpenRouterApiKey && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexOpenRouterApiKey}
-														</p>
-													)}
-												</div>
-
-												<div className="space-y-2">
-													<label className="text-sm font-medium">
-														{t("settings:codeIndex.modelLabel")}
-													</label>
-													<VSCodeDropdown
-														value={currentSettings.codebaseIndexEmbedderModelId}
-														onChange={(e: any) =>
-															updateSetting(
-																"codebaseIndexEmbedderModelId",
-																e.target.value,
-															)
-														}
-														className={cn("w-full", {
-															"border-red-500": formErrors.codebaseIndexEmbedderModelId,
-														})}>
-														<VSCodeOption value="" className="p-2">
-															{t("settings:codeIndex.selectModel")}
-														</VSCodeOption>
-														{getAvailableModels().map((modelId) => {
-															const model =
-																codebaseIndexModels?.[
-																	currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
-																]?.[modelId]
-															return (
-																<VSCodeOption
-																	key={modelId}
-																	value={modelId}
-																	className="p-2">
-																	{modelId}{" "}
-																	{model
-																		? t("settings:codeIndex.modelDimensions", {
-																				dimension: model.dimension,
-																			})
-																		: ""}
-																</VSCodeOption>
-															)
-														})}
-													</VSCodeDropdown>
-													{formErrors.codebaseIndexEmbedderModelId && (
-														<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-															{formErrors.codebaseIndexEmbedderModelId}
-														</p>
-													)}
-												</div>
-
-												{/* Provider Routing for OpenRouter */}
-												{openRouterEmbeddingProviders &&
-													Object.keys(openRouterEmbeddingProviders).length > 0 && (
-														<div className={fieldGroupClass}>
-															<label className="text-sm font-medium">
-																<a
-																	href="https://openrouter.ai/docs/features/provider-routing"
-																	target="_blank"
-																	rel="noopener noreferrer"
-																	className="flex items-center gap-1 hover:underline">
-																	{t(
-																		"settings:codeIndex.openRouterProviderRoutingLabel",
-																	)}
-																	<span className="codicon codicon-link-external text-xs" />
-																</a>
-															</label>
-															<Select
-																value={
-																	currentSettings.codebaseIndexOpenRouterSpecificProvider ||
-																	OPENROUTER_DEFAULT_PROVIDER_NAME
-																}
-																onValueChange={(value) =>
+											{currentSettings.codebaseIndexEmbedderProvider === "ollama" && (
+												<>
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.ollamaBaseUrlLabel")}
+														</label>
+														<VSCodeTextField
+															value={currentSettings.codebaseIndexEmbedderBaseUrl || ""}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexEmbedderBaseUrl",
+																	e.target.value,
+																)
+															}
+															onBlur={(e: any) => {
+																// Set default Ollama URL if field is empty
+																if (!e.target.value.trim()) {
+																	e.target.value = DEFAULT_OLLAMA_URL
 																	updateSetting(
-																		"codebaseIndexOpenRouterSpecificProvider",
-																		value,
+																		"codebaseIndexEmbedderBaseUrl",
+																		DEFAULT_OLLAMA_URL,
 																	)
-																}>
-																<SelectTrigger className="w-full">
-																	<SelectValue />
-																</SelectTrigger>
-																<SelectContent>
-																	<SelectItem
-																		value={OPENROUTER_DEFAULT_PROVIDER_NAME}>
-																		{OPENROUTER_DEFAULT_PROVIDER_NAME}
-																	</SelectItem>
-																	{Object.entries(openRouterEmbeddingProviders).map(
-																		([value, { label }]) => (
+																}
+															}}
+															placeholder={t("settings:codeIndex.ollamaUrlPlaceholder")}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderBaseUrl,
+															})}
+														/>
+														{formErrors.codebaseIndexEmbedderBaseUrl && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderBaseUrl}
+															</p>
+														)}
+													</div>
+
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelLabel")}
+														</label>
+														<VSCodeTextField
+															value={currentSettings.codebaseIndexEmbedderModelId || ""}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexEmbedderModelId",
+																	e.target.value,
+																)
+															}
+															placeholder={t("settings:codeIndex.modelPlaceholder")}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelId,
+															})}
+														/>
+														{formErrors.codebaseIndexEmbedderModelId && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelId}
+															</p>
+														)}
+													</div>
+
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelDimensionLabel")}
+														</label>
+														<VSCodeTextField
+															value={
+																currentSettings.codebaseIndexEmbedderModelDimension?.toString() ||
+																""
+															}
+															onInput={(e: any) => {
+																const value = e.target.value
+																	? parseInt(e.target.value, 10) || undefined
+																	: undefined
+																updateSetting(
+																	"codebaseIndexEmbedderModelDimension",
+																	value,
+																)
+															}}
+															placeholder={t(
+																"settings:codeIndex.modelDimensionPlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelDimension,
+															})}
+														/>
+														{formErrors.codebaseIndexEmbedderModelDimension && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelDimension}
+															</p>
+														)}
+													</div>
+												</>
+											)}
+
+											{currentSettings.codebaseIndexEmbedderProvider === "openai-compatible" && (
+												<>
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.openAiCompatibleBaseUrlLabel")}
+														</label>
+														<VSCodeTextField
+															value={
+																currentSettings.codebaseIndexOpenAiCompatibleBaseUrl ||
+																""
+															}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexOpenAiCompatibleBaseUrl",
+																	e.target.value,
+																)
+															}
+															placeholder={t(
+																"settings:codeIndex.openAiCompatibleBaseUrlPlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexOpenAiCompatibleBaseUrl,
+															})}
+														/>
+														{formErrors.codebaseIndexOpenAiCompatibleBaseUrl && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexOpenAiCompatibleBaseUrl}
+															</p>
+														)}
+													</div>
+
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.openAiCompatibleApiKeyLabel")}
+														</label>
+														<VSCodeTextField
+															type="password"
+															value={
+																currentSettings.codebaseIndexOpenAiCompatibleApiKey ||
+																""
+															}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexOpenAiCompatibleApiKey",
+																	e.target.value,
+																)
+															}
+															placeholder={t(
+																"settings:codeIndex.openAiCompatibleApiKeyPlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexOpenAiCompatibleApiKey,
+															})}
+														/>
+														{formErrors.codebaseIndexOpenAiCompatibleApiKey && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexOpenAiCompatibleApiKey}
+															</p>
+														)}
+													</div>
+
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelLabel")}
+														</label>
+														<VSCodeTextField
+															value={currentSettings.codebaseIndexEmbedderModelId || ""}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexEmbedderModelId",
+																	e.target.value,
+																)
+															}
+															placeholder={t("settings:codeIndex.modelPlaceholder")}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelId,
+															})}
+														/>
+														{formErrors.codebaseIndexEmbedderModelId && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelId}
+															</p>
+														)}
+													</div>
+
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelDimensionLabel")}
+														</label>
+														<VSCodeTextField
+															value={
+																currentSettings.codebaseIndexEmbedderModelDimension?.toString() ||
+																""
+															}
+															onInput={(e: any) => {
+																const value = e.target.value
+																	? parseInt(e.target.value, 10) || undefined
+																	: undefined
+																updateSetting(
+																	"codebaseIndexEmbedderModelDimension",
+																	value,
+																)
+															}}
+															placeholder={t(
+																"settings:codeIndex.modelDimensionPlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelDimension,
+															})}
+														/>
+														{formErrors.codebaseIndexEmbedderModelDimension && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelDimension}
+															</p>
+														)}
+													</div>
+												</>
+											)}
+
+											{currentSettings.codebaseIndexEmbedderProvider === "gemini" && (
+												<>
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.geminiApiKeyLabel")}
+														</label>
+														<VSCodeTextField
+															type="password"
+															value={currentSettings.codebaseIndexGeminiApiKey || ""}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexGeminiApiKey",
+																	e.target.value,
+																)
+															}
+															placeholder={t(
+																"settings:codeIndex.geminiApiKeyPlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500": formErrors.codebaseIndexGeminiApiKey,
+															})}
+														/>
+														{formErrors.codebaseIndexGeminiApiKey && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexGeminiApiKey}
+															</p>
+														)}
+													</div>
+
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelLabel")}
+														</label>
+														<VSCodeDropdown
+															value={currentSettings.codebaseIndexEmbedderModelId}
+															onChange={(e: any) =>
+																updateSetting(
+																	"codebaseIndexEmbedderModelId",
+																	e.target.value,
+																)
+															}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelId,
+															})}>
+															<VSCodeOption value="" className="p-2">
+																{t("settings:codeIndex.selectModel")}
+															</VSCodeOption>
+															{getAvailableModels().map((modelId) => {
+																const model =
+																	codebaseIndexModels?.[
+																		currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
+																	]?.[modelId]
+																return (
+																	<VSCodeOption
+																		key={modelId}
+																		value={modelId}
+																		className="p-2">
+																		{modelId}{" "}
+																		{model
+																			? t("settings:codeIndex.modelDimensions", {
+																					dimension: model.dimension,
+																				})
+																			: ""}
+																	</VSCodeOption>
+																)
+															})}
+														</VSCodeDropdown>
+														{formErrors.codebaseIndexEmbedderModelId && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelId}
+															</p>
+														)}
+													</div>
+												</>
+											)}
+
+											{currentSettings.codebaseIndexEmbedderProvider === "mistral" && (
+												<>
+													<div className={fieldGroupClass}>
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.mistralApiKeyLabel")}
+														</label>
+														<VSCodeTextField
+															type="password"
+															value={currentSettings.codebaseIndexMistralApiKey || ""}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexMistralApiKey",
+																	e.target.value,
+																)
+															}
+															placeholder={t(
+																"settings:codeIndex.mistralApiKeyPlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500": formErrors.codebaseIndexMistralApiKey,
+															})}
+														/>
+														{formErrors.codebaseIndexMistralApiKey && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexMistralApiKey}
+															</p>
+														)}
+													</div>
+
+													<div className="space-y-2">
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelLabel")}
+														</label>
+														<VSCodeDropdown
+															value={currentSettings.codebaseIndexEmbedderModelId}
+															onChange={(e: any) =>
+																updateSetting(
+																	"codebaseIndexEmbedderModelId",
+																	e.target.value,
+																)
+															}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelId,
+															})}>
+															<VSCodeOption value="" className="p-2">
+																{t("settings:codeIndex.selectModel")}
+															</VSCodeOption>
+															{getAvailableModels().map((modelId) => {
+																const model =
+																	codebaseIndexModels?.[
+																		currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
+																	]?.[modelId]
+																return (
+																	<VSCodeOption
+																		key={modelId}
+																		value={modelId}
+																		className="p-2">
+																		{modelId}{" "}
+																		{model
+																			? t("settings:codeIndex.modelDimensions", {
+																					dimension: model.dimension,
+																				})
+																			: ""}
+																	</VSCodeOption>
+																)
+															})}
+														</VSCodeDropdown>
+														{formErrors.codebaseIndexEmbedderModelId && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelId}
+															</p>
+														)}
+													</div>
+												</>
+											)}
+
+											{currentSettings.codebaseIndexEmbedderProvider === "vercel-ai-gateway" && (
+												<>
+													<div className="space-y-2">
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.vercelAiGatewayApiKeyLabel")}
+														</label>
+														<VSCodeTextField
+															type="password"
+															value={
+																currentSettings.codebaseIndexVercelAiGatewayApiKey || ""
+															}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexVercelAiGatewayApiKey",
+																	e.target.value,
+																)
+															}
+															placeholder={t(
+																"settings:codeIndex.vercelAiGatewayApiKeyPlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexVercelAiGatewayApiKey,
+															})}
+														/>
+														{formErrors.codebaseIndexVercelAiGatewayApiKey && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexVercelAiGatewayApiKey}
+															</p>
+														)}
+													</div>
+
+													<div className="space-y-2">
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelLabel")}
+														</label>
+														<VSCodeDropdown
+															value={currentSettings.codebaseIndexEmbedderModelId}
+															onChange={(e: any) =>
+																updateSetting(
+																	"codebaseIndexEmbedderModelId",
+																	e.target.value,
+																)
+															}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelId,
+															})}>
+															<VSCodeOption value="" className="p-2">
+																{t("settings:codeIndex.selectModel")}
+															</VSCodeOption>
+															{getAvailableModels().map((modelId) => {
+																const model =
+																	codebaseIndexModels?.[
+																		currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
+																	]?.[modelId]
+																return (
+																	<VSCodeOption
+																		key={modelId}
+																		value={modelId}
+																		className="p-2">
+																		{modelId}{" "}
+																		{model
+																			? t("settings:codeIndex.modelDimensions", {
+																					dimension: model.dimension,
+																				})
+																			: ""}
+																	</VSCodeOption>
+																)
+															})}
+														</VSCodeDropdown>
+														{formErrors.codebaseIndexEmbedderModelId && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelId}
+															</p>
+														)}
+													</div>
+												</>
+											)}
+
+											{currentSettings.codebaseIndexEmbedderProvider === "bedrock" && (
+												<>
+													<div className="space-y-2">
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.bedrockRegionLabel")}
+														</label>
+														<VSCodeTextField
+															value={currentSettings.codebaseIndexBedrockRegion || ""}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexBedrockRegion",
+																	e.target.value,
+																)
+															}
+															placeholder={t(
+																"settings:codeIndex.bedrockRegionPlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500": formErrors.codebaseIndexBedrockRegion,
+															})}
+														/>
+														{formErrors.codebaseIndexBedrockRegion && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexBedrockRegion}
+															</p>
+														)}
+													</div>
+
+													<div className="space-y-2">
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.bedrockProfileLabel")}
+															<span className="text-xs text-vscode-descriptionForeground ml-1">
+																({t("settings:codeIndex.optional")})
+															</span>
+														</label>
+														<VSCodeTextField
+															value={currentSettings.codebaseIndexBedrockProfile || ""}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexBedrockProfile",
+																	e.target.value,
+																)
+															}
+															placeholder={t(
+																"settings:codeIndex.bedrockProfilePlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexBedrockProfile,
+															})}
+														/>
+														{formErrors.codebaseIndexBedrockProfile && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexBedrockProfile}
+															</p>
+														)}
+														{!formErrors.codebaseIndexBedrockProfile && (
+															<p className="text-xs text-vscode-descriptionForeground mt-1 mb-0">
+																{t("settings:codeIndex.bedrockProfileDescription")}
+															</p>
+														)}
+													</div>
+
+													<div className="space-y-2">
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelLabel")}
+														</label>
+														<VSCodeDropdown
+															value={currentSettings.codebaseIndexEmbedderModelId}
+															onChange={(e: any) =>
+																updateSetting(
+																	"codebaseIndexEmbedderModelId",
+																	e.target.value,
+																)
+															}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelId,
+															})}>
+															<VSCodeOption value="" className="p-2">
+																{t("settings:codeIndex.selectModel")}
+															</VSCodeOption>
+															{getAvailableModels().map((modelId) => {
+																const model =
+																	codebaseIndexModels?.[
+																		currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
+																	]?.[modelId]
+																return (
+																	<VSCodeOption
+																		key={modelId}
+																		value={modelId}
+																		className="p-2">
+																		{modelId}{" "}
+																		{model
+																			? t("settings:codeIndex.modelDimensions", {
+																					dimension: model.dimension,
+																				})
+																			: ""}
+																	</VSCodeOption>
+																)
+															})}
+														</VSCodeDropdown>
+														{formErrors.codebaseIndexEmbedderModelId && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelId}
+															</p>
+														)}
+													</div>
+												</>
+											)}
+
+											{currentSettings.codebaseIndexEmbedderProvider === "openrouter" && (
+												<>
+													<div className="space-y-2">
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.openRouterApiKeyLabel")}
+														</label>
+														<VSCodeTextField
+															type="password"
+															value={currentSettings.codebaseIndexOpenRouterApiKey || ""}
+															onInput={(e: any) =>
+																updateSetting(
+																	"codebaseIndexOpenRouterApiKey",
+																	e.target.value,
+																)
+															}
+															placeholder={t(
+																"settings:codeIndex.openRouterApiKeyPlaceholder",
+															)}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexOpenRouterApiKey,
+															})}
+														/>
+														{formErrors.codebaseIndexOpenRouterApiKey && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexOpenRouterApiKey}
+															</p>
+														)}
+													</div>
+
+													<div className="space-y-2">
+														<label className="text-sm font-medium">
+															{t("settings:codeIndex.modelLabel")}
+														</label>
+														<VSCodeDropdown
+															value={currentSettings.codebaseIndexEmbedderModelId}
+															onChange={(e: any) =>
+																updateSetting(
+																	"codebaseIndexEmbedderModelId",
+																	e.target.value,
+																)
+															}
+															className={cn("w-full", {
+																"border-red-500":
+																	formErrors.codebaseIndexEmbedderModelId,
+															})}>
+															<VSCodeOption value="" className="p-2">
+																{t("settings:codeIndex.selectModel")}
+															</VSCodeOption>
+															{getAvailableModels().map((modelId) => {
+																const model =
+																	codebaseIndexModels?.[
+																		currentSettings.codebaseIndexEmbedderProvider as keyof typeof codebaseIndexModels
+																	]?.[modelId]
+																return (
+																	<VSCodeOption
+																		key={modelId}
+																		value={modelId}
+																		className="p-2">
+																		{modelId}{" "}
+																		{model
+																			? t("settings:codeIndex.modelDimensions", {
+																					dimension: model.dimension,
+																				})
+																			: ""}
+																	</VSCodeOption>
+																)
+															})}
+														</VSCodeDropdown>
+														{formErrors.codebaseIndexEmbedderModelId && (
+															<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+																{formErrors.codebaseIndexEmbedderModelId}
+															</p>
+														)}
+													</div>
+
+													{/* Provider Routing for OpenRouter */}
+													{openRouterEmbeddingProviders &&
+														Object.keys(openRouterEmbeddingProviders).length > 0 && (
+															<div className={fieldGroupClass}>
+																<label className="text-sm font-medium">
+																	<a
+																		href="https://openrouter.ai/docs/features/provider-routing"
+																		target="_blank"
+																		rel="noopener noreferrer"
+																		className="flex items-center gap-1 hover:underline">
+																		{t(
+																			"settings:codeIndex.openRouterProviderRoutingLabel",
+																		)}
+																		<span className="codicon codicon-link-external text-xs" />
+																	</a>
+																</label>
+																<Select
+																	value={
+																		currentSettings.codebaseIndexOpenRouterSpecificProvider ||
+																		OPENROUTER_DEFAULT_PROVIDER_NAME
+																	}
+																	onValueChange={(value) =>
+																		updateSetting(
+																			"codebaseIndexOpenRouterSpecificProvider",
+																			value,
+																		)
+																	}>
+																	<SelectTrigger className="w-full">
+																		<SelectValue />
+																	</SelectTrigger>
+																	<SelectContent>
+																		<SelectItem
+																			value={OPENROUTER_DEFAULT_PROVIDER_NAME}>
+																			{OPENROUTER_DEFAULT_PROVIDER_NAME}
+																		</SelectItem>
+																		{Object.entries(
+																			openRouterEmbeddingProviders,
+																		).map(([value, { label }]) => (
 																			<SelectItem key={value} value={value}>
 																				{label}
 																			</SelectItem>
-																		),
+																		))}
+																	</SelectContent>
+																</Select>
+																<p className="text-xs text-vscode-descriptionForeground mt-1 mb-0">
+																	{t(
+																		"settings:codeIndex.openRouterProviderRoutingDescription",
 																	)}
-																</SelectContent>
-															</Select>
-															<p className="text-xs text-vscode-descriptionForeground mt-1 mb-0">
-																{t(
-																	"settings:codeIndex.openRouterProviderRoutingDescription",
-																)}
-															</p>
-														</div>
-													)}
-											</>
-										)}
+																</p>
+															</div>
+														)}
+												</>
+											)}
 
-										{/* Qdrant Settings */}
-										<div className={fieldGroupClass}>
-											<label className="text-sm font-medium">
-												{t("settings:codeIndex.qdrantUrlLabel")}
-											</label>
-											<VSCodeTextField
-												value={currentSettings.codebaseIndexQdrantUrl || ""}
-												onInput={(e: any) =>
-													updateSetting("codebaseIndexQdrantUrl", e.target.value)
-												}
-												onBlur={(e: any) => {
-													// Set default Qdrant URL if field is empty
-													if (!e.target.value.trim()) {
-														currentSettings.codebaseIndexQdrantUrl = DEFAULT_QDRANT_URL
-														updateSetting("codebaseIndexQdrantUrl", DEFAULT_QDRANT_URL)
+											{/* Qdrant Settings */}
+											<div className={fieldGroupClass}>
+												<label className="text-sm font-medium">
+													{t("settings:codeIndex.qdrantUrlLabel")}
+												</label>
+												<VSCodeTextField
+													value={currentSettings.codebaseIndexQdrantUrl || ""}
+													onInput={(e: any) =>
+														updateSetting("codebaseIndexQdrantUrl", e.target.value)
 													}
-												}}
-												placeholder={t("settings:codeIndex.qdrantUrlPlaceholder")}
-												className={cn("w-full", {
-													"border-red-500": formErrors.codebaseIndexQdrantUrl,
-												})}
-											/>
-											{formErrors.codebaseIndexQdrantUrl && (
-												<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-													{formErrors.codebaseIndexQdrantUrl}
-												</p>
-											)}
-										</div>
+													onBlur={(e: any) => {
+														// Set default Qdrant URL if field is empty
+														if (!e.target.value.trim()) {
+															currentSettings.codebaseIndexQdrantUrl = DEFAULT_QDRANT_URL
+															updateSetting("codebaseIndexQdrantUrl", DEFAULT_QDRANT_URL)
+														}
+													}}
+													placeholder={t("settings:codeIndex.qdrantUrlPlaceholder")}
+													className={cn("w-full", {
+														"border-red-500": formErrors.codebaseIndexQdrantUrl,
+													})}
+												/>
+												{formErrors.codebaseIndexQdrantUrl && (
+													<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+														{formErrors.codebaseIndexQdrantUrl}
+													</p>
+												)}
+											</div>
 
-										<div className={fieldGroupClass}>
-											<label className="text-sm font-medium">
-												{t("settings:codeIndex.qdrantApiKeyLabel")}
-											</label>
-											<VSCodeTextField
-												type="password"
-												value={currentSettings.codeIndexQdrantApiKey || ""}
-												onInput={(e: any) =>
-													updateSetting("codeIndexQdrantApiKey", e.target.value)
-												}
-												placeholder={t("settings:codeIndex.qdrantApiKeyPlaceholder")}
-												className={cn("w-full", {
-													"border-red-500": formErrors.codeIndexQdrantApiKey,
-												})}
-											/>
-											{formErrors.codeIndexQdrantApiKey && (
-												<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
-													{formErrors.codeIndexQdrantApiKey}
-												</p>
-											)}
+											<div className={fieldGroupClass}>
+												<label className="text-sm font-medium">
+													{t("settings:codeIndex.qdrantApiKeyLabel")}
+												</label>
+												<VSCodeTextField
+													type="password"
+													value={currentSettings.codeIndexQdrantApiKey || ""}
+													onInput={(e: any) =>
+														updateSetting("codeIndexQdrantApiKey", e.target.value)
+													}
+													placeholder={t("settings:codeIndex.qdrantApiKeyPlaceholder")}
+													className={cn("w-full", {
+														"border-red-500": formErrors.codeIndexQdrantApiKey,
+													})}
+												/>
+												{formErrors.codeIndexQdrantApiKey && (
+													<p className="text-xs text-vscode-errorForeground mt-1 mb-0">
+														{formErrors.codeIndexQdrantApiKey}
+													</p>
+												)}
+											</div>
 										</div>
 									</div>
-								</div>
-							)}
-						</div>
+								)}
+							</div>
 
-						{/* Advanced Settings Disclosure */}
-						<div ref={advancedSectionRef} className="mt-5 scroll-mt-4">
-							<button
-								onClick={() => setIsAdvancedSettingsOpen(!isAdvancedSettingsOpen)}
-								className={disclosureButtonClass}
-								aria-expanded={isAdvancedSettingsOpen}>
-								<div>
-									<div className={sectionLabelClass}>Tuning</div>
-									<div className="mt-1 text-[15px] font-semibold tracking-[-0.01em]">
-										{t("settings:codeIndex.advancedConfigLabel")}
+							{/* Advanced Settings Disclosure */}
+							<div ref={advancedSectionRef} className="mt-5 scroll-mt-4">
+								<button
+									onClick={() => setIsAdvancedSettingsOpen(!isAdvancedSettingsOpen)}
+									className={disclosureButtonClass}
+									aria-expanded={isAdvancedSettingsOpen}>
+									<div>
+										<div className={sectionLabelClass}>Tuning</div>
+										<div className="mt-1 text-[15px] font-semibold tracking-[-0.01em]">
+											{t("settings:codeIndex.advancedConfigLabel")}
+										</div>
 									</div>
-								</div>
-								<span
-									className={`codicon codicon-${isAdvancedSettingsOpen ? "chevron-down" : "chevron-right"} text-vscode-descriptionForeground`}></span>
-							</button>
+									<span
+										className={`codicon codicon-${isAdvancedSettingsOpen ? "chevron-down" : "chevron-right"} text-vscode-descriptionForeground`}></span>
+								</button>
 
-							{isAdvancedSettingsOpen && (
-								<div className={disclosurePanelClass}>
-									<div className={groupedListClass}>
-										{/* Search Score Threshold Slider */}
-										<div className={fieldGroupClass}>
-											<div className="flex items-center gap-2">
-												<label className="text-sm font-medium">
-													{t("settings:codeIndex.searchMinScoreLabel")}
-												</label>
-												<StandardTooltip
-													content={t("settings:codeIndex.searchMinScoreDescription")}>
-													<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
-												</StandardTooltip>
-											</div>
-											<div className="flex items-center gap-2">
-												<Slider
-													min={CODEBASE_INDEX_DEFAULTS.MIN_SEARCH_SCORE}
-													max={CODEBASE_INDEX_DEFAULTS.MAX_SEARCH_SCORE}
-													step={CODEBASE_INDEX_DEFAULTS.SEARCH_SCORE_STEP}
-													value={[
-														currentSettings.codebaseIndexSearchMinScore ??
-															CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_MIN_SCORE,
-													]}
-													onValueChange={(values) =>
-														updateSetting("codebaseIndexSearchMinScore", values[0])
-													}
-													className="flex-1 min-w-[80px]"
-													data-testid="search-min-score-slider"
-												/>
-												<span className="w-12 text-center">
-													{(
-														currentSettings.codebaseIndexSearchMinScore ??
-														CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_MIN_SCORE
-													).toFixed(2)}
-												</span>
-												<VSCodeButton
-													appearance="icon"
-													title={t("settings:codeIndex.resetToDefault")}
-													onClick={() =>
-														updateSetting(
-															"codebaseIndexSearchMinScore",
-															CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_MIN_SCORE,
-														)
-													}>
-													<span className="codicon codicon-discard" />
-												</VSCodeButton>
-											</div>
-										</div>
-
-										{/* Maximum Search Results Slider */}
-										<div className={fieldGroupClass}>
-											<div className="flex items-center gap-2">
-												<label className="text-sm font-medium">
-													{t("settings:codeIndex.searchMaxResultsLabel")}
-												</label>
-												<StandardTooltip
-													content={t("settings:codeIndex.searchMaxResultsDescription")}>
-													<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
-												</StandardTooltip>
-											</div>
-											<div className="flex items-center gap-2">
-												<Slider
-													min={CODEBASE_INDEX_DEFAULTS.MIN_SEARCH_RESULTS}
-													max={CODEBASE_INDEX_DEFAULTS.MAX_SEARCH_RESULTS}
-													step={CODEBASE_INDEX_DEFAULTS.SEARCH_RESULTS_STEP}
-													value={[
-														currentSettings.codebaseIndexSearchMaxResults ??
-															CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_RESULTS,
-													]}
-													onValueChange={(values) =>
-														updateSetting("codebaseIndexSearchMaxResults", values[0])
-													}
-													className="flex-1 min-w-[80px]"
-													data-testid="search-max-results-slider"
-												/>
-												<span className="w-12 text-center">
-													{currentSettings.codebaseIndexSearchMaxResults ??
-														CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_RESULTS}
-												</span>
-												<VSCodeButton
-													appearance="icon"
-													title={t("settings:codeIndex.resetToDefault")}
-													onClick={() =>
-														updateSetting(
-															"codebaseIndexSearchMaxResults",
-															CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_RESULTS,
-														)
-													}>
-													<span className="codicon codicon-discard" />
-												</VSCodeButton>
-											</div>
-										</div>
-
-										<div className={fieldGroupClass}>
-											<div className="flex items-center gap-2">
-												<label className="text-sm font-medium">
-													{t("settings:codeIndex.maxFilesLabel")}
-												</label>
-												<StandardTooltip content={t("settings:codeIndex.maxFilesDescription")}>
-													<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
-												</StandardTooltip>
-											</div>
-											<VSCodeTextField
-												value={currentSettings.codebaseIndexMaxFiles?.toString() || ""}
-												onInput={(e: any) =>
-													updateSetting(
-														"codebaseIndexMaxFiles",
-														e.target.value
-															? parseInt(e.target.value, 10) || undefined
-															: undefined,
-													)
-												}
-												placeholder="100000"
-												className="w-full"
-											/>
-										</div>
-
-										<div className={fieldGroupClass}>
-											<div className="flex items-center gap-2">
-												<label className="text-sm font-medium">
-													Max indexed file size (MB)
-												</label>
-												<StandardTooltip content="Files larger than this are skipped unless you explicitly approve them below.">
-													<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
-												</StandardTooltip>
-											</div>
-											<VSCodeTextField
-												value={currentSettings.codebaseIndexMaxFileSizeMb?.toString() || ""}
-												onInput={(e: any) =>
-													updateSetting(
-														"codebaseIndexMaxFileSizeMb",
-														e.target.value
-															? parseInt(e.target.value, 10) || undefined
-															: undefined,
-													)
-												}
-												placeholder="1"
-												className="w-full"
-											/>
-										</div>
-
-										<div className={fieldGroupClass}>
-											<div className="flex items-center gap-2">
-												<label className="text-sm font-medium">
-													{t("settings:codeIndex.embeddingBatchSizeLabel")}
-												</label>
-												<StandardTooltip
-													content={t("settings:codeIndex.embeddingBatchSizeDescription")}>
-													<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
-												</StandardTooltip>
-											</div>
-											<VSCodeTextField
-												value={
-													currentSettings.codebaseIndexEmbeddingBatchSize?.toString() || ""
-												}
-												onInput={(e: any) =>
-													updateSetting(
-														"codebaseIndexEmbeddingBatchSize",
-														e.target.value
-															? parseInt(e.target.value, 10) || undefined
-															: undefined,
-													)
-												}
-												placeholder="60"
-												className="w-full"
-											/>
-										</div>
-
-										<div className={fieldGroupClass}>
-											<div className="flex items-center gap-2">
-												<label className="text-sm font-medium">
-													{t("settings:codeIndex.embeddingLaneConcurrencyLabel")}
-												</label>
-												<StandardTooltip
-													content={t(
-														"settings:codeIndex.embeddingLaneConcurrencyDescription",
-													)}>
-													<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
-												</StandardTooltip>
-											</div>
-											<VSCodeTextField
-												value={
-													currentSettings.codebaseIndexEmbeddingLaneConcurrency?.toString() ||
-													""
-												}
-												onInput={(e: any) =>
-													updateSetting(
-														"codebaseIndexEmbeddingLaneConcurrency",
-														e.target.value
-															? parseInt(e.target.value, 10) || undefined
-															: undefined,
-													)
-												}
-												placeholder="2"
-												className="w-full"
-											/>
-										</div>
-
-										<div className={fieldGroupClass}>
-											<div className="flex items-center gap-2">
-												<label className="text-sm font-medium">
-													{t("settings:codeIndex.fileSearchIndexLimitLabel")}
-												</label>
-												<StandardTooltip
-													content={t("settings:codeIndex.fileSearchIndexLimitDescription")}>
-													<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
-												</StandardTooltip>
-											</div>
-											<VSCodeTextField
-												value={
-													currentSettings.maximumIndexedFilesForFileSearch?.toString() || ""
-												}
-												onInput={(e: any) =>
-													updateSetting(
-														"maximumIndexedFilesForFileSearch",
-														e.target.value
-															? parseInt(e.target.value, 10) || undefined
-															: undefined,
-													)
-												}
-												placeholder="10000"
-												className="w-full"
-											/>
-										</div>
-
-										<div className="space-y-2 rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] p-3">
-											<div className="flex items-start gap-2">
-												<input
-													type="checkbox"
-													id="respect-gitignore-toggle"
-													checked={currentSettings.codebaseIndexRespectGitIgnore}
-													onChange={(e) =>
-														updateSetting("codebaseIndexRespectGitIgnore", e.target.checked)
-													}
-													className="mt-0.5 accent-vscode-focusBorder"
-												/>
-												<div className="space-y-1">
-													<label
-														htmlFor="respect-gitignore-toggle"
-														className="cursor-pointer text-sm text-vscode-foreground">
-														{t("settings:codeIndex.respectGitIgnoreLabel")}
+								{isAdvancedSettingsOpen && (
+									<div className={disclosurePanelClass}>
+										<div className={groupedListClass}>
+											{/* Search Score Threshold Slider */}
+											<div className={fieldGroupClass}>
+												<div className="flex items-center gap-2">
+													<label className="text-sm font-medium">
+														{t("settings:codeIndex.searchMinScoreLabel")}
 													</label>
-													<p className="m-0 text-xs leading-5 text-vscode-descriptionForeground">
-														{t("settings:codeIndex.respectGitIgnoreDescription")}
-													</p>
-													<p className="m-0 text-xs leading-5 text-vscode-descriptionForeground/90">
-														{t("settings:codeIndex.rooIgnoreAlwaysAppliesNote")}
-													</p>
+													<StandardTooltip
+														content={t("settings:codeIndex.searchMinScoreDescription")}>
+														<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
+													</StandardTooltip>
+												</div>
+												<div className="flex items-center gap-2">
+													<Slider
+														min={CODEBASE_INDEX_DEFAULTS.MIN_SEARCH_SCORE}
+														max={CODEBASE_INDEX_DEFAULTS.MAX_SEARCH_SCORE}
+														step={CODEBASE_INDEX_DEFAULTS.SEARCH_SCORE_STEP}
+														value={[
+															currentSettings.codebaseIndexSearchMinScore ??
+																CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_MIN_SCORE,
+														]}
+														onValueChange={(values) =>
+															updateSetting("codebaseIndexSearchMinScore", values[0])
+														}
+														className="flex-1 min-w-[80px]"
+														data-testid="search-min-score-slider"
+													/>
+													<span className="w-12 text-center">
+														{(
+															currentSettings.codebaseIndexSearchMinScore ??
+															CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_MIN_SCORE
+														).toFixed(2)}
+													</span>
+													<VSCodeButton
+														appearance="icon"
+														title={t("settings:codeIndex.resetToDefault")}
+														onClick={() =>
+															updateSetting(
+																"codebaseIndexSearchMinScore",
+																CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_MIN_SCORE,
+															)
+														}>
+														<span className="codicon codicon-discard" />
+													</VSCodeButton>
 												</div>
 											</div>
-											{!currentSettings.codebaseIndexRespectGitIgnore && (
-												<div className="flex items-start gap-2 rounded-xl border border-yellow-500/35 bg-yellow-500/10 px-3 py-2 text-xs leading-5 text-vscode-descriptionForeground">
-													<AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-yellow-500" />
-													<span>{t("settings:codeIndex.respectGitIgnoreWarning")}</span>
-												</div>
-											)}
-										</div>
 
-										<div className={fieldGroupClass}>
-											<div className="flex items-start gap-2">
-												<input
-													type="checkbox"
-													id="code-index-debug-logging-toggle"
-													checked={currentSettings.codebaseIndexDebugLogging}
-													onChange={(e) =>
-														updateSetting("codebaseIndexDebugLogging", e.target.checked)
-													}
-													className="mt-0.5 accent-vscode-focusBorder"
-												/>
-												<div className="space-y-1">
-													<label
-														htmlFor="code-index-debug-logging-toggle"
-														className="cursor-pointer text-sm text-vscode-foreground">
-														{t("settings:codeIndex.debugLoggingLabel")}
+											{/* Maximum Search Results Slider */}
+											<div className={fieldGroupClass}>
+												<div className="flex items-center gap-2">
+													<label className="text-sm font-medium">
+														{t("settings:codeIndex.searchMaxResultsLabel")}
 													</label>
-													<p className="m-0 text-xs leading-5 text-vscode-descriptionForeground">
-														{t("settings:codeIndex.debugLoggingDescription")}
-													</p>
+													<StandardTooltip
+														content={t("settings:codeIndex.searchMaxResultsDescription")}>
+														<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
+													</StandardTooltip>
+												</div>
+												<div className="flex items-center gap-2">
+													<Slider
+														min={CODEBASE_INDEX_DEFAULTS.MIN_SEARCH_RESULTS}
+														max={CODEBASE_INDEX_DEFAULTS.MAX_SEARCH_RESULTS}
+														step={CODEBASE_INDEX_DEFAULTS.SEARCH_RESULTS_STEP}
+														value={[
+															currentSettings.codebaseIndexSearchMaxResults ??
+																CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_RESULTS,
+														]}
+														onValueChange={(values) =>
+															updateSetting("codebaseIndexSearchMaxResults", values[0])
+														}
+														className="flex-1 min-w-[80px]"
+														data-testid="search-max-results-slider"
+													/>
+													<span className="w-12 text-center">
+														{currentSettings.codebaseIndexSearchMaxResults ??
+															CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_RESULTS}
+													</span>
+													<VSCodeButton
+														appearance="icon"
+														title={t("settings:codeIndex.resetToDefault")}
+														onClick={() =>
+															updateSetting(
+																"codebaseIndexSearchMaxResults",
+																CODEBASE_INDEX_DEFAULTS.DEFAULT_SEARCH_RESULTS,
+															)
+														}>
+														<span className="codicon codicon-discard" />
+													</VSCodeButton>
+												</div>
+											</div>
+
+											<div className={fieldGroupClass}>
+												<div className="flex items-center gap-2">
+													<label className="text-sm font-medium">
+														{t("settings:codeIndex.maxFilesLabel")}
+													</label>
+													<StandardTooltip
+														content={t("settings:codeIndex.maxFilesDescription")}>
+														<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
+													</StandardTooltip>
+												</div>
+												<VSCodeTextField
+													value={currentSettings.codebaseIndexMaxFiles?.toString() || ""}
+													onInput={(e: any) =>
+														updateSetting(
+															"codebaseIndexMaxFiles",
+															e.target.value
+																? parseInt(e.target.value, 10) || undefined
+																: undefined,
+														)
+													}
+													placeholder="100000"
+													className="w-full"
+												/>
+											</div>
+
+											<div className={fieldGroupClass}>
+												<div className="flex items-center gap-2">
+													<label className="text-sm font-medium">
+														Max indexed file size (MB)
+													</label>
+													<StandardTooltip content="Files larger than this are skipped unless you explicitly approve them below.">
+														<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
+													</StandardTooltip>
+												</div>
+												<VSCodeTextField
+													value={currentSettings.codebaseIndexMaxFileSizeMb?.toString() || ""}
+													onInput={(e: any) =>
+														updateSetting(
+															"codebaseIndexMaxFileSizeMb",
+															e.target.value
+																? parseInt(e.target.value, 10) || undefined
+																: undefined,
+														)
+													}
+													placeholder="1"
+													className="w-full"
+												/>
+											</div>
+
+											<div className={fieldGroupClass}>
+												<div className="flex items-center gap-2">
+													<label className="text-sm font-medium">
+														{t("settings:codeIndex.embeddingBatchSizeLabel")}
+													</label>
+													<StandardTooltip
+														content={t("settings:codeIndex.embeddingBatchSizeDescription")}>
+														<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
+													</StandardTooltip>
+												</div>
+												<VSCodeTextField
+													value={
+														currentSettings.codebaseIndexEmbeddingBatchSize?.toString() ||
+														""
+													}
+													onInput={(e: any) =>
+														updateSetting(
+															"codebaseIndexEmbeddingBatchSize",
+															e.target.value
+																? parseInt(e.target.value, 10) || undefined
+																: undefined,
+														)
+													}
+													placeholder="60"
+													className="w-full"
+												/>
+											</div>
+
+											<div className={fieldGroupClass}>
+												<div className="flex items-center gap-2">
+													<label className="text-sm font-medium">
+														{t("settings:codeIndex.embeddingLaneConcurrencyLabel")}
+													</label>
+													<StandardTooltip
+														content={t(
+															"settings:codeIndex.embeddingLaneConcurrencyDescription",
+														)}>
+														<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
+													</StandardTooltip>
+												</div>
+												<VSCodeTextField
+													value={
+														currentSettings.codebaseIndexEmbeddingLaneConcurrency?.toString() ||
+														""
+													}
+													onInput={(e: any) =>
+														updateSetting(
+															"codebaseIndexEmbeddingLaneConcurrency",
+															e.target.value
+																? parseInt(e.target.value, 10) || undefined
+																: undefined,
+														)
+													}
+													placeholder="2"
+													className="w-full"
+												/>
+											</div>
+
+											<div className={fieldGroupClass}>
+												<div className="flex items-center gap-2">
+													<label className="text-sm font-medium">
+														{t("settings:codeIndex.fileSearchIndexLimitLabel")}
+													</label>
+													<StandardTooltip
+														content={t(
+															"settings:codeIndex.fileSearchIndexLimitDescription",
+														)}>
+														<span className="codicon codicon-info text-xs text-vscode-descriptionForeground cursor-help" />
+													</StandardTooltip>
+												</div>
+												<VSCodeTextField
+													value={
+														currentSettings.maximumIndexedFilesForFileSearch?.toString() ||
+														""
+													}
+													onInput={(e: any) =>
+														updateSetting(
+															"maximumIndexedFilesForFileSearch",
+															e.target.value
+																? parseInt(e.target.value, 10) || undefined
+																: undefined,
+														)
+													}
+													placeholder="10000"
+													className="w-full"
+												/>
+											</div>
+
+											<div className="space-y-2 rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] p-3">
+												<div className="flex items-start gap-2">
+													<input
+														type="checkbox"
+														id="respect-gitignore-toggle"
+														checked={currentSettings.codebaseIndexRespectGitIgnore}
+														onChange={(e) =>
+															updateSetting(
+																"codebaseIndexRespectGitIgnore",
+																e.target.checked,
+															)
+														}
+														className="mt-0.5 accent-vscode-focusBorder"
+													/>
+													<div className="space-y-1">
+														<label
+															htmlFor="respect-gitignore-toggle"
+															className="cursor-pointer text-sm text-vscode-foreground">
+															{t("settings:codeIndex.respectGitIgnoreLabel")}
+														</label>
+														<p className="m-0 text-xs leading-5 text-vscode-descriptionForeground">
+															{t("settings:codeIndex.respectGitIgnoreDescription")}
+														</p>
+														<p className="m-0 text-xs leading-5 text-vscode-descriptionForeground/90">
+															{t("settings:codeIndex.rooIgnoreAlwaysAppliesNote")}
+														</p>
+													</div>
+												</div>
+												{!currentSettings.codebaseIndexRespectGitIgnore && (
+													<div className="flex items-start gap-2 rounded-xl border border-yellow-500/35 bg-yellow-500/10 px-3 py-2 text-xs leading-5 text-vscode-descriptionForeground">
+														<AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-yellow-500" />
+														<span>{t("settings:codeIndex.respectGitIgnoreWarning")}</span>
+													</div>
+												)}
+											</div>
+
+											<div className={fieldGroupClass}>
+												<div className="flex items-start gap-2">
+													<input
+														type="checkbox"
+														id="code-index-debug-logging-toggle"
+														checked={currentSettings.codebaseIndexDebugLogging}
+														onChange={(e) =>
+															updateSetting("codebaseIndexDebugLogging", e.target.checked)
+														}
+														className="mt-0.5 accent-vscode-focusBorder"
+													/>
+													<div className="space-y-1">
+														<label
+															htmlFor="code-index-debug-logging-toggle"
+															className="cursor-pointer text-sm text-vscode-foreground">
+															{t("settings:codeIndex.debugLoggingLabel")}
+														</label>
+														<p className="m-0 text-xs leading-5 text-vscode-descriptionForeground">
+															{t("settings:codeIndex.debugLoggingDescription")}
+														</p>
+													</div>
 												</div>
 											</div>
 										</div>
 									</div>
-								</div>
-							)}
+								)}
+							</div>
 						</div>
 					</div>
 
-					{/* Sticky Action Footer */}
-					<div className="flex-shrink-0 border-t border-vscode-dropdown-border/80 bg-[linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.012))] px-5 py-4 backdrop-blur-md">
+					<div
+						className={cn(
+							"flex-shrink-0 border-t border-vscode-dropdown-border/80 bg-[linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.012))] px-5 py-4 backdrop-blur-md",
+							activeTab !== "settings" && "hidden",
+						)}>
 						<div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
-							<div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap">
-								{shouldShowStartAction && (
-									<Button
-										variant="outline"
-										className={footerSecondaryButtonClass}
-										onClick={() => vscode.postMessage({ type: "startIndexing" })}
-										disabled={saveStatus === "saving" || hasUnsavedChanges}>
-										{t("settings:codeIndex.startIndexingButton")}
-									</Button>
-								)}
-
-								{shouldShowRefreshAction && (
-									<Button
-										variant="outline"
-										className={footerSecondaryButtonClass}
-										onClick={() => vscode.postMessage({ type: "fullRefreshIndexData" })}
-										disabled={saveStatus === "saving" || hasUnsavedChanges}>
-										{isCurrentStandby
-											? t("settings:codeIndex.refreshIndexButton")
-											: t("settings:codeIndex.reindexButton")}
-									</Button>
-								)}
-
-								{currentSettings.codebaseIndexEnabled && indexingStatus.systemStatus === "Indexing" && (
-									<Button
-										variant="destructive"
-										className={footerDestructiveButtonClass}
-										onClick={() => vscode.postMessage({ type: "stopIndexing" })}>
-										{t("settings:codeIndex.stopIndexingButton")}
-									</Button>
-								)}
-
-								{currentSettings.codebaseIndexEnabled && indexingStatus.systemStatus === "Stopping" && (
-									<Button variant="destructive" className={footerDestructiveButtonClass} disabled>
-										{t("settings:codeIndex.stoppingButton")}
-									</Button>
-								)}
-
-								{currentSettings.codebaseIndexEnabled &&
-									indexingStatus.systemStatus !== "Indexing" &&
-									indexingStatus.systemStatus !== "Stopping" && (
-										<AlertDialog>
-											<AlertDialogTrigger asChild>
-												<Button variant="secondary" className={footerDestructiveButtonClass}>
-													{t("settings:codeIndex.clearIndexDataButton")}
-												</Button>
-											</AlertDialogTrigger>
-											<AlertDialogContent>
-												<AlertDialogHeader>
-													<AlertDialogTitle>
-														{t("settings:codeIndex.clearDataDialog.title")}
-													</AlertDialogTitle>
-													<AlertDialogDescription>
-														{t("settings:codeIndex.clearDataDialog.description")}
-													</AlertDialogDescription>
-												</AlertDialogHeader>
-												<AlertDialogFooter>
-													<AlertDialogCancel>
-														{t("settings:codeIndex.clearDataDialog.cancelButton")}
-													</AlertDialogCancel>
-													<AlertDialogAction
-														onClick={() => vscode.postMessage({ type: "clearIndexData" })}>
-														{t("settings:codeIndex.clearDataDialog.confirmButton")}
-													</AlertDialogAction>
-												</AlertDialogFooter>
-											</AlertDialogContent>
-										</AlertDialog>
-									)}
-							</div>
+							{showDebugSection ? (
+								<div className="rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] px-3 py-2 text-xs leading-5 text-vscode-descriptionForeground">
+									<div className="font-medium text-vscode-foreground">Roo Build</div>
+									<div>version: {rooVersion}</div>
+									<div>build: {rooBuildTimestamp}</div>
+									<div>context: {renderContext}</div>
+									<div>view: code index tuning</div>
+									{rooDebugInfo.webviewId ? <div>webview: {rooDebugInfo.webviewId}</div> : null}
+									{rooDebugInfo.origin ? <div>origin: {rooDebugInfo.origin}</div> : null}
+									{debug ? <div>debug mode: enabled</div> : null}
+								</div>
+							) : (
+								<div />
+							)}
 
 							{hasUnsavedChanges || saveStatus === "saving" ? (
 								<Button
@@ -3442,7 +3781,6 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 							)}
 						</div>
 
-						{/* Save Status Messages */}
 						{saveStatus === "error" && (
 							<div className="mt-2">
 								<span className="text-sm text-vscode-errorForeground block">

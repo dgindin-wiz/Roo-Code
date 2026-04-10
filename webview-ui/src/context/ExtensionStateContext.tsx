@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from "react"
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react"
 
 import {
 	type ProviderSettings,
@@ -148,7 +148,7 @@ export interface ExtensionStateContextType extends ExtensionState {
 
 export const ExtensionStateContext = createContext<ExtensionStateContextType | undefined>(undefined)
 
-export const mergeExtensionState = (prevState: ExtensionState, newState: Partial<ExtensionState>) => {
+export const mergeExtensionState = (prevState: ExtensionState, newState: Partial<ExtensionState>): ExtensionState => {
 	const { customModePrompts: prevCustomModePrompts, experiments: prevExperiments, ...prevRest } = prevState
 
 	const {
@@ -188,6 +188,11 @@ export const mergeExtensionState = (prevState: ExtensionState, newState: Partial
 		experiments,
 	}
 }
+
+const STATE_MERGE_THROTTLE_MS = typeof process !== "undefined" && process.env?.NODE_ENV === "test" ? 0 : 100
+const STATE_BACKPRESSURE_QUEUE_LIMIT = 10
+const STATE_BACKPRESSURE_DELAY_MS = 500
+const STATE_BACKPRESSURE_LOG_COOLDOWN_MS = 2000
 
 export const ExtensionStateContextProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 	const [state, setState] = useState<ExtensionState>({
@@ -294,6 +299,15 @@ export const ExtensionStateContextProvider: React.FC<{ children: React.ReactNode
 	const [prevCloudIsAuthenticated, setPrevCloudIsAuthenticated] = useState(false)
 	const [includeCurrentTime, setIncludeCurrentTime] = useState(true)
 	const [includeCurrentCost, setIncludeCurrentCost] = useState(true)
+	const pendingStateQueueRef = useRef<Partial<ExtensionState>[]>([])
+	const pendingStateFlushTimerRef = useRef<number | undefined>(undefined)
+	const pendingStateFirstEnqueuedAtRef = useRef<number | undefined>(undefined)
+	const lastBackpressureLogAtRef = useRef<number | undefined>(undefined)
+	const debugLoggingEnabledRef = useRef(false)
+
+	useEffect(() => {
+		debugLoggingEnabledRef.current = Boolean(state.debug || state.codebaseIndexConfig?.codebaseIndexDebugLogging)
+	}, [state.codebaseIndexConfig?.codebaseIndexDebugLogging, state.debug])
 
 	const setListApiConfigMeta = useCallback(
 		(value: ProviderSettingsEntry[]) => setState((prevState) => ({ ...prevState, listApiConfigMeta: value })),
@@ -310,42 +324,152 @@ export const ExtensionStateContextProvider: React.FC<{ children: React.ReactNode
 		}))
 	}, [])
 
+	const applyStatePatch = useCallback(
+		(patch: Partial<ExtensionState>) => {
+			setState((prevState) => mergeExtensionState(prevState, patch))
+			if (patch.apiConfiguration !== undefined) {
+				setShowWelcome(!checkExistKey(patch.apiConfiguration))
+			}
+			setDidHydrateState(true)
+			if ((patch as any).alwaysAllowFollowupQuestions !== undefined) {
+				setAlwaysAllowFollowupQuestions((patch as any).alwaysAllowFollowupQuestions)
+			}
+			if ((patch as any).followupAutoApproveTimeoutMs !== undefined) {
+				setFollowupAutoApproveTimeoutMs((patch as any).followupAutoApproveTimeoutMs)
+			}
+			if ((patch as any).includeTaskHistoryInEnhance !== undefined) {
+				setIncludeTaskHistoryInEnhance((patch as any).includeTaskHistoryInEnhance)
+			}
+			if ((patch as any).includeCurrentTime !== undefined) {
+				setIncludeCurrentTime((patch as any).includeCurrentTime)
+			}
+			if ((patch as any).includeCurrentCost !== undefined) {
+				setIncludeCurrentCost((patch as any).includeCurrentCost)
+			}
+			if (patch.marketplaceItems !== undefined) {
+				setMarketplaceItems(patch.marketplaceItems)
+			}
+			if (patch.marketplaceInstalledMetadata !== undefined) {
+				setMarketplaceInstalledMetadata(patch.marketplaceInstalledMetadata)
+			}
+		},
+		[
+			setIncludeCurrentCost,
+			setIncludeCurrentTime,
+			setIncludeTaskHistoryInEnhance,
+			setAlwaysAllowFollowupQuestions,
+			setFollowupAutoApproveTimeoutMs,
+		],
+	)
+
+	const flushPendingState = useCallback(() => {
+		pendingStateFlushTimerRef.current = undefined
+		const pendingQueue = pendingStateQueueRef.current
+		if (pendingQueue.length === 0) {
+			return
+		}
+		pendingStateQueueRef.current = []
+		pendingStateFirstEnqueuedAtRef.current = undefined
+		setState((prevState) =>
+			pendingQueue.reduce<ExtensionState>((acc, patch) => mergeExtensionState(acc, patch), prevState),
+		)
+		const combinedPatch = pendingQueue.reduce<Partial<ExtensionState>>((acc, patch) => ({ ...acc, ...patch }), {})
+		if (combinedPatch.apiConfiguration !== undefined) {
+			setShowWelcome(!checkExistKey(combinedPatch.apiConfiguration))
+		}
+		setDidHydrateState(true)
+		if ((combinedPatch as any).alwaysAllowFollowupQuestions !== undefined) {
+			setAlwaysAllowFollowupQuestions((combinedPatch as any).alwaysAllowFollowupQuestions)
+		}
+		if ((combinedPatch as any).followupAutoApproveTimeoutMs !== undefined) {
+			setFollowupAutoApproveTimeoutMs((combinedPatch as any).followupAutoApproveTimeoutMs)
+		}
+		if ((combinedPatch as any).includeTaskHistoryInEnhance !== undefined) {
+			setIncludeTaskHistoryInEnhance((combinedPatch as any).includeTaskHistoryInEnhance)
+		}
+		if ((combinedPatch as any).includeCurrentTime !== undefined) {
+			setIncludeCurrentTime((combinedPatch as any).includeCurrentTime)
+		}
+		if ((combinedPatch as any).includeCurrentCost !== undefined) {
+			setIncludeCurrentCost((combinedPatch as any).includeCurrentCost)
+		}
+		if (combinedPatch.marketplaceItems !== undefined) {
+			setMarketplaceItems(combinedPatch.marketplaceItems)
+		}
+		if (combinedPatch.marketplaceInstalledMetadata !== undefined) {
+			setMarketplaceInstalledMetadata(combinedPatch.marketplaceInstalledMetadata)
+		}
+	}, [])
+
+	const maybeLogBackpressure = useCallback((queueSize: number) => {
+		if (!debugLoggingEnabledRef.current) {
+			return
+		}
+		const firstEnqueuedAt = pendingStateFirstEnqueuedAtRef.current
+		const now = Date.now()
+		const elapsedMs = firstEnqueuedAt ? now - firstEnqueuedAt : 0
+		const shouldLog = queueSize >= STATE_BACKPRESSURE_QUEUE_LIMIT || elapsedMs >= STATE_BACKPRESSURE_DELAY_MS
+		if (!shouldLog) {
+			return
+		}
+		const lastLogAt = lastBackpressureLogAtRef.current ?? 0
+		if (now - lastLogAt < STATE_BACKPRESSURE_LOG_COOLDOWN_MS) {
+			return
+		}
+		lastBackpressureLogAtRef.current = now
+		console.debug("[Roo] Webview state batching backpressure", {
+			queueSize,
+			elapsedMs,
+			throttleMs: STATE_MERGE_THROTTLE_MS,
+		})
+		vscode.postMessage({
+			type: "codeIndexDebugLog",
+			values: {
+				event: "webview-state-backpressure",
+				queueSize,
+				elapsedMs,
+				throttleMs: STATE_MERGE_THROTTLE_MS,
+			},
+		})
+	}, [])
+
+	const scheduleStateFlush = useCallback(() => {
+		if (pendingStateFlushTimerRef.current !== undefined) {
+			return
+		}
+		pendingStateFlushTimerRef.current = window.setTimeout(
+			() => {
+				flushPendingState()
+			},
+			Math.max(0, STATE_MERGE_THROTTLE_MS),
+		)
+	}, [flushPendingState])
+
+	useEffect(() => {
+		return () => {
+			if (pendingStateFlushTimerRef.current !== undefined) {
+				window.clearTimeout(pendingStateFlushTimerRef.current)
+				pendingStateFlushTimerRef.current = undefined
+			}
+		}
+	}, [])
+
 	const handleMessage = useCallback(
 		(event: MessageEvent) => {
 			const message: ExtensionMessage = event.data
 			switch (message.type) {
 				case "state": {
 					const newState = message.state ?? {}
-					setState((prevState) => mergeExtensionState(prevState, newState))
-					setShowWelcome(!checkExistKey(newState.apiConfiguration))
-					setDidHydrateState(true)
-					// Update alwaysAllowFollowupQuestions if present in state message
-					if ((newState as any).alwaysAllowFollowupQuestions !== undefined) {
-						setAlwaysAllowFollowupQuestions((newState as any).alwaysAllowFollowupQuestions)
+					if (STATE_MERGE_THROTTLE_MS <= 0) {
+						applyStatePatch(newState)
+						break
 					}
-					// Update followupAutoApproveTimeoutMs if present in state message
-					if ((newState as any).followupAutoApproveTimeoutMs !== undefined) {
-						setFollowupAutoApproveTimeoutMs((newState as any).followupAutoApproveTimeoutMs)
+					pendingStateQueueRef.current.push(newState)
+					if (pendingStateFirstEnqueuedAtRef.current === undefined) {
+						pendingStateFirstEnqueuedAtRef.current = Date.now()
 					}
-					// Update includeTaskHistoryInEnhance if present in state message
-					if ((newState as any).includeTaskHistoryInEnhance !== undefined) {
-						setIncludeTaskHistoryInEnhance((newState as any).includeTaskHistoryInEnhance)
-					}
-					// Update includeCurrentTime if present in state message
-					if ((newState as any).includeCurrentTime !== undefined) {
-						setIncludeCurrentTime((newState as any).includeCurrentTime)
-					}
-					// Update includeCurrentCost if present in state message
-					if ((newState as any).includeCurrentCost !== undefined) {
-						setIncludeCurrentCost((newState as any).includeCurrentCost)
-					}
-					// Handle marketplace data if present in state message
-					if (newState.marketplaceItems !== undefined) {
-						setMarketplaceItems(newState.marketplaceItems)
-					}
-					if (newState.marketplaceInstalledMetadata !== undefined) {
-						setMarketplaceInstalledMetadata(newState.marketplaceInstalledMetadata)
-					}
+					maybeLogBackpressure(pendingStateQueueRef.current.length)
+					scheduleStateFlush()
 					break
 				}
 				case "action": {
@@ -468,7 +592,7 @@ export const ExtensionStateContextProvider: React.FC<{ children: React.ReactNode
 				}
 			}
 		},
-		[setListApiConfigMeta],
+		[applyStatePatch, maybeLogBackpressure, scheduleStateFlush, setListApiConfigMeta],
 	)
 
 	useEffect(() => {

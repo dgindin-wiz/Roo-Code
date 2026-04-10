@@ -30,6 +30,7 @@ export interface CodeIndexConfig {
 	searchMinScore?: number
 	searchMaxResults?: number
 	respectGitIgnore?: boolean
+	includeDefaultIgnoredGeneratedPaths?: boolean
 	embeddingLaneConcurrency?: number
 }
 
@@ -58,5 +59,6 @@ export type PreviousConfigSnapshot = {
 	maxFileSizeBytes?: number
 	oversizedFileApprovalsJson?: string
 	respectGitIgnore?: boolean
+	includeDefaultIgnoredGeneratedPaths?: boolean
 	embeddingLaneConcurrency?: number
 }

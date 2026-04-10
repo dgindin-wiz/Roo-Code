@@ -602,16 +602,24 @@ describe("ClineProvider", () => {
 	})
 
 	test("handles webviewDidLaunch message", async () => {
+		vi.useFakeTimers()
 		await provider.resolveWebviewView(mockWebviewView)
+		const postStateToWebviewWithoutTaskHistorySpy = vi
+			.spyOn(provider, "postStateToWebviewWithoutTaskHistory")
+			.mockResolvedValue(undefined)
+		const broadcastTaskHistoryUpdateSpy = vi.spyOn(provider, "broadcastTaskHistoryUpdate").mockResolvedValue()
 
 		// Get the message handler from onDidReceiveMessage
 		const messageHandler = (mockWebviewView.webview.onDidReceiveMessage as any).mock.calls[0][0]
 
 		// Simulate webviewDidLaunch message
 		await messageHandler({ type: "webviewDidLaunch" })
+		await vi.runAllTimersAsync()
 
-		// Should post state and theme to webview
+		expect(postStateToWebviewWithoutTaskHistorySpy).toHaveBeenCalledTimes(1)
+		expect(broadcastTaskHistoryUpdateSpy).toHaveBeenCalledTimes(1)
 		expect(mockPostMessage).toHaveBeenCalled()
+		vi.useRealTimers()
 	})
 
 	test("clearTask aborts current task", async () => {

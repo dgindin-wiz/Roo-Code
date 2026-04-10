@@ -153,6 +153,225 @@ describe("CodeIndexStateManager", () => {
 		})
 	})
 
+	describe("pipeline snapshots", () => {
+		it("builds a structured pipeline snapshot and preserves the last completed run", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "discovery",
+						title: "Discovery",
+						state: "completed",
+						health: "healthy",
+						summary: "done",
+						metrics: [],
+					},
+					{
+						id: "file_checks",
+						title: "File checks",
+						state: "running",
+						health: "healthy",
+						summary: "checking",
+						metrics: [],
+					},
+				],
+			})
+
+			expect(stateManager.getCurrentStatus().pipeline?.services[0].id).toBe("discovery")
+			expect(stateManager.getCurrentStatus().pipeline?.services[1].state).toBe("running")
+
+			stateManager.preserveCompletedPipelineSnapshot()
+			const preserved = stateManager.getCurrentStatus().pipeline
+			expect(preserved?.overallState).toBe("completed")
+			expect(preserved?.preservedFromPreviousRun).toBe(true)
+			expect(preserved?.services[0].state).toBe("completed")
+		})
+
+		it("keeps the run summary pinned to embedding while parse, plan, and vector sync are also active", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "parse",
+						title: "Parse",
+						state: "running",
+						health: "healthy",
+						summary: "Parsing changed files",
+						progressCurrent: 340,
+						progressTotal: 2377,
+						progressUnit: "files",
+						progressPercent: 14,
+						metrics: [],
+					},
+					{
+						id: "plan",
+						title: "Plan",
+						state: "running",
+						health: "watch",
+						summary: "Preparing vector workload",
+						detail: "parsed_revisions_waiting_for_planning",
+						metrics: [],
+					},
+					{
+						id: "embedding",
+						title: "Embedding",
+						state: "running",
+						health: "watch",
+						summary: "Creating vector embeddings",
+						metrics: [],
+					},
+					{
+						id: "vector_sync",
+						title: "Vector sync",
+						state: "running",
+						health: "healthy",
+						summary: "Syncing vectors to Qdrant",
+						progressCurrent: 8633,
+						progressTotal: 10881,
+						progressUnit: "chunks",
+						progressPercent: 79,
+						metrics: [],
+					},
+				],
+			})
+
+			const summary = stateManager.getCurrentStatus().pipeline?.summary
+			expect(summary?.primaryServiceId).toBe("embedding")
+			expect(summary?.headline).toBe("Building embeddings and syncing vectors")
+			expect(summary?.progressLabel).toBe("Synced 8,633 of 10,881 chunks")
+			expect(summary?.secondaryLabel).toBe("Planner is catching up before more parsed files are handed off.")
+		})
+
+		it("keeps legacy embed snapshots rendering as a combined service", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "embed",
+						title: "Embed",
+						state: "running",
+						health: "healthy",
+						summary: "Embedding and syncing vectors",
+						progressCurrent: 100,
+						progressTotal: 200,
+						progressUnit: "chunks",
+						progressPercent: 50,
+						metrics: [],
+					},
+				],
+			})
+
+			const pipeline = stateManager.getCurrentStatus().pipeline
+			expect(pipeline?.services.map((service) => service.id)).toEqual([
+				"discovery",
+				"file_checks",
+				"parse",
+				"plan",
+				"embed",
+				"cleanup",
+			])
+			expect(pipeline?.summary?.headline).toBe("Building embeddings and syncing vectors")
+		})
+
+		it("emits a calm preserved summary after completion", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "file_checks",
+						title: "File checks",
+						state: "completed",
+						health: "healthy",
+						summary: "Checked files",
+						progressCurrent: 2370,
+						progressTotal: 2370,
+						progressUnit: "files",
+						progressPercent: 100,
+						metrics: [],
+					},
+					{
+						id: "vector_sync",
+						title: "Vector sync",
+						state: "completed",
+						health: "healthy",
+						summary: "Synced chunks",
+						progressCurrent: 1192,
+						progressTotal: 1192,
+						progressUnit: "chunks",
+						progressPercent: 100,
+						metrics: [],
+					},
+				],
+			})
+
+			stateManager.preserveCompletedPipelineSnapshot()
+
+			const summary = stateManager.getCurrentStatus().pipeline?.summary
+			expect(summary?.headline).toBe("Index ready")
+			expect(summary?.progressLabel).toBe("2,370 files • 1,192 chunks synced")
+			expect(summary?.secondaryLabel).toBeUndefined()
+		})
+
+		it("switches the run summary to cleanup after embed is no longer active", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "embed",
+						title: "Embed",
+						state: "completed",
+						health: "healthy",
+						summary: "Done",
+						progressCurrent: 10881,
+						progressTotal: 10881,
+						progressUnit: "chunks",
+						progressPercent: 100,
+						metrics: [],
+					},
+					{
+						id: "cleanup",
+						title: "Cleanup",
+						state: "running",
+						health: "healthy",
+						summary: "Removing stale vectors",
+						progressCurrent: 253,
+						progressTotal: 400,
+						progressUnit: "vectors",
+						progressPercent: 63,
+						metrics: [],
+					},
+				],
+			})
+
+			const summary = stateManager.getCurrentStatus().pipeline?.summary
+			expect(summary?.primaryServiceId).toBe("cleanup")
+			expect(summary?.headline).toBe("Removing stale vectors")
+			expect(summary?.progressLabel).toBe("Removed 253 of 400 stale vectors")
+		})
+
+		it("clears preserved pipeline snapshots on reset", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "discovery",
+						title: "Discovery",
+						state: "completed",
+						health: "healthy",
+						summary: "done",
+						metrics: [],
+					},
+				],
+			})
+			stateManager.preserveCompletedPipelineSnapshot()
+
+			expect(stateManager.getCurrentStatus().pipeline).toBeDefined()
+
+			stateManager.resetIndexingState()
+			expect(stateManager.getCurrentStatus().pipeline).toBeUndefined()
+		})
+	})
+
 	describe("reportScanProgress", () => {
 		it("should set phase to scanning and update file counts", () => {
 			stateManager.reportScanProgress(50, 1000)

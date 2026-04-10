@@ -247,12 +247,19 @@
 		"reindexButton": "Re-index",
 		"refreshIndexButton": "Refresh Index",
 		"clearIndexDataButton": "Clear Index Data",
+		"clearIndexDatabaseButton": "Clear Database",
 		"unsavedSettingsMessage": "Please save your settings before starting the indexing process.",
 		"clearDataDialog": {
 			"title": "Are you sure?",
-			"description": "This action cannot be undone. This will permanently delete your codebase index data.",
+			"description": "This will permanently delete the current workspace index data and vectors, but keep run history and diagnostics for later analysis.",
 			"cancelButton": "Cancel",
-			"confirmButton": "Clear Data"
+			"confirmButton": "Clear Index"
+		},
+		"clearDatabaseDialog": {
+			"title": "Delete index database and history?",
+			"description": "This action cannot be undone. This will permanently delete the current workspace index data, vectors, run history, telemetry samples, diagnostics logs, and any future persistent benchmark data stored for this workspace.",
+			"cancelButton": "Cancel",
+			"confirmButton": "Delete Database"
 		},
 		"ollamaUrlPlaceholder": "http://localhost:11434",
 		"openAiCompatibleBaseUrlPlaceholder": "https://api.example.com",

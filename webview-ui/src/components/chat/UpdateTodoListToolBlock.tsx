@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react"
 import { ToolUseBlock, ToolUseBlockHeader } from "../common/ToolUseBlock"
-import MarkdownBlock from "../common/MarkdownBlock"
+import LazyMarkdownBlock from "../common/LazyMarkdownBlock"
 
 interface TodoItem {
 	id?: string
@@ -427,7 +427,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 							)}
 						</ul>
 					) : (
-						<MarkdownBlock markdown={content} />
+						<LazyMarkdownBlock markdown={content} />
 					)}
 				</div>
 				{/* Delete confirmation dialog */}

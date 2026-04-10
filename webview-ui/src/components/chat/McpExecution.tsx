@@ -15,7 +15,7 @@ import { safeJsonParse } from "@roo/core"
 import { cn } from "@src/lib/utils"
 import { Button } from "@src/components/ui"
 
-import CodeBlock from "../common/CodeBlock"
+import LazyCodeBlock from "../common/LazyCodeBlock"
 import McpToolRow from "../mcp/McpToolRow"
 
 import { Markdown } from "./Markdown"
@@ -277,7 +277,7 @@ export const McpExecution = ({
 							"mt-1 pt-1":
 								!isArguments && (useMcpServer?.type === "use_mcp_tool" || (toolName && serverName)),
 						})}>
-						<CodeBlock source={formattedArgumentsText} language="json" />
+						<LazyCodeBlock source={formattedArgumentsText} language="json" />
 					</div>
 				)}
 
@@ -327,7 +327,7 @@ const ResponseContainerInternal = ({
 				"max-h-96 overflow-y-auto mt-1 pt-1": !hasArguments,
 			})}>
 			{isJson ? (
-				<CodeBlock source={response} language="json" />
+				<LazyCodeBlock source={response} language="json" />
 			) : (
 				<Markdown markdown={response} partial={isPartial} />
 			)}

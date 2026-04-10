@@ -1,4 +1,13 @@
 import * as vscode from "vscode"
+import type {
+	IndexingHealthState,
+	IndexingPipelineOverallState,
+	IndexingPipelineRunMode,
+	IndexingPipelineSnapshot,
+	IndexingRunSummarySnapshot,
+	IndexingServiceId,
+	IndexingServiceSnapshot,
+} from "@roo-code/types"
 import { IndexDebugLogger } from "./debug-logger"
 
 export type IndexingState = "Standby" | "Indexing" | "Indexed" | "Error" | "Stopping"
@@ -43,6 +52,51 @@ type OversizedDetail = {
 	reason: string
 	needsReapproval?: boolean
 	approvedMaxBytes?: number
+}
+
+type PipelineSnapshotPatch = Partial<Omit<IndexingPipelineSnapshot, "services">> & {
+	services?: IndexingServiceSnapshot[]
+}
+
+const PIPELINE_SERVICE_ORDER: IndexingServiceId[] = [
+	"discovery",
+	"file_checks",
+	"parse",
+	"plan",
+	"embedding",
+	"vector_sync",
+	"cleanup",
+]
+
+const LEGACY_PIPELINE_SERVICE_ORDER: IndexingServiceId[] = [
+	"discovery",
+	"file_checks",
+	"parse",
+	"plan",
+	"embed",
+	"cleanup",
+]
+
+const RUN_SUMMARY_PRIMARY_SERVICE_ORDER: IndexingServiceId[] = [
+	"embedding",
+	"vector_sync",
+	"embed",
+	"cleanup",
+	"plan",
+	"parse",
+	"file_checks",
+	"discovery",
+]
+
+const PIPELINE_SERVICE_TITLES: Record<IndexingServiceId, string> = {
+	discovery: "Discovery",
+	file_checks: "File checks",
+	parse: "Parse",
+	plan: "Plan",
+	embedding: "Embedding",
+	vector_sync: "Vector sync",
+	embed: "Embed",
+	cleanup: "Cleanup",
 }
 
 /**
@@ -103,6 +157,13 @@ export class CodeIndexStateManager {
 	private static readonly BACKPRESSURE_DISPLAY_THRESHOLD_MS = 2_000 // show "waiting" hint after 2s of no file progress
 	private static readonly MAX_RECENT_DENSITY_SAMPLES = 8
 	private static readonly MAX_RECENT_THROUGHPUT_SAMPLES = 8
+	private static readonly FOREGROUND_NUMERIC_UPDATE_THROTTLE_MS = 500
+	private static readonly BACKGROUND_NUMERIC_UPDATE_THROTTLE_MS = 2_000
+	private _activePipelineSnapshot?: IndexingPipelineSnapshot
+	private _lastCompletedPipelineSnapshot?: IndexingPipelineSnapshot
+	private _lastProgressEmitAt = 0
+	private _lastSemanticSignature = ""
+	private _pendingProgressEmitTimer: ReturnType<typeof setTimeout> | undefined
 
 	// --- Public API ---
 
@@ -152,7 +213,81 @@ export class CodeIndexStateManager {
 			terminallyFailedChunks: this._resilienceStats.terminallyFailedChunks,
 			retryingChunks: this._resilienceStats.retryingChunks,
 			warningDetails: this._resilienceStats.warningDetails,
+			pipeline: this.getPipelineSnapshotForStatus(),
 		}
+	}
+
+	public beginPipelineRun(runMode: IndexingPipelineRunMode): void {
+		this._activePipelineSnapshot = {
+			overallState: "running",
+			overallHealth: "unknown",
+			runMode,
+			etaMs: null,
+			services: PIPELINE_SERVICE_ORDER.map((serviceId) => this.createDefaultServiceSnapshot(serviceId)),
+		}
+		this._lastCompletedPipelineSnapshot = undefined
+		this.emitProgressUpdate({ forceImmediate: true })
+	}
+
+	public setPipelineSnapshot(snapshot: PipelineSnapshotPatch, options?: { forceImmediate?: boolean }): void {
+		const baseSnapshot = this._activePipelineSnapshot ?? {
+			overallState: "running" as IndexingPipelineOverallState,
+			overallHealth: "unknown" as IndexingHealthState,
+			runMode: "unknown" as IndexingPipelineRunMode,
+			etaMs: null,
+			services: PIPELINE_SERVICE_ORDER.map((serviceId) => this.createDefaultServiceSnapshot(serviceId)),
+		}
+		const merged: IndexingPipelineSnapshot = {
+			...baseSnapshot,
+			...snapshot,
+			services: this.normalizePipelineServices(snapshot.services ?? baseSnapshot.services),
+		}
+		merged.etaMs = snapshot.etaMs ?? this._estimatedTimeRemainingMs ?? null
+		merged.overallHealth = this.getPipelineOverallHealth(merged.services)
+		this._activePipelineSnapshot = merged
+		this.emitProgressUpdate({ forceImmediate: options?.forceImmediate })
+	}
+
+	public preserveCompletedPipelineSnapshot(): void {
+		if (!this._activePipelineSnapshot) {
+			return
+		}
+		const preservedSnapshot: IndexingPipelineSnapshot = {
+			...this._activePipelineSnapshot,
+			overallState: "completed",
+			overallHealth: this.getPipelineOverallHealth(this._activePipelineSnapshot.services),
+			etaMs: null,
+			lastCompletedAt: Date.now(),
+			preservedFromPreviousRun: false,
+			services: this.normalizePipelineServices(this._activePipelineSnapshot.services).map((service) =>
+				service.state === "pending" ? { ...service, state: "skipped", summary: "No work required" } : service,
+			),
+		}
+		this._lastCompletedPipelineSnapshot = preservedSnapshot
+		this._activePipelineSnapshot = undefined
+		this.emitProgressUpdate({ forceImmediate: true })
+	}
+
+	public setPipelineTerminalState(overallState: "failed" | "stopped"): void {
+		if (!this._activePipelineSnapshot) {
+			return
+		}
+		this._activePipelineSnapshot = {
+			...this._activePipelineSnapshot,
+			overallState,
+			overallHealth:
+				overallState === "failed"
+					? "critical"
+					: this.getPipelineOverallHealth(this._activePipelineSnapshot.services),
+			etaMs: null,
+		}
+		this.emitProgressUpdate({ forceImmediate: true })
+	}
+
+	public clearPipelineSnapshots(): void {
+		this._activePipelineSnapshot = undefined
+		this._lastCompletedPipelineSnapshot = undefined
+		this.emitProgressUpdate({ forceImmediate: true })
 	}
 
 	// --- State Management ---
@@ -180,6 +315,14 @@ export class CodeIndexStateManager {
 				if (newState === "Standby" || newState === "Error") {
 					this.resetResilienceStats()
 				}
+				if (newState === "Error" && this._activePipelineSnapshot) {
+					this._activePipelineSnapshot = {
+						...this._activePipelineSnapshot,
+						overallState: "failed",
+						overallHealth: "critical",
+						etaMs: null,
+					}
+				}
 				// Reset two-phase fields
 				if (newState !== "Stopping") {
 					this.resetDetailedProgressFields({
@@ -189,7 +332,7 @@ export class CodeIndexStateManager {
 				}
 			}
 
-			this._progressEmitter.fire(this.getCurrentStatus())
+			this.emitProgressUpdate({ forceImmediate: true })
 			IndexDebugLogger.log("StateManager", "setSystemState", {
 				phaseTransition: true,
 				newState,
@@ -207,8 +350,10 @@ export class CodeIndexStateManager {
 		this._activityDetail = ""
 		this.resetDetailedProgressFields()
 		this.resetResilienceStats()
+		this._activePipelineSnapshot = undefined
+		this._lastCompletedPipelineSnapshot = undefined
 
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate({ forceImmediate: true })
 		IndexDebugLogger.log("StateManager", "resetIndexingState", {
 			phaseTransition: true,
 			message: message.substring(0, 120),
@@ -233,7 +378,7 @@ export class CodeIndexStateManager {
 	): void {
 		this._interruptionKind = interruptionKind
 		this._resumeContext = resumeContext
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate({ forceImmediate: true })
 		IndexDebugLogger.log("StateManager", "setRecoveryContext", {
 			interruptionKind,
 			resumeContext,
@@ -256,7 +401,7 @@ export class CodeIndexStateManager {
 		this._systemStatus = "Indexing"
 		this._statusMessage = `Checking ${totalFiles.toLocaleString()} files for changes...`
 
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate()
 		IndexDebugLogger.log("StateManager", "reportScanProgress", { scannedFiles, totalFiles })
 	}
 
@@ -317,7 +462,7 @@ export class CodeIndexStateManager {
 		const changedSuffix = changedFiles !== undefined ? ` from ${changedFiles.toLocaleString()} files` : ""
 		this._statusMessage = `${prefix}${totalBlocks.toLocaleString()} blocks to index${changedSuffix}`
 
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate()
 		IndexDebugLogger.log("StateManager", "startEmbedPhase", {
 			phaseTransition: true,
 			totalBlocks,
@@ -477,7 +622,7 @@ export class CodeIndexStateManager {
 		const detailLine = this._activityDetail ? `\n${this._activityDetail}` : ""
 		this._statusMessage = `${blockLine}${fileLine}${detailLine}`
 
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate({ forceImmediate: true })
 		IndexDebugLogger.log("StateManager", "reportEmbedProgress", {
 			blocksEmbedded,
 			revisedTotal,
@@ -516,13 +661,13 @@ export class CodeIndexStateManager {
 			this._statusMessage =
 				totalFiles > 0 ? `Index up-to-date — ${totalFiles.toLocaleString()} files` : "Index up-to-date"
 		}
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate({ forceImmediate: true })
 		IndexDebugLogger.log("StateManager", "reportComplete", { phaseTransition: true, totalBlocks, totalFiles })
 	}
 
 	public setResilienceStats(stats: Partial<IndexingResilienceStats>): void {
 		this.applyResilienceStats(stats)
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate({ forceImmediate: true })
 		IndexDebugLogger.log("StateManager", "setResilienceStats", {
 			...this._resilienceStats,
 		})
@@ -530,7 +675,7 @@ export class CodeIndexStateManager {
 
 	public setOversizedDetails(details: OversizedDetail[]): void {
 		this._oversizedDetails = details
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate({ forceImmediate: true })
 		IndexDebugLogger.log("StateManager", "setOversizedDetails", {
 			count: details.length,
 		})
@@ -589,7 +734,7 @@ export class CodeIndexStateManager {
 			this._totalFiles = totalItems
 		}
 
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate()
 		IndexDebugLogger.log("StateManager", "reportCustomProgress", {
 			message: message.substring(0, 120),
 			processedItems,
@@ -612,7 +757,7 @@ export class CodeIndexStateManager {
 		} else {
 			this._statusMessage = this.composeStatusMessage(this._statusMessage.split("\n")[0] ?? this._statusMessage)
 		}
-		this._progressEmitter.fire(this.getCurrentStatus())
+		this.emitProgressUpdate()
 		IndexDebugLogger.log("StateManager", "reportHeartbeat", {
 			message: this._statusMessage.substring(0, 120),
 			phase: this._phase,
@@ -626,13 +771,506 @@ export class CodeIndexStateManager {
 		this._activityDetail = detail
 		if (this._systemStatus === "Indexing") {
 			this._statusMessage = this.composeStatusMessage(this._statusMessage.split("\n")[0] ?? this._statusMessage)
-			this._progressEmitter.fire(this.getCurrentStatus())
+			this.emitProgressUpdate()
 		}
 		IndexDebugLogger.log("StateManager", "setActivityDetail", {
 			detail: detail.substring(0, 120),
 			phase: this._phase,
 			detailedStage: this._detailedStage,
 		})
+	}
+
+	private getPipelineSnapshotForStatus(): IndexingPipelineSnapshot | undefined {
+		if (this._activePipelineSnapshot) {
+			return this.decoratePipelineSnapshot({
+				...this._activePipelineSnapshot,
+				etaMs: this._activePipelineSnapshot.etaMs ?? this._estimatedTimeRemainingMs ?? null,
+				services: this.normalizePipelineServices(this._activePipelineSnapshot.services),
+			})
+		}
+
+		if (this._lastCompletedPipelineSnapshot) {
+			return this.decoratePipelineSnapshot({
+				...this._lastCompletedPipelineSnapshot,
+				preservedFromPreviousRun: true,
+				services: this.normalizePipelineServices(this._lastCompletedPipelineSnapshot.services),
+			})
+		}
+
+		return this.synthesizePipelineSnapshot()
+	}
+
+	private synthesizePipelineSnapshot(): IndexingPipelineSnapshot | undefined {
+		const shouldRenderPipeline =
+			this._systemStatus === "Indexing" ||
+			this._systemStatus === "Indexed" ||
+			(this._systemStatus === "Standby" &&
+				/^(?:V2 is current|Index up-to-date|Code Index V2 is ready to start)/.test(this._statusMessage))
+		if (!shouldRenderPipeline) {
+			return undefined
+		}
+
+		const activeStage = this._detailedStage
+		const stageOrder: IndexingServiceId[] = ["discovery", "file_checks", "parse", "plan", "embed", "cleanup"]
+		const activeServiceId: IndexingServiceId | undefined =
+			activeStage === "discovering"
+				? "discovery"
+				: activeStage === "hashing_initial" || activeStage === "comparing_signatures"
+					? "file_checks"
+					: activeStage === "parsing"
+						? "parse"
+						: activeStage === "planning_vectors"
+							? "plan"
+							: activeStage === "embedding"
+								? "embed"
+								: activeStage === "deleting_vectors"
+									? "cleanup"
+									: undefined
+		const activeIndex = activeServiceId ? stageOrder.indexOf(activeServiceId) : -1
+
+		const services: IndexingServiceSnapshot[] = stageOrder.map((serviceId, index) => {
+			const base = this.createDefaultServiceSnapshot(serviceId)
+			const isPast = activeIndex >= 0 && index < activeIndex
+			const isCurrent = serviceId === activeServiceId
+			const isAfter = activeIndex >= 0 && index > activeIndex
+			let state = base.state
+			if (this._systemStatus === "Indexed") {
+				state = "completed"
+			} else if (isCurrent) {
+				state = "running"
+			} else if (isPast) {
+				state = "completed"
+			} else if (isAfter) {
+				state = "pending"
+			}
+
+			if (serviceId === "embed" && this._systemStatus === "Indexing" && this._phase === "embedding") {
+				state = "running"
+			}
+
+			const summary =
+				serviceId === activeServiceId && this._statusMessage
+					? (this._statusMessage.split("\n")[0] ?? base.summary)
+					: state === "completed"
+						? "Completed"
+						: state === "pending"
+							? "Waiting to start"
+							: base.summary
+
+			return {
+				...base,
+				state,
+				health: (isCurrent ? "healthy" : state === "completed" ? "healthy" : "unknown") as IndexingHealthState,
+				summary,
+			}
+		})
+
+		return this.decoratePipelineSnapshot({
+			overallState:
+				this._systemStatus === "Indexed"
+					? "completed"
+					: this._systemStatus === "Error"
+						? "failed"
+						: this._systemStatus === "Stopping"
+							? "stopped"
+							: this._systemStatus === "Indexing"
+								? "running"
+								: "idle",
+			overallHealth:
+				this._systemStatus === "Error" ? "critical" : this._systemStatus === "Indexing" ? "healthy" : "unknown",
+			runMode: this._isBackgroundReconcile ? "reconcile" : "unknown",
+			etaMs: this._estimatedTimeRemainingMs,
+			services,
+			preservedFromPreviousRun: this._systemStatus !== "Indexing",
+		})
+	}
+
+	private createDefaultServiceSnapshot(serviceId: IndexingServiceId): IndexingServiceSnapshot {
+		return {
+			id: serviceId,
+			title: PIPELINE_SERVICE_TITLES[serviceId],
+			state: "pending",
+			health: "unknown",
+			summary: "Waiting to start",
+			progressPercent: null,
+			metrics: [],
+		}
+	}
+
+	private normalizePipelineServices(services: IndexingServiceSnapshot[]): IndexingServiceSnapshot[] {
+		const byId = new Map(services.map((service) => [service.id, service]))
+		const serviceOrder =
+			byId.has("embedding") || byId.has("vector_sync") || !byId.has("embed")
+				? PIPELINE_SERVICE_ORDER
+				: LEGACY_PIPELINE_SERVICE_ORDER
+		return serviceOrder.map((serviceId) => {
+			const current = byId.get(serviceId)
+			if (!current) {
+				return this.createDefaultServiceSnapshot(serviceId)
+			}
+			return {
+				...this.createDefaultServiceSnapshot(serviceId),
+				...current,
+				title: current.title || PIPELINE_SERVICE_TITLES[serviceId],
+				metrics: current.metrics ?? [],
+			}
+		})
+	}
+
+	private decoratePipelineSnapshot(snapshot: IndexingPipelineSnapshot): IndexingPipelineSnapshot {
+		const normalizedServices = this.normalizePipelineServices(snapshot.services)
+		const decoratedSnapshot: IndexingPipelineSnapshot = {
+			...snapshot,
+			services: normalizedServices,
+		}
+		decoratedSnapshot.summary = snapshot.summary ?? this.buildRunSummarySnapshot(decoratedSnapshot)
+		return decoratedSnapshot
+	}
+
+	private buildRunSummarySnapshot(snapshot: IndexingPipelineSnapshot): IndexingRunSummarySnapshot {
+		if (snapshot.overallState === "completed") {
+			return this.buildCompletedRunSummarySnapshot(snapshot)
+		}
+
+		if (snapshot.overallState === "failed") {
+			return {
+				headline: "Indexing failed",
+				secondaryLabel: "Review the service panels for the failing step.",
+				indeterminate: true,
+			}
+		}
+
+		if (snapshot.overallState === "stopped") {
+			return {
+				headline: "Indexing stopped",
+				secondaryLabel: "You can restart indexing at any time.",
+				indeterminate: true,
+			}
+		}
+
+		const primaryService = this.selectRunSummaryPrimaryService(snapshot.services)
+		if (!primaryService) {
+			return {
+				headline: this._systemStatus === "Indexing" ? "Preparing workspace index" : "Index ready",
+				secondaryLabel: this._systemStatus === "Indexing" ? "Initializing indexing services." : undefined,
+				indeterminate: true,
+			}
+		}
+
+		const progressLabel = this.buildRunSummaryProgressLabel(snapshot, primaryService)
+		const secondaryLabel =
+			this.getRunSummaryBlockingReason(snapshot, primaryService) ??
+			this.getRunSummaryOverlapNote(snapshot.services, primaryService) ??
+			this.getRunSummaryFallbackDetail(primaryService)
+
+		return {
+			primaryServiceId: primaryService.id,
+			headline: this.getRunSummaryHeadline(primaryService.id),
+			progressLabel,
+			secondaryLabel,
+			progressCurrent: primaryService.progressCurrent,
+			progressTotal: primaryService.progressTotal,
+			progressUnit: primaryService.progressUnit,
+			progressPercent: primaryService.progressPercent ?? null,
+			indeterminate: primaryService.indeterminate,
+		}
+	}
+
+	private buildCompletedRunSummarySnapshot(snapshot: IndexingPipelineSnapshot): IndexingRunSummarySnapshot {
+		const fileCount =
+			this.getPipelineServiceById(snapshot.services, "file_checks")?.progressTotal ??
+			this.getPipelineServiceById(snapshot.services, "discovery")?.progressTotal ??
+			0
+		const syncedChunks =
+			this.getPipelineServiceById(snapshot.services, "vector_sync")?.progressCurrent ??
+			this.getPipelineServiceById(snapshot.services, "embedding")?.progressCurrent ??
+			this.getPipelineServiceById(snapshot.services, "embed")?.progressCurrent ??
+			this.getPipelineServiceById(snapshot.services, "cleanup")?.progressCurrent ??
+			0
+		const progressParts: string[] = []
+		if (fileCount > 0) {
+			progressParts.push(`${fileCount.toLocaleString()} files`)
+		}
+		if (syncedChunks > 0) {
+			progressParts.push(`${syncedChunks.toLocaleString()} chunks synced`)
+		}
+		const warningCount = snapshot.services.filter(
+			(service) => service.state === "warning" || service.state === "failed",
+		).length
+
+		return {
+			primaryServiceId:
+				this.getPipelineServiceById(snapshot.services, "vector_sync")?.id ??
+				this.getPipelineServiceById(snapshot.services, "embedding")?.id ??
+				this.getPipelineServiceById(snapshot.services, "embed")?.id,
+			headline: snapshot.preservedFromPreviousRun ? "Index ready" : "Indexing complete",
+			progressLabel: progressParts.join(" • ") || "Last run available",
+			secondaryLabel:
+				warningCount > 0 ? "Completed with warnings. Review the service panels for details." : undefined,
+			progressPercent: 100,
+			indeterminate: false,
+		}
+	}
+
+	private selectRunSummaryPrimaryService(services: IndexingServiceSnapshot[]): IndexingServiceSnapshot | undefined {
+		for (const serviceId of RUN_SUMMARY_PRIMARY_SERVICE_ORDER) {
+			const service = this.getPipelineServiceById(services, serviceId)
+			if (!service) {
+				continue
+			}
+			if (service.state === "running" || service.state === "warning" || service.state === "failed") {
+				return service
+			}
+		}
+		return undefined
+	}
+
+	private getPipelineServiceById(
+		services: IndexingServiceSnapshot[],
+		serviceId: IndexingServiceId,
+	): IndexingServiceSnapshot | undefined {
+		return services.find((service) => service.id === serviceId)
+	}
+
+	private getRunSummaryHeadline(serviceId: IndexingServiceId): string {
+		switch (serviceId) {
+			case "discovery":
+				return "Discovering workspace files"
+			case "file_checks":
+				return "Checking for changed files"
+			case "parse":
+				return "Preparing changed files for indexing"
+			case "plan":
+				return "Preparing vector workload"
+			case "embedding":
+			case "vector_sync":
+			case "embed":
+				return "Building embeddings and syncing vectors"
+			case "cleanup":
+				return "Removing stale vectors"
+		}
+	}
+
+	private buildRunSummaryProgressLabel(
+		snapshot: IndexingPipelineSnapshot,
+		service: IndexingServiceSnapshot,
+	): string | undefined {
+		const current = service.progressCurrent ?? 0
+		const total = service.progressTotal ?? current
+		const vectorSyncService =
+			this.getPipelineServiceById(snapshot.services, "vector_sync") ??
+			this.getPipelineServiceById(snapshot.services, "embed")
+		const vectorSyncCurrent = vectorSyncService?.progressCurrent ?? current
+		const vectorSyncTotal = vectorSyncService?.progressTotal ?? total
+
+		switch (service.id) {
+			case "discovery":
+				return `Discovered ${Math.max(current, total, 0).toLocaleString()} files`
+			case "file_checks":
+				return `Checked ${current.toLocaleString()} of ${Math.max(total, current, 1).toLocaleString()} files`
+			case "parse":
+				return `Parsed ${current.toLocaleString()} of ${Math.max(total, current, 1).toLocaleString()} changed files`
+			case "plan":
+				return `Prepared ${current.toLocaleString()} of ${Math.max(total, current, 1).toLocaleString()} changed files`
+			case "embedding":
+			case "vector_sync":
+			case "embed":
+				return `Synced ${vectorSyncCurrent.toLocaleString()} of ${Math.max(
+					vectorSyncTotal,
+					vectorSyncCurrent,
+					1,
+				).toLocaleString()} chunks`
+			case "cleanup":
+				return `Removed ${current.toLocaleString()} of ${Math.max(total, current, 1).toLocaleString()} stale vectors`
+		}
+	}
+
+	private getRunSummaryBlockingReason(
+		snapshot: IndexingPipelineSnapshot,
+		primaryService: IndexingServiceSnapshot,
+	): string | undefined {
+		const planService = this.getPipelineServiceById(snapshot.services, "plan")
+		const candidateDetails = [primaryService.detail, planService?.detail]
+		for (const detail of candidateDetails) {
+			const humanized = this.humanizeRunSummaryBlockingReason(detail)
+			if (humanized) {
+				return humanized
+			}
+		}
+		return undefined
+	}
+
+	private humanizeRunSummaryBlockingReason(detail?: string): string | undefined {
+		if (!detail) {
+			return undefined
+		}
+		if (this.isHumanizedBlockingReason(detail)) {
+			return detail
+		}
+
+		const normalized = detail.trim()
+		switch (normalized) {
+			case "parse_throttled:parsed_revisions_waiting_for_planning":
+				return "Parsing is temporarily throttled while the planner catches up."
+			case "parsed_revisions_waiting_for_planning":
+				return "Planner is catching up before more parsed files are handed off."
+			case "staged_chunks_waiting_for_upsert":
+				return "Waiting for queued vector sync work to drain."
+			default:
+				if (/^[a-z0-9_:-]+$/i.test(normalized)) {
+					return `Waiting on ${normalized.replace(/^parse_throttled:/, "").replace(/[_:]+/g, " ")}.`
+				}
+				return undefined
+		}
+	}
+
+	private isHumanizedBlockingReason(detail?: string): boolean {
+		if (!detail) {
+			return false
+		}
+		const normalized = detail.toLowerCase()
+		return (
+			normalized.includes("temporarily throttled") ||
+			normalized.includes("planner catches up") ||
+			normalized.includes("planner is catching up") ||
+			normalized.includes("queued vector sync work") ||
+			normalized.startsWith("waiting on ")
+		)
+	}
+
+	private getRunSummaryOverlapNote(
+		services: IndexingServiceSnapshot[],
+		primaryService: IndexingServiceSnapshot,
+	): string | undefined {
+		const isActive = (serviceId: IndexingServiceId) => {
+			const service = this.getPipelineServiceById(services, serviceId)
+			return service?.state === "running" || service?.state === "warning" || service?.state === "failed"
+		}
+
+		if (primaryService.id === "embedding" || primaryService.id === "vector_sync" || primaryService.id === "embed") {
+			if (isActive("plan")) {
+				return "Also preparing queued chunks for sync."
+			}
+			if (isActive("parse")) {
+				return "Also parsing changed files in the background."
+			}
+		}
+
+		if (primaryService.id === "plan" && isActive("parse")) {
+			return "Also parsing changed files in the background."
+		}
+
+		return undefined
+	}
+
+	private getRunSummaryFallbackDetail(service: IndexingServiceSnapshot): string | undefined {
+		if (service.id === "discovery") {
+			const estimateMetric = service.metrics.find((metric) => metric.key === "estimate")
+			return estimateMetric ? `${estimateMetric.value} files estimated` : undefined
+		}
+		const blockingReason = this.humanizeRunSummaryBlockingReason(service.detail)
+		if (blockingReason) {
+			return blockingReason
+		}
+		if (service.detail && !/^[a-z0-9_:-]+$/i.test(service.detail.trim())) {
+			return service.detail
+		}
+		return undefined
+	}
+
+	private getPipelineOverallHealth(services: IndexingServiceSnapshot[]): IndexingHealthState {
+		if (services.some((service) => service.health === "critical" || service.state === "failed")) {
+			return "critical"
+		}
+		if (services.some((service) => service.health === "watch" || service.state === "warning")) {
+			return "watch"
+		}
+		if (services.some((service) => service.health === "healthy" || service.state === "running")) {
+			return "healthy"
+		}
+		return "unknown"
+	}
+
+	private getSemanticSignature() {
+		const pipeline = this.getPipelineSnapshotForStatus()
+		return JSON.stringify({
+			systemStatus: this._systemStatus,
+			phase: this._phase,
+			detailedStage: this._detailedStage,
+			isBackgroundReconcile: this._isBackgroundReconcile,
+			interruptionKind: this._interruptionKind,
+			resumeContext: this._resumeContext,
+			warnings: {
+				oversized: this._oversizedFiles,
+				retryingParse: this._resilienceStats.retryingParseRevisions,
+				terminalFailedParse: this._resilienceStats.terminalFailedParseRevisions,
+				degraded: this._resilienceStats.degradedRevisions,
+				failed: this._resilienceStats.terminalFailedRevisions,
+				failedChunks: this._resilienceStats.terminallyFailedChunks,
+			},
+			pipeline: pipeline && {
+				overallState: pipeline.overallState,
+				overallHealth: pipeline.overallHealth,
+				runMode: pipeline.runMode,
+				preservedFromPreviousRun: pipeline.preservedFromPreviousRun,
+				summary: pipeline.summary && {
+					primaryServiceId: pipeline.summary.primaryServiceId,
+					headline: pipeline.summary.headline,
+					progressLabel: pipeline.summary.progressLabel,
+					secondaryLabel: pipeline.summary.secondaryLabel,
+				},
+				services: pipeline.services.map((service) => ({
+					id: service.id,
+					state: service.state,
+					health: service.health,
+					issueCount: service.issueCount ?? 0,
+				})),
+			},
+		})
+	}
+
+	private getNumericUpdateThrottleMs() {
+		if (this._systemStatus === "Indexing" && !this._isBackgroundReconcile) {
+			return CodeIndexStateManager.FOREGROUND_NUMERIC_UPDATE_THROTTLE_MS
+		}
+		return CodeIndexStateManager.BACKGROUND_NUMERIC_UPDATE_THROTTLE_MS
+	}
+
+	private flushPendingProgressEmit() {
+		if (this._pendingProgressEmitTimer !== undefined) {
+			clearTimeout(this._pendingProgressEmitTimer)
+			this._pendingProgressEmitTimer = undefined
+		}
+		this._progressEmitter.fire(this.getCurrentStatus())
+		this._lastProgressEmitAt = Date.now()
+		this._lastSemanticSignature = this.getSemanticSignature()
+	}
+
+	private emitProgressUpdate(options?: { forceImmediate?: boolean }) {
+		const semanticSignature = this.getSemanticSignature()
+		const semanticChanged = semanticSignature !== this._lastSemanticSignature
+		const shouldForce = options?.forceImmediate || semanticChanged || this._systemStatus !== "Indexing"
+
+		if (shouldForce) {
+			this.flushPendingProgressEmit()
+			return
+		}
+
+		const throttleMs = this.getNumericUpdateThrottleMs()
+		const elapsedMs = Date.now() - this._lastProgressEmitAt
+		if (elapsedMs >= throttleMs) {
+			this.flushPendingProgressEmit()
+			return
+		}
+		if (this._pendingProgressEmitTimer !== undefined) {
+			return
+		}
+		this._pendingProgressEmitTimer = setTimeout(
+			() => {
+				this.flushPendingProgressEmit()
+			},
+			Math.max(0, throttleMs - elapsedMs),
+		)
 	}
 
 	private inferDetailedStage(phase?: IndexingPhase): IndexingDetailedStage | undefined {
@@ -930,7 +1568,7 @@ export class CodeIndexStateManager {
 
 			// Only fire update if status, message or progress actually changed
 			if (oldStatus !== this._systemStatus || oldMessage !== this._statusMessage || progressChanged) {
-				this._progressEmitter.fire(this.getCurrentStatus())
+				this.emitProgressUpdate()
 			}
 		}
 	}
@@ -963,12 +1601,16 @@ export class CodeIndexStateManager {
 			this._statusMessage = message
 
 			if (oldStatus !== this._systemStatus || oldMessage !== this._statusMessage || progressChanged) {
-				this._progressEmitter.fire(this.getCurrentStatus())
+				this.emitProgressUpdate()
 			}
 		}
 	}
 
 	public dispose(): void {
+		if (this._pendingProgressEmitTimer !== undefined) {
+			clearTimeout(this._pendingProgressEmitTimer)
+			this._pendingProgressEmitTimer = undefined
+		}
 		this._progressEmitter.dispose()
 	}
 }

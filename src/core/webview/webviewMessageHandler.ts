@@ -25,6 +25,8 @@ import {
 import { customToolRegistry } from "@roo-code/core"
 import { CloudService } from "@roo-code/cloud"
 import { TelemetryService } from "@roo-code/telemetry"
+import { IndexDebugLoggerV2 } from "../../services/code-index-v2"
+import { CODE_INDEX_V2_ENGINE_ID } from "../../services/code-index-v2/shared/constants"
 
 import { type ApiMessage } from "../task-persistence/apiMessages"
 import { saveTaskMessages } from "../task-persistence"
@@ -553,84 +555,104 @@ export const webviewMessageHandler = async (
 
 	switch (message.type) {
 		case "webviewDidLaunch":
+			if (provider.isViewLaunched) {
+				IndexDebugLoggerV2.log("basic", "WebviewProvider", "webview-did-launch-ignored-duplicate")
+				break
+			}
+			provider.isViewLaunched = true
+			IndexDebugLoggerV2.log("basic", "WebviewProvider", "webview-did-launch")
 			// Load custom modes first
 			const customModes = await provider.customModesManager.getCustomModes()
 			await updateGlobalState("customModes", customModes)
 
-			provider.postStateToWebview()
-			provider.workspaceTracker?.initializeFilePaths() // Don't await.
+			// Keep the very first launch path lean and avoid overlapping multiple
+			// expensive async state/build operations while the sidebar is booting.
+			// Task history is streamed separately after first paint.
+			await provider.postStateToWebviewWithoutTaskHistory()
+			provider.syncCurrentCodeIndexStatusToWebview()
 
-			getTheme().then((theme) => provider.postMessageToWebview({ type: "theme", text: JSON.stringify(theme) }))
+			setTimeout(() => {
+				void provider.workspaceTracker?.initializeFilePaths()
 
-			// If MCP Hub is already initialized, update the webview with
-			// current server list.
-			const mcpHub = provider.getMcpHub()
-
-			if (mcpHub) {
-				provider.postMessageToWebview({ type: "mcpServers", mcpServers: mcpHub.getAllServers() })
-			}
-
-			provider.providerSettingsManager
-				.listConfig()
-				.then(async (listApiConfig) => {
-					if (!listApiConfig) {
-						return
-					}
-
-					if (listApiConfig.length === 1) {
-						// Check if first time init then sync with exist config.
-						if (!checkExistKey(listApiConfig[0])) {
-							const { apiConfiguration } = await provider.getState()
-
-							// Only save if the current configuration has meaningful settings
-							// (e.g., API keys). This prevents saving a default "anthropic"
-							// fallback when no real config exists, which can happen during
-							// CLI initialization before provider settings are applied.
-							if (checkExistKey(apiConfiguration)) {
-								await provider.providerSettingsManager.saveConfig(
-									listApiConfig[0].name ?? "default",
-									apiConfiguration,
-								)
-
-								listApiConfig[0].apiProvider = apiConfiguration.apiProvider
-							}
-						}
-					}
-
-					const currentConfigName = getGlobalState("currentApiConfigName")
-
-					if (currentConfigName) {
-						if (!(await provider.providerSettingsManager.hasConfig(currentConfigName))) {
-							// Current config name not valid, get first config in list.
-							const name = listApiConfig[0]?.name
-							await updateGlobalState("currentApiConfigName", name)
-
-							if (name) {
-								await provider.activateProviderProfile({ name })
-								return
-							}
-						}
-					}
-
-					await Promise.all([
-						await updateGlobalState("listApiConfigMeta", listApiConfig),
-						await provider.postMessageToWebview({ type: "listApiConfig", listApiConfig }),
-					])
-				})
-				.catch((error) =>
-					provider.log(
-						`Error list api configuration: ${JSON.stringify(error, Object.getOwnPropertyNames(error), 2)}`,
-					),
+				void getTheme().then((theme) =>
+					provider.postMessageToWebview({ type: "theme", text: JSON.stringify(theme) }),
 				)
 
+				// If MCP Hub is already initialized, update the webview with
+				// current server list.
+				const mcpHub = provider.getMcpHub()
+				if (mcpHub) {
+					void provider.postMessageToWebview({ type: "mcpServers", mcpServers: mcpHub.getAllServers() })
+				}
+
+				void provider.providerSettingsManager
+					.listConfig()
+					.then(async (listApiConfig) => {
+						if (!listApiConfig) {
+							return
+						}
+
+						if (listApiConfig.length === 1) {
+							// Check if first time init then sync with exist config.
+							if (!checkExistKey(listApiConfig[0])) {
+								const { apiConfiguration } = await provider.getState()
+
+								// Only save if the current configuration has meaningful settings
+								// (e.g., API keys). This prevents saving a default "anthropic"
+								// fallback when no real config exists, which can happen during
+								// CLI initialization before provider settings are applied.
+								if (checkExistKey(apiConfiguration)) {
+									await provider.providerSettingsManager.saveConfig(
+										listApiConfig[0].name ?? "default",
+										apiConfiguration,
+									)
+
+									listApiConfig[0].apiProvider = apiConfiguration.apiProvider
+								}
+							}
+						}
+
+						const currentConfigName = getGlobalState("currentApiConfigName")
+
+						if (currentConfigName) {
+							if (!(await provider.providerSettingsManager.hasConfig(currentConfigName))) {
+								// Current config name not valid, get first config in list.
+								const name = listApiConfig[0]?.name
+								await updateGlobalState("currentApiConfigName", name)
+
+								if (name) {
+									await provider.activateProviderProfile({ name })
+									return
+								}
+							}
+						}
+
+						await Promise.all([
+							await updateGlobalState("listApiConfigMeta", listApiConfig),
+							await provider.postMessageToWebview({ type: "listApiConfig", listApiConfig }),
+						])
+					})
+					.catch((error) =>
+						provider.log(
+							`Error list api configuration: ${JSON.stringify(error, Object.getOwnPropertyNames(error), 2)}`,
+						),
+					)
+			}, 250)
+			setTimeout(() => {
+				void provider.broadcastTaskHistoryUpdate()
+			}, 1_000)
+
 			// Enable telemetry by default (when unset) or when explicitly enabled
-			provider.getStateToPostToWebview().then((state) => {
+			provider.getState().then((state) => {
 				const { telemetrySetting } = state
 				const isOptedIn = telemetrySetting !== "disabled"
 				TelemetryService.instance.updateTelemetryState(isOptedIn)
 			})
-
-			provider.isViewLaunched = true
+			break
+		case "webviewBootMarker":
+			IndexDebugLoggerV2.log("basic", "WebviewProvider", "webview-boot-marker", {
+				jobId: message.text,
+			})
 			break
 		case "newTask":
 			// Initializing new instance of Cline will make sure that any
@@ -2887,16 +2909,8 @@ export const webviewMessageHandler = async (
 				await startManager.setWorkspaceEnabled(true)
 
 				if (startManager.isFeatureEnabled && startManager.isFeatureConfigured) {
-					// initialize() handles service creation and will call startIndexing()
-					// internally when shouldStartOrRestartIndexing is true.
-					// We only need a single initialize() call, then check if we need
-					// an explicit startIndexing() for cases where initialize() didn't trigger it.
 					await startManager.initialize(provider.contextProxy)
-
-					const currentState = startManager.state
-					if (currentState === "Standby" || currentState === "Error") {
-						startManager.startIndexing()
-					}
+					await startManager.startIndexing()
 				}
 			} catch (error) {
 				provider.log(`Error starting indexing: ${error instanceof Error ? error.message : String(error)}`)
@@ -2946,7 +2960,15 @@ export const webviewMessageHandler = async (
 					provider.log("Cannot stop indexing: No workspace folder open")
 					return
 				}
+				IndexDebugLoggerV2.log("basic", "WebviewProvider", "stop-indexing-requested", {
+					component: "WebviewProvider",
+					workspacePath: provider.cwd ?? provider.workspaceTracker?.cwd ?? "",
+				})
 				await manager.stopIndexing()
+				IndexDebugLoggerV2.log("basic", "WebviewProvider", "stop-indexing-complete", {
+					component: "WebviewProvider",
+					workspacePath: provider.cwd ?? provider.workspaceTracker?.cwd ?? "",
+				})
 				provider.postMessageToWebview({
 					type: "indexingStatusUpdate",
 					values: manager.getCurrentStatus(),
@@ -2967,7 +2989,9 @@ export const webviewMessageHandler = async (
 				await toggleManager.setWorkspaceEnabled(enabled)
 				if (enabled && toggleManager.isFeatureEnabled && toggleManager.isFeatureConfigured) {
 					await toggleManager.initialize(provider.contextProxy)
-					toggleManager.startIndexing()
+					if (toggleManager.selectedEngine !== CODE_INDEX_V2_ENGINE_ID) {
+						toggleManager.startIndexing()
+					}
 				} else if (!enabled) {
 					await toggleManager.stopIndexing()
 				}
@@ -3003,7 +3027,9 @@ export const webviewMessageHandler = async (
 						await m.stopIndexing()
 					} else if (!wasEnabled && isNowEnabled && m.isFeatureEnabled && m.isFeatureConfigured) {
 						await m.initialize(provider.contextProxy)
-						m.startIndexing()
+						if (m.selectedEngine !== CODE_INDEX_V2_ENGINE_ID) {
+							m.startIndexing()
+						}
 					}
 				}
 				provider.postMessageToWebview({
@@ -3047,6 +3073,46 @@ export const webviewMessageHandler = async (
 					},
 				})
 			}
+			break
+		}
+		case "clearIndexDatabase": {
+			try {
+				const manager = provider.getCurrentWorkspaceCodeIndexManager()
+				if (!manager) {
+					provider.log("Cannot clear index database: No workspace folder open")
+					provider.postMessageToWebview({
+						type: "indexCleared",
+						values: {
+							success: false,
+							error: t("embeddings:orchestrator.indexingRequiresWorkspace"),
+						},
+					})
+					return
+				}
+				await (manager.clearIndexDatabase?.() ?? manager.clearIndexData())
+				provider.postMessageToWebview({ type: "indexCleared", values: { success: true } })
+				provider.postMessageToWebview({
+					type: "indexingStatusUpdate",
+					values: manager.getCurrentStatus(),
+				})
+			} catch (error) {
+				provider.log(`Error clearing index database: ${error instanceof Error ? error.message : String(error)}`)
+				provider.postMessageToWebview({
+					type: "indexCleared",
+					values: {
+						success: false,
+						error: error instanceof Error ? error.message : String(error),
+					},
+				})
+			}
+			break
+		}
+		case "codeIndexDebugLog": {
+			const values = message.values ?? {}
+			IndexDebugLoggerV2.log("basic", "WebviewStateBatching", values.event ?? "webview-debug-log", {
+				...values,
+				workspacePath: provider.cwd ?? provider.workspaceTracker?.cwd ?? "",
+			})
 			break
 		}
 		case "focusPanelRequest": {

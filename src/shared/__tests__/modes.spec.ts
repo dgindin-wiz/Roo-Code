@@ -5,13 +5,8 @@ import type { ModeConfig, PromptComponent } from "@roo-code/types"
 // Mock setup must come before imports
 vi.mock("vscode")
 
-vi.mock("../../core/prompts/sections/custom-instructions", () => ({
-	addCustomInstructions: vi.fn().mockResolvedValue("Combined instructions"),
-}))
-
-import { FileRestrictionError, getFullModeDetails, modes, getModeSelection } from "../modes"
+import { FileRestrictionError, modes, getModeSelection } from "../modes"
 import { isToolAllowedForMode } from "../../core/tools/validateToolUse"
-import { addCustomInstructions } from "../../core/prompts/sections/custom-instructions"
 
 describe("isToolAllowedForMode", () => {
 	const customModes: ModeConfig[] = [
@@ -618,81 +613,6 @@ describe("FileRestrictionError", () => {
 			expect(debugMode?.customInstructions).toContain(
 				"Reflect on 5-7 different possible sources of the problem, distill those down to 1-2 most likely sources, and then add logs to validate your assumptions. Explicitly ask the user to confirm the diagnosis before fixing the problem.",
 			)
-		})
-	})
-
-	describe("getFullModeDetails", () => {
-		beforeEach(() => {
-			vi.clearAllMocks()
-			vi.mocked(addCustomInstructions).mockResolvedValue("Combined instructions")
-		})
-
-		it("returns base mode when no overrides exist", async () => {
-			const result = await getFullModeDetails("debug")
-			expect(result).toMatchObject({
-				slug: "debug",
-				name: "🪲 Debug",
-				roleDefinition:
-					"You are Roo, an expert software debugger specializing in systematic problem diagnosis and resolution.",
-			})
-		})
-
-		it("applies custom mode overrides", async () => {
-			const customModes: ModeConfig[] = [
-				{
-					slug: "debug",
-					name: "Custom Debug",
-					roleDefinition: "Custom debug role",
-					groups: ["read"],
-				},
-			]
-
-			const result = await getFullModeDetails("debug", customModes)
-			expect(result).toMatchObject({
-				slug: "debug",
-				name: "Custom Debug",
-				roleDefinition: "Custom debug role",
-				groups: ["read"],
-			})
-		})
-
-		it("applies prompt component overrides", async () => {
-			const customModePrompts = {
-				debug: {
-					roleDefinition: "Overridden role",
-					customInstructions: "Overridden instructions",
-				},
-			}
-
-			const result = await getFullModeDetails("debug", undefined, customModePrompts)
-			expect(result.roleDefinition).toBe("Overridden role")
-			expect(result.customInstructions).toBe("Overridden instructions")
-		})
-
-		it("combines custom instructions when cwd provided", async () => {
-			const options = {
-				cwd: "/test/path",
-				globalCustomInstructions: "Global instructions",
-				language: "en",
-			}
-
-			await getFullModeDetails("debug", undefined, undefined, options)
-
-			expect(addCustomInstructions).toHaveBeenCalledWith(
-				expect.any(String),
-				"Global instructions",
-				"/test/path",
-				"debug",
-				{ language: "en" },
-			)
-		})
-
-		it("falls back to first mode for non-existent mode", async () => {
-			const result = await getFullModeDetails("non-existent")
-			expect(result).toMatchObject({
-				...modes[0],
-				// The first mode (architect) has its own customInstructions
-			})
 		})
 	})
 

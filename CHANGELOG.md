@@ -4,9 +4,11 @@
 
 ### Minor Changes
 
-- Improve Code Index V2 resilience with better retry/resume behavior, stronger parse/chunk/diff/embed pipeline coordination, and more reliable reconciliation and metadata tracking for long-running indexing work.
-- Improve indexing observability and UX with richer progress reporting, updated indexing status surfaces, and new code index settings for embedding throughput and concurrency tuning.
-- Harden parser and indexing behavior with broader test coverage, parser improvements, and supporting type and message updates across the extension and webview.
+- Stabilize Code Index V2 for long-running local indexing with stronger start/stop/recovery behavior, sidecar bootstrap fixes, safer revision planning, better retry handling, and tighter pipeline coordination across parse, planning, embedding, and cleanup.
+- Add persistent per-workspace indexing telemetry with rotated diagnostics logs, SQLite run summaries and samples, GPU-aware embed diagnostics, CLI reporting helpers, and backfill support so benchmark history survives normal index clears.
+- Redesign the indexing popover around service-oriented pipeline panels, a calmer host-driven run summary, clearer embedding versus vector sync visibility, default-loading lightweight webview boot flow, and new clear-database controls for destructive resets.
+- Improve local embed throughput tuning with richer utilization metrics, pressure reason tracking, adaptive Apple Silicon lane ramping under safe headroom, and updated code index settings for throughput and concurrency control.
+- Harden parser, worker, workspace-adapter, telemetry, and UI behavior with broader test coverage, locale path fixes for sidecars, and supporting type/message updates across the extension and webview.
 
 ## 3.51.1
 

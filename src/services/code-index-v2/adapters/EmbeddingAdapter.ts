@@ -1,3 +1,5 @@
+import type { EmbeddingResponse } from "../../code-index/interfaces/embedder"
+
 export interface EmbeddingAdapter {
 	readonly provider: string
 	readonly modelId: string
@@ -16,7 +18,7 @@ export interface EmbeddingAdapter {
 				outerBatchSize?: number
 			}
 		},
-	): Promise<{ embeddings: number[][] }>
+	): Promise<EmbeddingResponse>
 
 	recycleClient?(): Promise<void>
 }

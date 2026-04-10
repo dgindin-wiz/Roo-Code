@@ -16,6 +16,7 @@ async function main() {
 	const watch = process.argv.includes("--watch")
 	const minify = production
 	const sourcemap = true // Always generate source maps for error handling.
+	const buildTimestamp = new Date().toISOString()
 
 	/**
 	 * @type {import('esbuild').BuildOptions}
@@ -100,6 +101,9 @@ async function main() {
 		plugins,
 		entryPoints: ["extension.ts"],
 		outfile: "dist/extension.js",
+		define: {
+			"process.env.PKG_BUILD_TIMESTAMP": JSON.stringify(buildTimestamp),
+		},
 		// global-agent must be external because it dynamically patches Node.js http/https modules
 		// which breaks when bundled. It needs access to the actual Node.js module instances.
 		// undici must be bundled because our VSIX is packaged with `--no-dependencies`.
@@ -111,8 +115,16 @@ async function main() {
 	 */
 	const workerConfig = {
 		...buildOptions,
-		entryPoints: ["workers/countTokens.ts"],
+		entryPoints: [
+			"workers/countTokens.ts",
+			"workers/codeIndexV2EmbedUpsertSidecar.ts",
+			"workers/codeIndexV2ParseSidecarBootstrap.ts",
+			"workers/codeIndexV2ParseSidecar.ts",
+		],
 		outdir: "dist/workers",
+		define: {
+			"process.env.PKG_BUILD_TIMESTAMP": JSON.stringify(buildTimestamp),
+		},
 	}
 
 	const [extensionCtx, workerCtx] = await Promise.all([

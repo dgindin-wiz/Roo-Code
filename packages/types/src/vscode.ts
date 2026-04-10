@@ -43,6 +43,9 @@ export const commandIds = [
 	"setCustomStoragePath",
 	"importSettings",
 	"runCodeIndexEval",
+	"startCodeIndexing",
+	"stopCodeIndexing",
+	"forceStopCodeIndexing",
 
 	"focusInput",
 	"acceptInput",

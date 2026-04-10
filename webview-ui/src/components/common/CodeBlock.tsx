@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useCallback, useState } from "react"
 import styled from "styled-components"
 import { useCopyToClipboard } from "@src/utils/clipboard"
+import { vscode } from "@src/utils/vscode"
 import { getHighlighter, isLanguageLoaded, normalizeLanguage } from "@src/utils/highlighter"
 import type { ShikiTransformer } from "shiki"
 import { toJsxRuntime } from "hast-util-to-jsx-runtime"
@@ -38,6 +39,8 @@ interface CodeBlockProps {
 	collapsedHeight?: number
 	initialWindowShade?: boolean
 }
+
+let hasLoggedShikiInitialization = false
 
 const CodeBlockButton = styled.button`
 	background: transparent;
@@ -204,6 +207,14 @@ const CodeBlock = memo(
 			)
 
 			const highlight = async () => {
+				if (!hasLoggedShikiInitialization) {
+					hasLoggedShikiInitialization = true
+					vscode.postMessage({
+						type: "webviewBootMarker" as any,
+						text: "shiki-init-start",
+					})
+				}
+
 				// Show plain text if language needs to be loaded.
 				if (currentLanguage && !isLanguageLoaded(currentLanguage)) {
 					if (isMountedRef.current) {

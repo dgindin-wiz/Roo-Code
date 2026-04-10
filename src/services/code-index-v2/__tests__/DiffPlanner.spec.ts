@@ -98,4 +98,84 @@ describe("DiffPlanner", () => {
 		expect(summary.upsertJobs).toBe(2)
 		expect(summary.deleteJobs).toBe(1)
 	})
+
+	it("re-enqueues unchanged chunk fingerprints for a new revision", async () => {
+		const { metadataStore } = createDeps()
+		metadataStore.getRevisionsByState.mockResolvedValue([
+			{
+				revisionId: "revision-new",
+				fileId: "file-1",
+				runId: "run-1",
+			},
+		])
+		metadataStore.getDiffBaselineRevision.mockResolvedValue({
+			revisionId: "revision-old",
+			fileId: "file-1",
+			state: "committed",
+		})
+		metadataStore.getChunksForRevision.mockImplementation(async (revisionId: string) => {
+			if (revisionId === "revision-new") {
+				return [
+					{
+						chunkId: "chunk-same",
+						chunkFingerprint: "fp-same",
+						state: "parsed",
+						vectorPointId: null,
+					},
+					{
+						chunkId: "chunk-new",
+						chunkFingerprint: "fp-new",
+						state: "parsed",
+						vectorPointId: null,
+					},
+				]
+			}
+
+			return [
+				{
+					chunkId: "old-same",
+					chunkFingerprint: "fp-same",
+					state: "upserted",
+					vectorPointId: "point-same",
+				},
+				{
+					chunkId: "old-removed",
+					chunkFingerprint: "fp-removed",
+					state: "upserted",
+					vectorPointId: "point-removed",
+				},
+			]
+		})
+
+		const planner = new DiffPlanner(metadataStore as any)
+		const summary = await planner.run("run-1")
+
+		expect(metadataStore.enqueueJobs).toHaveBeenCalledTimes(2)
+		expect(metadataStore.enqueueJobs).toHaveBeenNthCalledWith(1, [
+			{
+				workspaceId: "workspace-1",
+				runId: "run-1",
+				jobType: "upsert",
+				entityId: "chunk-same",
+			},
+			{
+				workspaceId: "workspace-1",
+				runId: "run-1",
+				jobType: "upsert",
+				entityId: "chunk-new",
+			},
+		])
+		expect(metadataStore.enqueueJobs).toHaveBeenNthCalledWith(2, [
+			{
+				workspaceId: "workspace-1",
+				runId: "run-1",
+				jobType: "delete",
+				entityId: "old-removed",
+			},
+		])
+		expect(metadataStore.markRevisionState).toHaveBeenCalledWith("revision-new", "planned")
+		expect(summary.plannedRevisions).toBe(1)
+		expect(summary.upsertJobs).toBe(2)
+		expect(summary.deleteJobs).toBe(1)
+	})
 })

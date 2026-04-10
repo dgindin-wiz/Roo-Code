@@ -35,12 +35,35 @@ function formatCountLabel(count: number, singular: string, plural: string): stri
 	return `${count.toLocaleString()} ${count === 1 ? singular : plural}`
 }
 
+function formatPipelineSummaryTooltipText(
+	summary: NonNullable<NonNullable<IndexingStatus["pipeline"]>["summary"]>,
+	etaMs?: number | null,
+): string {
+	const parts = [
+		summary.headline,
+		summary.progressLabel,
+		summary.secondaryLabel,
+		etaMs != null ? formatEtaForDisplay(etaMs) : null,
+	].filter((part): part is string => Boolean(part))
+
+	return parts.join(" — ")
+}
+
 export function getIndexingBadgeTooltipText(
 	indexingStatus: IndexingStatus,
 	isCurrentStandby: boolean,
 	t: (key: string, params?: any) => string,
 	progressPercentage: number,
 ): string {
+	const pipeline = indexingStatus.pipeline
+	const pipelineSummary = pipeline?.summary
+	const runningServices =
+		pipeline?.services
+			.filter((service) => service.state === "running")
+			.map((service) => service.title)
+			.join(", ") ?? ""
+	const pipelineHealthText =
+		pipeline?.overallHealth && pipeline.overallHealth !== "unknown" ? ` — health ${pipeline.overallHealth}` : ""
 	const extraParts: string[] = []
 	if ((indexingStatus.resumedPendingJobs ?? 0) > 0) {
 		extraParts.push(
@@ -66,10 +89,30 @@ export function getIndexingBadgeTooltipText(
 
 	switch (indexingStatus.systemStatus) {
 		case "Standby":
+			if (pipeline?.preservedFromPreviousRun && pipelineSummary) {
+				return `${formatPipelineSummaryTooltipText(pipelineSummary, pipeline.etaMs)}${extraText}`
+			}
+			if (pipeline?.preservedFromPreviousRun) {
+				const completedServices =
+					pipeline.services
+						.filter((service) => service.state === "completed" || service.state === "warning")
+						.map((service) => service.title)
+						.join(", ") || "last run"
+				return `Last run available — ${completedServices}${extraText}`
+			}
 			return isCurrentStandby
 				? `Index ready — watching for changes${extraText}`
 				: `${t("chat:indexingStatus.ready")}${extraText}`
 		case "Indexing": {
+			if (pipelineSummary) {
+				return `${formatPipelineSummaryTooltipText(
+					pipelineSummary,
+					indexingStatus.estimatedTimeRemainingMs ?? pipeline?.etaMs ?? null,
+				)}${extraText}`
+			}
+			if (pipeline && runningServices) {
+				return `Indexing — ${runningServices}${pipelineHealthText}${extraText}`
+			}
 			const etaText =
 				indexingStatus.estimatedTimeRemainingMs != null
 					? ` — ${formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)}`
@@ -131,12 +174,21 @@ export function getIndexingBadgeTooltipText(
 			}
 		}
 		case "Indexed":
+			if (pipelineSummary) {
+				return `${formatPipelineSummaryTooltipText(pipelineSummary, pipeline?.etaMs)}${extraText}`
+			}
 			return isCurrentStandby
 				? `Index ready — watching for changes${extraText}`
 				: `${t("chat:indexingStatus.indexed")}${extraText}`
 		case "Stopping":
+			if (pipelineSummary) {
+				return `${formatPipelineSummaryTooltipText(pipelineSummary, pipeline?.etaMs)}${extraText}`
+			}
 			return t("chat:indexingStatus.stopping")
 		case "Error":
+			if (pipelineSummary) {
+				return `${formatPipelineSummaryTooltipText(pipelineSummary, pipeline?.etaMs)}${extraText}`
+			}
 			return `${t("chat:indexingStatus.error")}${extraText}`
 		default:
 			return `${t("chat:indexingStatus.status")}${extraText}`
