@@ -2,6 +2,7 @@ import { createHash } from "crypto"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { MetadataStore } from "../store/MetadataStore"
 import { WorkspaceAdapter } from "../adapters/WorkspaceAdapter"
+import { CODE_INDEX_V2_CHUNKER_VERSION, CODE_INDEX_V2_PARSER_VERSION } from "../shared/chunkSurfaces"
 
 export interface OversizedFileDetail {
 	relativePath: string
@@ -59,8 +60,8 @@ export function describeOversizedFile(
 }
 
 export class StatHashService {
-	private static readonly PARSER_VERSION = "v2-placeholder"
-	private static readonly CHUNKER_VERSION = "v2-placeholder"
+	private static readonly PARSER_VERSION = CODE_INDEX_V2_PARSER_VERSION
+	private static readonly CHUNKER_VERSION = CODE_INDEX_V2_CHUNKER_VERSION
 
 	constructor(
 		private readonly metadataStore: MetadataStore,
@@ -139,6 +140,10 @@ export class StatHashService {
 			if (
 				!options?.forceReindex &&
 				file.latestRevisionState === "committed" &&
+				this.hasCurrentRetrievalSurfaceVersion(
+					file.latestRevisionParserVersion,
+					file.latestRevisionChunkerVersion,
+				) &&
 				file.latestRevisionFastFingerprint === fastFingerprint &&
 				file.latestRevisionContentHash
 			) {
@@ -189,6 +194,10 @@ export class StatHashService {
 			if (
 				!options?.forceReindex &&
 				file.latestRevisionState === "committed" &&
+				this.hasCurrentRetrievalSurfaceVersion(
+					file.latestRevisionParserVersion,
+					file.latestRevisionChunkerVersion,
+				) &&
 				file.latestRevisionContentHash === contentHash
 			) {
 				skippedFiles++
@@ -211,6 +220,8 @@ export class StatHashService {
 					file.fileId,
 					contentHash,
 					fastFingerprint,
+					StatHashService.PARSER_VERSION,
+					StatHashService.CHUNKER_VERSION,
 				)
 				if (reusableRevision) {
 					await this.metadataStore.adoptRevisionToRun(reusableRevision.revisionId, runId)
@@ -340,6 +351,13 @@ export class StatHashService {
 		approvedMaxBytes?: number,
 	): OversizedFileDetail {
 		return describeOversizedFile(relativePath, sizeBytes, approvedMaxBytes)
+	}
+
+	private hasCurrentRetrievalSurfaceVersion(
+		parserVersion: string | null | undefined,
+		chunkerVersion: string | null | undefined,
+	): boolean {
+		return parserVersion === StatHashService.PARSER_VERSION && chunkerVersion === StatHashService.CHUNKER_VERSION
 	}
 
 	private isMissingFileError(error: unknown): boolean {

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { MAX_FILE_SIZE_BYTES } from "../../code-index/constants"
 import { StatHashService } from "../pipeline/StatHashService"
+import { CODE_INDEX_V2_CHUNKER_VERSION, CODE_INDEX_V2_PARSER_VERSION } from "../shared/chunkSurfaces"
 
 describe("StatHashService", () => {
 	const createDeps = () => {
@@ -30,12 +31,15 @@ describe("StatHashService", () => {
 		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue([
 			{
 				fileId: "file-1",
+				relativePath: "src/example.ts",
 				normalizedPath: "/workspace/src/example.ts",
 				lastSeenSize: 10,
 				lastSeenMtimeMs: 20,
 				latestRevisionState: null,
 				latestRevisionFastFingerprint: null,
 				latestRevisionContentHash: null,
+				latestRevisionParserVersion: null,
+				latestRevisionChunkerVersion: null,
 			},
 		])
 		workspaceAdapter.readFile.mockResolvedValue("const resumed = true")
@@ -53,6 +57,77 @@ describe("StatHashService", () => {
 		expect(summary.unchangedFiles).toBe(0)
 		expect(summary.oversizedFiles).toBe(0)
 		expect(summary.missingFiles).toBe(0)
+	})
+
+	it("does not treat matching committed revisions as unchanged when retrieval surface versions differ", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue([
+			{
+				fileId: "file-1",
+				relativePath: "src/example.ts",
+				normalizedPath: "/workspace/src/example.ts",
+				lastSeenSize: 21,
+				lastSeenMtimeMs: 42,
+				latestRevisionState: "committed",
+				latestRevisionFastFingerprint: "21:42",
+				latestRevisionContentHash: "content-hash-1",
+				latestRevisionParserVersion: "code-index-v2:older-surfaces",
+				latestRevisionChunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+			},
+		])
+		workspaceAdapter.readFile.mockResolvedValue("const example = true")
+		metadataStore.findReusableRevision.mockResolvedValue(undefined)
+
+		const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+		const summary = await service.run("run-1")
+
+		expect(workspaceAdapter.readFile).toHaveBeenCalledWith("/workspace/src/example.ts")
+		expect(metadataStore.createFileRevision).toHaveBeenCalledWith(
+			expect.objectContaining({
+				fileId: "file-1",
+				parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+				chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+				state: "hashed",
+			}),
+		)
+		expect(summary.changedFiles).toBe(1)
+		expect(summary.unchangedFiles).toBe(0)
+	})
+
+	it("only reuses parsed revisions that match the current retrieval surface version", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue([
+			{
+				fileId: "file-1",
+				relativePath: "src/example.ts",
+				normalizedPath: "/workspace/src/example.ts",
+				lastSeenSize: 10,
+				lastSeenMtimeMs: 20,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+				latestRevisionParserVersion: null,
+				latestRevisionChunkerVersion: null,
+			},
+		])
+		workspaceAdapter.readFile.mockResolvedValue("const resumed = true")
+		metadataStore.findReusableRevision.mockResolvedValue({
+			revisionId: "revision-stale",
+			state: "parsed",
+		})
+
+		const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+		const summary = await service.run("run-1")
+
+		expect(metadataStore.findReusableRevision).toHaveBeenCalledWith(
+			"file-1",
+			expect.any(String),
+			"10:20",
+			CODE_INDEX_V2_PARSER_VERSION,
+			CODE_INDEX_V2_CHUNKER_VERSION,
+		)
+		expect(metadataStore.adoptRevisionToRun).toHaveBeenCalledWith("revision-stale", "run-1")
+		expect(summary.reusedParsedRevisionIds).toEqual(["revision-stale"])
 	})
 
 	it("skips missing files without crashing the run", async () => {

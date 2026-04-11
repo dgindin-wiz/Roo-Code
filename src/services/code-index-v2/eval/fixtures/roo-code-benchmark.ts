@@ -85,6 +85,20 @@ export const rooCodeBenchmarkFixtures: RetrievalEvalFixture[] = [
 		notes: "Manager entrypoint for non-destructive full refresh.",
 	},
 	{
+		id: "full-refresh-manager-identifier-expansion",
+		query: "refresh_all_index_data manager",
+		expectedPaths: ["src/services/code-index/manager.ts"],
+		expectedSymbols: ["refreshAllIndexData"],
+		notes: "Snake_case identifier expansion for the manager full-refresh entrypoint.",
+	},
+	{
+		id: "full-refresh-manager-natural-language",
+		query: "how do we refresh all indexed files without clearing the index first",
+		expectedPaths: ["src/services/code-index/manager.ts"],
+		expectedSymbols: ["refreshAllIndexData"],
+		notes: "Natural-language retrieval for the non-destructive full-refresh behavior.",
+	},
+	{
 		id: "preflight-timeout",
 		query: "Qdrant verification timed out after 10s preflight",
 		expectedPaths: ["src/services/code-index-v2/engine/CodeIndexEngineV2.ts"],

@@ -68,6 +68,9 @@ const mocks = vi.hoisted(() => {
 		markRunFailed: vi.fn().mockResolvedValue(undefined),
 		markRunStopped: vi.fn().mockResolvedValue(undefined),
 		clearStorage: vi.fn().mockResolvedValue(undefined),
+		getDiagnosticsDirectoryPath: vi
+			.fn()
+			.mockReturnValue("/global-storage/code-index-v2/persistent/workspace-1/diagnostics"),
 	}
 
 	const workspaceAdapter = {
@@ -328,6 +331,7 @@ vi.mock("../adapters/QdrantRestVectorStoreAdapter", () => ({
 
 vi.mock("../logging/IndexDebugLoggerV2", () => ({
 	IndexDebugLoggerV2: {
+		configureDiagnosticsDirectory: vi.fn(),
 		setContext: vi.fn(),
 		log: vi.fn(),
 		getMemorySnapshot: vi.fn(() => ({
@@ -502,6 +506,15 @@ describe("CodeIndexEngineV2 smoke", () => {
 
 		await engine.start()
 
+		const configureDiagnosticsDirectory = vi.mocked(IndexDebugLoggerV2.configureDiagnosticsDirectory)
+		const setContext = vi.mocked(IndexDebugLoggerV2.setContext)
+
+		expect(configureDiagnosticsDirectory).toHaveBeenCalledWith(
+			"/global-storage/code-index-v2/persistent/workspace-1/diagnostics",
+		)
+		expect(configureDiagnosticsDirectory.mock.invocationCallOrder[0]).toBeLessThan(
+			setContext.mock.invocationCallOrder[0],
+		)
 		expect(mocks.metadataStore.initialize).toHaveBeenCalledTimes(1)
 		expect(mocks.metadataStore.cleanupStaleRuns).toHaveBeenCalledTimes(1)
 		expect(mocks.metadataStore.adoptRetryableJobsFromStaleRuns).toHaveBeenCalledWith("run-1", [])
@@ -1000,6 +1013,79 @@ describe("CodeIndexEngineV2 smoke", () => {
 			20,
 			expect.any(Object),
 		)
+	})
+
+	it("expands identifier-style queries for lexical retrieval without changing the grounding result", async () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		await engine.search("refreshAllIndexData", 5)
+
+		expect(mocks.metadataStore.searchActiveChunksLexicallyWithStatus).toHaveBeenCalledWith(
+			expect.stringContaining("refresh_all_index_data"),
+			20,
+			expect.objectContaining({
+				allowExactFallback: true,
+			}),
+		)
+		expect(mocks.metadataStore.searchActiveChunksLexicallyWithStatus).toHaveBeenCalledWith(
+			expect.stringContaining("refresh all index data"),
+			20,
+			expect.any(Object),
+		)
+	})
+
+	it("filters vector and lexical candidates by directory prefix before reranking", async () => {
+		mocks.vectorStore.search.mockResolvedValueOnce([
+			{
+				id: "point-auth",
+				score: 0.81,
+				payload: {
+					filePath: "src/auth/validate.ts",
+					chunkFingerprint: "auth-fp",
+					codeChunk: "export function validateToken() {}",
+					startLine: 1,
+					endLine: 3,
+					symbolName: "validateToken",
+					symbolQualifiedName: "Auth.validateToken",
+				},
+			},
+			{
+				id: "point-other",
+				score: 0.95,
+				payload: {
+					filePath: "src/other.ts",
+					chunkFingerprint: "other-fp",
+					codeChunk: "export const validateToken = true",
+					startLine: 1,
+					endLine: 1,
+				},
+			},
+		])
+		mocks.metadataStore.searchActiveChunksLexicallyWithStatus.mockResolvedValueOnce({
+			results: [],
+			status: "completed",
+			mode: "fts_plus_exact_fallback",
+			timingsMs: {
+				ftsMs: 1,
+				fallbackMs: 0,
+				totalMs: 1,
+			},
+		})
+
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		const results = await engine.search("validateToken", 2, { directoryPrefix: "src/auth" })
+
+		expect(mocks.vectorStore.search).toHaveBeenCalledWith([0.1, 0.2, 0.3], 60, 0.4)
+		expect(mocks.metadataStore.searchActiveChunksLexicallyWithStatus).toHaveBeenCalledWith(
+			expect.any(String),
+			60,
+			expect.any(Object),
+		)
+		expect(results).toHaveLength(1)
+		expect(results[0].payload?.filePath).toBe("src/auth/validate.ts")
 	})
 
 	it("parses query intent once and threads it through search", async () => {

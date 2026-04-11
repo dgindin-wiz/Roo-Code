@@ -10,6 +10,7 @@ interface ParseExecutor {
 		runId: string
 		revisionId: string
 		normalizedPath: string
+		relativePath: string
 		maxFileSizeBytes?: number
 		laneId?: number
 		signal?: AbortSignal
@@ -164,6 +165,7 @@ export class ParseChunkService {
 								runId: revision.runId,
 								revisionId: revision.revisionId,
 								normalizedPath: revision.normalizedPath,
+								relativePath: revision.relativePath,
 								maxFileSizeBytes,
 								laneId,
 								signal,
@@ -173,6 +175,7 @@ export class ParseChunkService {
 							const content = await this.workspaceAdapter.readFile(revision.normalizedPath)
 							return this.parserAdapter.parseFile({
 								filePath: revision.normalizedPath,
+								relativePath: revision.relativePath,
 								content,
 								maxFileSizeBytes,
 							})

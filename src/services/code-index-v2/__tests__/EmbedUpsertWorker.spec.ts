@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { EmbedUpsertWorker } from "../pipeline/EmbedUpsertWorker"
 import { MacGpuTelemetrySampler } from "../telemetry"
+import { buildRawCodeVariantContent } from "../shared/chunkSurfaces"
 
 const mockConfigValues: Record<string, unknown> = {
 	"codeIndex.embeddingBatchSize": 2,
@@ -230,7 +231,17 @@ describe("EmbedUpsertWorker", () => {
 				variantId: "variant-raw",
 				chunkId: "chunk-1",
 				variantType: "raw_code",
-				content: chunk.searchText,
+				content: buildRawCodeVariantContent({
+					relativePath: chunk.relativePath,
+					content: chunk.content,
+					language: chunk.language,
+					chunkKind: chunk.chunkKind,
+					symbolName: chunk.symbolName,
+					symbolQualifiedName: chunk.symbolQualifiedName,
+					parentSymbolName: chunk.parentSymbolName,
+					startLine: chunk.startLine,
+					endLine: chunk.endLine,
+				}),
 				contentHash: "hash-raw",
 				tokenEstimate: 20,
 				embeddingModel: null,
@@ -264,7 +275,17 @@ describe("EmbedUpsertWorker", () => {
 
 		expect(embeddingAdapter.createEmbeddings).toHaveBeenCalledWith(
 			[
-				"Path: src/auth.ts\nSymbol: validateToken\nParent: Auth\n\nexport function validateToken(token: string) { return token.length > 0 }",
+				buildRawCodeVariantContent({
+					relativePath: chunk.relativePath,
+					content: chunk.content,
+					language: chunk.language,
+					chunkKind: chunk.chunkKind,
+					symbolName: chunk.symbolName,
+					symbolQualifiedName: chunk.symbolQualifiedName,
+					parentSymbolName: chunk.parentSymbolName,
+					startLine: chunk.startLine,
+					endLine: chunk.endLine,
+				}),
 			],
 			expect.any(Object),
 		)
@@ -403,7 +424,7 @@ describe("EmbedUpsertWorker", () => {
 			if (texts.length === 2) {
 				throw new Error("batch failed")
 			}
-			if (texts[0] === "bad") {
+			if (texts[0]?.includes("\nbad")) {
 				throw new Error("bad chunk")
 			}
 			return { embeddings: [[0.4, 0.5, 0.6]] }
@@ -532,7 +553,7 @@ describe("EmbedUpsertWorker", () => {
 			if (texts.length === 2) {
 				throw new Error("batch failed")
 			}
-			if (texts[0] === "bad") {
+			if (texts[0]?.includes("\nbad")) {
 				throw new Error("bad chunk")
 			}
 			return { embeddings: [[0.7, 0.8, 0.9]] }

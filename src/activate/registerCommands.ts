@@ -122,7 +122,7 @@ export async function runCodeIndexEvalForCurrentWorkspace({
 			refreshAll: async () => {},
 			stop: async () => {},
 			clear: async () => {},
-			search: (query, limit) => manager.searchIndex(query, limit),
+			search: (query, limit) => manager.searchIndex(query, { limit }),
 			searchDebug: async (query, limit) => {
 				const trace = await manager.searchIndexDebug(query, limit)
 				if (!trace) {

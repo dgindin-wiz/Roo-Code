@@ -406,6 +406,7 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 				loadConfiguration: vi.fn().mockResolvedValue({ requiresRestart: false }),
 				isFeatureConfigured: true,
 				isFeatureEnabled: true,
+				currentSearchMaxResults: 50,
 			}
 			;(manager as any)._configManager = mockConfigManager
 			mockStateManager = (manager as any)._stateManager
@@ -455,7 +456,9 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 
 			expect(mockCodeIndexEngineV2.start).toHaveBeenCalledTimes(1)
 			expect(mockStateManager.setSystemState).toHaveBeenCalledWith("Standby", "V2 updated")
-			expect(mockCodeIndexEngineV2.search).toHaveBeenCalledWith("find value", 50)
+			expect(mockCodeIndexEngineV2.search).toHaveBeenCalledWith("find value", 50, {
+				directoryPrefix: undefined,
+			})
 			expect(results).toHaveLength(1)
 			expect(mockCodeIndexEngineV2.clear).toHaveBeenCalledTimes(1)
 		})

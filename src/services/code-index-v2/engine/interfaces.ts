@@ -45,7 +45,7 @@ export interface ICodeIndexEngine {
 	stop(): Promise<void>
 	clear(): Promise<void>
 	clearDatabase?(): Promise<void>
-	search(query: string, limit: number): Promise<VectorStoreSearchResult[]>
+	search(query: string, limit: number, options?: { directoryPrefix?: string }): Promise<VectorStoreSearchResult[]>
 	searchDebug?(query: string, limit: number): Promise<CodeIndexDebugSearchTrace>
 	enqueuePathsChanged(paths: string[], reason: "watcher" | "manual" | "reconcile"): Promise<void>
 	getStatus(): Promise<CodeIndexStatus>

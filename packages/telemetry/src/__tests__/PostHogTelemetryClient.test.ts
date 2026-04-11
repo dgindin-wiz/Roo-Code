@@ -2,23 +2,36 @@
 
 // pnpm --filter @roo-code/telemetry test src/__tests__/PostHogTelemetryClient.test.ts
 
-import * as vscode from "vscode"
 import { PostHog } from "posthog-node"
 
 import { type TelemetryPropertiesProvider, TelemetryEventName, ApiProviderError } from "@roo-code/types"
 
+const mocks = vi.hoisted(() => ({
+	vscode: {
+		env: {
+			machineId: "test-machine-id",
+		},
+		workspace: {
+			getConfiguration: vi.fn(),
+		},
+	},
+}))
+
+vi.mock("node:module", async () => {
+	const actual = await vi.importActual<typeof import("node:module")>("node:module")
+
+	return {
+		...actual,
+		createRequire: vi.fn(() => ((id: string) => (id === "vscode" ? mocks.vscode : undefined)) as NodeJS.Require),
+	}
+})
+
+import * as vscode from "vscode"
 import { PostHogTelemetryClient } from "../PostHogTelemetryClient"
 
 vi.mock("posthog-node")
 
-vi.mock("vscode", () => ({
-	env: {
-		machineId: "test-machine-id",
-	},
-	workspace: {
-		getConfiguration: vi.fn(),
-	},
-}))
+vi.mock("vscode", () => mocks.vscode)
 
 describe("PostHogTelemetryClient", () => {
 	const getPrivateProperty = <T>(instance: any, propertyName: string): T => {

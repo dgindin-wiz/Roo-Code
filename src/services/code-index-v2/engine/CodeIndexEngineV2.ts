@@ -45,6 +45,7 @@ import { CodeIndexV2GpuSnapshot } from "../logging/log-types"
 type QueryIntent = {
 	pathHints: string[]
 	symbolHints: string[]
+	lexicalExpansionTerms: string[]
 	looksLikeNaturalLanguage: boolean
 	looksLikeCodeQuestion: boolean
 	looksLikeImplementationQuery: boolean
@@ -167,6 +168,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			message: "Warming up the V2 index engine",
 		}
 
+		// Point the logger at the workspace-scoped diagnostics file before the
+		// first session-start write so early startup events do not land in the
+		// home-directory fallback log.
+		IndexDebugLoggerV2.configureDiagnosticsDirectory(this.metadataStore.getDiagnosticsDirectoryPath())
 		IndexDebugLoggerV2.setContext({
 			engine: this.engine,
 			component: "CodeIndexEngineV2",
@@ -408,8 +413,12 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		})
 	}
 
-	async search(query: string, limit: number): Promise<VectorStoreSearchResult[]> {
-		const trace = await this.buildSearchTrace(query, limit)
+	async search(
+		query: string,
+		limit: number,
+		options?: { directoryPrefix?: string },
+	): Promise<VectorStoreSearchResult[]> {
+		const trace = await this.buildSearchTrace(query, limit, options)
 		return trace.stages.final
 	}
 
@@ -417,7 +426,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return this.buildSearchTrace(query, limit)
 	}
 
-	private async buildSearchTrace(query: string, limit: number): Promise<CodeIndexDebugSearchTrace> {
+	private async buildSearchTrace(
+		query: string,
+		limit: number,
+		options?: { directoryPrefix?: string },
+	): Promise<CodeIndexDebugSearchTrace> {
 		const traceStartedAt = Date.now()
 		const { embeddingAdapter, vectorStore } = this.getOrCreateSearchDependencies()
 		await vectorStore.initialize()
@@ -425,9 +438,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		const embeddingResponse = await embeddingAdapter.createEmbeddings([query], { isQuery: true })
 		const queryEmbeddingMs = Date.now() - embeddingStartedAt
 		const vector = embeddingResponse.embeddings[0]
-		const candidateLimit = Math.max(limit * 3, 20)
+		const normalizedDirectoryPrefix = this.normalizeDirectoryPrefix(options?.directoryPrefix)
+		const candidateLimit = this.computeSearchCandidateLimit(limit, normalizedDirectoryPrefix)
 		const queryTokens = this.tokenizeSearchText(query)
 		const queryIntent = this.parseQueryIntent(query)
+		const lexicalQuery = this.buildExpandedLexicalQuery(query, queryIntent)
 
 		const vectorStartedAt = Date.now()
 		const vectorResults = vector
@@ -441,9 +456,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			lexicalFallbackMs,
 			lexicalRetrievalMs,
 			lexicalStatus,
-		} = await this.runLexicalSearch(query, candidateLimit, lexicalMode)
+		} = await this.runLexicalSearch(lexicalQuery, candidateLimit, lexicalMode)
+		const scopedVectorResults = this.filterResultsByDirectoryPrefix(vectorResults, normalizedDirectoryPrefix)
+		const scopedLexicalResults = this.filterResultsByDirectoryPrefix(lexicalResults, normalizedDirectoryPrefix)
 		const mergeStartedAt = Date.now()
-		const mergedResults = this.mergeSearchCandidates(queryIntent, vectorResults, lexicalResults)
+		const mergedResults = this.mergeSearchCandidates(queryIntent, scopedVectorResults, scopedLexicalResults)
 		const mergeMs = Date.now() - mergeStartedAt
 		const rerankStartedAt = Date.now()
 		const rerankedResults = this.rerankSearchResults(query, queryIntent, mergedResults)
@@ -471,8 +488,8 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				totalMs,
 			},
 			stages: {
-				vector: [...vectorResults],
-				lexical: [...lexicalResults],
+				vector: [...scopedVectorResults],
+				lexical: [...scopedLexicalResults],
 				merged: [...mergedResults],
 				final: [...finalResults],
 			},
@@ -545,6 +562,14 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 
 		return queryTokens.length <= 2 ? "fts_plus_exact_fallback" : "fts_only"
+	}
+
+	private computeSearchCandidateLimit(limit: number, directoryPrefix?: string): number {
+		if (directoryPrefix) {
+			return Math.min(Math.max(limit * 6, 60), 300)
+		}
+
+		return Math.max(limit * 3, 20)
 	}
 
 	private getEffectiveMaxFileSizeBytes(relativePath: string): number {
@@ -727,6 +752,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				}
 			} else if (symbolQualifiedName.includes(symbolHint) || symbolName.includes(symbolHint)) {
 				rerankScore += 0.18
+				matchReasons.add("hinted symbol match")
+			} else if (searchText.includes(symbolHint)) {
+				rerankScore += 0.12
 				matchReasons.add("hinted symbol match")
 			}
 		}
@@ -1460,11 +1488,102 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return segments[segments.length - 1] ?? normalized
 	}
 
+	private normalizeDirectoryPrefix(directoryPrefix?: string): string | undefined {
+		if (!directoryPrefix) {
+			return undefined
+		}
+
+		const normalized = directoryPrefix.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "").trim()
+		return normalized || undefined
+	}
+
+	private filterResultsByDirectoryPrefix(
+		results: VectorStoreSearchResult[],
+		directoryPrefix?: string,
+	): VectorStoreSearchResult[] {
+		if (!directoryPrefix) {
+			return [...results]
+		}
+
+		const normalizedPrefix = directoryPrefix.toLowerCase()
+		return results.filter((result) => {
+			const filePath = result.payload?.filePath
+			if (!filePath) {
+				return false
+			}
+
+			const normalizedFilePath = filePath.replace(/\\/g, "/").toLowerCase()
+			return normalizedFilePath === normalizedPrefix || normalizedFilePath.startsWith(`${normalizedPrefix}/`)
+		})
+	}
+
+	private buildExpandedLexicalQuery(query: string, queryIntent: QueryIntent): string {
+		const normalizedQuery = query.toLowerCase()
+		const extraTerms = queryIntent.lexicalExpansionTerms.filter(
+			(term) => term && term.length >= 2 && !normalizedQuery.includes(term),
+		)
+		if (extraTerms.length === 0) {
+			return query
+		}
+
+		return `${query} ${extraTerms.slice(0, 8).join(" ")}`
+	}
+
+	private expandIdentifierHintVariants(value: string): string[] {
+		const normalizedValue = value.replace(/\\/g, "/").trim()
+		if (!normalizedValue) {
+			return []
+		}
+
+		const rawSegments = normalizedValue.split(/[./]/).filter(Boolean)
+		const normalizedSegments = rawSegments.map((segment) => segment.toLowerCase())
+		const forms = new Set<string>([normalizedValue.toLowerCase()])
+		const segmentWords = rawSegments.map((segment) => this.splitIdentifierWords(segment))
+		const flattenedWords = segmentWords.flat()
+
+		if (normalizedSegments.length > 1) {
+			forms.add(normalizedSegments.join("."))
+			forms.add(normalizedSegments.join(" "))
+		}
+
+		for (const words of segmentWords) {
+			if (words.length === 0) {
+				continue
+			}
+
+			forms.add(words.join(" "))
+			forms.add(words.join("_"))
+			forms.add(words.join(""))
+			forms.add(words.join("-"))
+		}
+
+		if (flattenedWords.length > 0) {
+			forms.add(flattenedWords.join(" "))
+			forms.add(flattenedWords.join("_"))
+			forms.add(flattenedWords.join(""))
+		}
+
+		return Array.from(forms).filter((form) => form.length >= 2)
+	}
+
+	private splitIdentifierWords(value: string): string[] {
+		return value
+			.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+			.replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+			.replace(/[_-]+/g, " ")
+			.replace(/[^A-Za-z0-9 ]+/g, " ")
+			.trim()
+			.toLowerCase()
+			.split(/\s+/)
+			.filter(Boolean)
+	}
+
 	private parseQueryIntent(query: string): QueryIntent {
 		const normalizedQuery = this.normalizeSearchText(query)
 		const rawTokens = query.match(/[A-Za-z0-9_./-]+/g) ?? []
 		const pathHints = new Set<string>()
 		const symbolHints = new Set<string>()
+		const lexicalExpansionTerms = new Set<string>()
 		const ddlHints = new Set<string>()
 		const ddlTokens = new Set(["create", "table", "alter", "index", "column", "constraint", "primary", "foreign"])
 		const pascalCaseStopwords = new Set(["how", "what", "where", "when", "why", "does", "roo", "code"])
@@ -1555,7 +1674,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				/[a-z]+[A-Z][A-Za-z0-9_]*/.test(token) ||
 				/^[a-z][a-z0-9]*_[a-z0-9_]+$/.test(token)
 			if (looksLikeQualifiedSymbol || looksLikeIdentifier) {
-				symbolHints.add(normalizedToken)
+				for (const expansion of this.expandIdentifierHintVariants(token)) {
+					symbolHints.add(expansion)
+					lexicalExpansionTerms.add(expansion)
+				}
 			}
 
 			if (ddlTokens.has(normalizedToken)) {
@@ -1567,7 +1689,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			pathHints.add(normalizedQuery.replace(/\\/g, "/"))
 		}
 		if (normalizedQuery.includes(".") && /[a-z_]/.test(normalizedQuery)) {
-			symbolHints.add(normalizedQuery)
+			for (const expansion of this.expandIdentifierHintVariants(query.trim())) {
+				symbolHints.add(expansion)
+				lexicalExpansionTerms.add(expansion)
+			}
 		}
 
 		const normalizedTokens = this.tokenizeSearchText(query)
@@ -1649,6 +1774,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return {
 			pathHints: Array.from(pathHints),
 			symbolHints: Array.from(symbolHints),
+			lexicalExpansionTerms: Array.from(lexicalExpansionTerms),
 			looksLikeNaturalLanguage: query.trim().includes(" ") && rawTokens.length >= 3,
 			looksLikeCodeQuestion,
 			looksLikeImplementationQuery,

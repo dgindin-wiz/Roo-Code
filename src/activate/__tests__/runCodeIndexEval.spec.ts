@@ -55,7 +55,7 @@ describe("runCodeIndexEvalForCurrentWorkspace", () => {
 			isFeatureConfigured: true,
 			selectedEngine: "v2",
 			initialize: vi.fn(),
-			searchIndex: vi.fn(async (query: string, _limit?: number) => {
+			searchIndex: vi.fn(async (query: string, _options?: { limit?: number; directoryPrefix?: string }) => {
 				const fixture = rooCodeBenchmarkFixtures.find((item) => item.query === query)
 				if (!fixture) {
 					return []
@@ -78,7 +78,7 @@ describe("runCodeIndexEvalForCurrentWorkspace", () => {
 				]
 			}),
 			searchIndexDebug: vi.fn(async (query: string, limit: number) => {
-				const results = await mockManager.searchIndex(query, limit)
+				const results = await mockManager.searchIndex(query, { limit })
 				return {
 					query,
 					limit,

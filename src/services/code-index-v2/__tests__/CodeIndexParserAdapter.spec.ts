@@ -28,11 +28,13 @@ describe("CodeIndexParserAdapter", () => {
 
 		const adapter = new CodeIndexParserAdapter()
 		const chunks = await adapter.parseFile({
-			filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+			filePath: "/workspace/src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+			relativePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
 			content: "private async expandSearchResultsWithParents() {}",
 		})
 
 		expect(chunks).toHaveLength(1)
+		expect(chunks[0]?.searchText).toContain("Path: src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
 		expect(chunks[0]?.searchText).toContain("Symbol Words: expand search results with parents")
 		expect(chunks[0]?.searchText).toContain("Qualified Symbol: CodeIndexEngineV2.expandSearchResultsWithParents")
 		expect(chunks[0]?.summary).toContain("expand search results with parents")
@@ -64,7 +66,8 @@ describe("CodeIndexParserAdapter", () => {
 
 		const adapter = new CodeIndexParserAdapter()
 		const chunks = await adapter.parseFile({
-			filePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+			filePath: "/workspace/src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
+			relativePath: "src/services/code-index-v2/engine/CodeIndexEngineV2.ts",
 			content: "class CodeIndexEngineV2 {}",
 		})
 
@@ -90,7 +93,8 @@ describe("CodeIndexParserAdapter", () => {
 
 		const adapter = new CodeIndexParserAdapter()
 		const chunks = await adapter.parseFile({
-			filePath: "src/example.ts",
+			filePath: "/workspace/src/example.ts",
+			relativePath: "src/example.ts",
 			content: "class Example { method() {} }",
 		})
 
@@ -114,7 +118,8 @@ describe("CodeIndexParserAdapter", () => {
 
 		const adapter = new CodeIndexParserAdapter()
 		const chunks = await adapter.parseFile({
-			filePath: "src/services/code-index/manager.ts",
+			filePath: "/workspace/src/services/code-index/manager.ts",
+			relativePath: "src/services/code-index/manager.ts",
 			content: "class CodeIndexManager {}",
 		})
 

@@ -110,6 +110,7 @@ async function handleMessage(message: ParseSidecarHostToChildMessage) {
 				const content = await fs.readFile(message.normalizedPath, "utf8")
 				const chunks = await parserAdapter.parseFile({
 					filePath: message.normalizedPath,
+					relativePath: message.relativePath,
 					content,
 					maxFileSizeBytes: message.maxFileSizeBytes,
 				})

@@ -87,7 +87,9 @@ describe("codebaseSearchTool", () => {
 
 		await codebaseSearchTool.handle(mockTask, block, mockCallbacks)
 
-		expect(mockSearchIndex).toHaveBeenCalledWith("validateToken", "src/auth")
+		expect(mockSearchIndex).toHaveBeenCalledWith("validateToken", {
+			directoryPrefix: "src/auth",
+		})
 		expect(mockTask.say).toHaveBeenCalledWith(
 			"codebase_search_result",
 			expect.stringContaining('"filePath":"src/auth/validate.ts"'),
@@ -100,5 +102,80 @@ describe("codebaseSearchTool", () => {
 			expect.stringContaining("Code Chunk: export function validateToken(token: string) {"),
 		)
 		expect(mockCallbacks.pushToolResult).toHaveBeenCalledWith(expect.stringContaining("return token.length > 0"))
+	})
+
+	it("truncates low-confidence result groups while preserving parent context for the kept primary", async () => {
+		mockSearchIndex.mockResolvedValue([
+			{
+				id: "point-primary",
+				score: 0.92,
+				rerankScore: 0.96,
+				matchReasons: ["exact hinted symbol match"],
+				payload: {
+					filePath: "/workspace/src/auth/service.ts",
+					chunkFingerprint: "chunk-fp-primary",
+					startLine: 10,
+					endLine: 24,
+					codeChunk:
+						"export function validateToken(token: string) {\n\tif (!token) {\n\t\treturn false\n\t}\n\treturn token.length > 0\n}",
+					language: "ts",
+					chunkKind: "function",
+					symbolName: "validateToken",
+					symbolQualifiedName: "AuthService.validateToken",
+					parentSymbolName: "AuthService",
+				},
+			},
+			{
+				id: "point-parent",
+				score: 0.7,
+				rerankScore: 0.83,
+				matchReasons: ["expanded parent context"],
+				payload: {
+					filePath: "/workspace/src/auth/service.ts",
+					chunkFingerprint: "chunk-fp-parent",
+					startLine: 1,
+					endLine: 40,
+					codeChunk:
+						"export class AuthService {\n\tvalidateToken(token: string) {\n\t\treturn token.length > 0\n\t}\n}",
+					language: "ts",
+					chunkKind: "class",
+					symbolName: "AuthService",
+					symbolQualifiedName: "AuthService",
+				},
+			},
+			{
+				id: "point-low-signal",
+				score: 0.6,
+				rerankScore: 0.41,
+				matchReasons: ["lexical match"],
+				payload: {
+					filePath: "/workspace/src/other.ts",
+					chunkFingerprint: "chunk-fp-low",
+					startLine: 1,
+					endLine: 3,
+					codeChunk: "export const helper = true",
+					language: "ts",
+					chunkKind: "constant",
+				},
+			},
+		])
+
+		const block: ToolUse<"codebase_search"> = {
+			type: "tool_use",
+			name: "codebase_search",
+			params: {},
+			partial: false,
+			nativeArgs: {
+				query: "validateToken",
+			},
+		}
+
+		await codebaseSearchTool.handle(mockTask, block, mockCallbacks)
+
+		const [, payload] =
+			mockTask.say.mock.calls.find(([event]: [string, string]) => event === "codebase_search_result") ?? []
+		expect(payload).toContain('"filePath":"src/auth/service.ts"')
+		expect(payload).not.toContain('"filePath":"src/other.ts"')
+		expect(payload).toContain("// ... 4 more lines ...")
 	})
 })

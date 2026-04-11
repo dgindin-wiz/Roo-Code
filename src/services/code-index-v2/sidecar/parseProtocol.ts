@@ -16,6 +16,7 @@ export type ParseSidecarHostToChildMessage =
 			runId: string
 			revisionId: string
 			normalizedPath: string
+			relativePath: string
 			maxFileSizeBytes?: number
 	  }
 	| {

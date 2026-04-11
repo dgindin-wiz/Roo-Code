@@ -60,6 +60,7 @@ describe("ParseChunkService", () => {
 				fileId: "file-1",
 				runId: "run-1",
 				normalizedPath: "/workspace/src/a.ts",
+				relativePath: "src/a.ts",
 			},
 		])
 		workspaceAdapter.readFile.mockResolvedValue("const value = 1")
@@ -76,6 +77,13 @@ describe("ParseChunkService", () => {
 		const summary = await service.run("run-1")
 
 		expect(parserAdapter.parseFile).toHaveBeenCalledTimes(2)
+		expect(parserAdapter.parseFile).toHaveBeenNthCalledWith(
+			1,
+			expect.objectContaining({
+				filePath: "/workspace/src/a.ts",
+				relativePath: "src/a.ts",
+			}),
+		)
 		expect(metadataStore.markRevisionState).toHaveBeenCalledWith("revision-1", "parsed")
 		expect(metadataStore.markRevisionTerminalFailure).not.toHaveBeenCalled()
 		expect(summary.parsedRevisions).toBe(1)
@@ -84,7 +92,7 @@ describe("ParseChunkService", () => {
 		expect(summary.terminalFailedRevisions).toBe(0)
 	})
 
-	it("creates a rich raw-code variant and symbol signature variant for structured chunks", async () => {
+	it("creates raw-code, summary, and symbol-signature variants for structured chunks", async () => {
 		const { metadataStore, workspaceAdapter, parserAdapter } = createDeps()
 		metadataStore.getRevisionsByState.mockResolvedValue([
 			{
@@ -103,7 +111,7 @@ describe("ParseChunkService", () => {
 				endLine: 12,
 				content: "export function validateToken(token: string) {}",
 				searchText:
-					"Path: src/auth.ts\nLanguage: ts\nKind: function\nLines: 10-12\nSymbol: validateToken\nSymbol Words: validate token\nQualified Symbol: Auth.validateToken\nParent: Auth\n\nexport function validateToken(token: string) {}",
+					"Path: src/auth.ts\nLanguage: ts\nKind: function\nLines: 10-12\nSymbol: validateToken\nSymbol Words: validate token\nQualified Symbol: Auth.validateToken\nParent: Auth\nPreview: export function validateToken token: string",
 				language: "ts",
 				chunkKind: "function",
 				symbolName: "validateToken",
@@ -123,11 +131,12 @@ describe("ParseChunkService", () => {
 					content:
 						"Path: src/auth.ts\nLanguage: ts\nKind: function\nLines: 10-12\nSymbol: validateToken\nSymbol Words: validate token\nQualified Symbol: Auth.validateToken\nParent: Auth\n\nexport function validateToken(token: string) {}",
 				}),
+				expect.objectContaining({
+					variantType: "summary",
+					content: "ts function validateToken in Auth at src/auth.ts:10-12",
+				}),
 				expect.objectContaining({ variantType: "symbol_signature" }),
 			]),
-		)
-		expect(metadataStore.upsertChunkVariants).not.toHaveBeenCalledWith(
-			expect.arrayContaining([expect.objectContaining({ variantType: "summary" })]),
 		)
 	})
 
@@ -139,12 +148,14 @@ describe("ParseChunkService", () => {
 				fileId: "file-bad",
 				runId: "run-1",
 				normalizedPath: "/workspace/src/bad.ts",
+				relativePath: "src/bad.ts",
 			},
 			{
 				revisionId: "revision-good",
 				fileId: "file-good",
 				runId: "run-1",
 				normalizedPath: "/workspace/src/good.ts",
+				relativePath: "src/good.ts",
 			},
 		])
 		workspaceAdapter.readFile.mockResolvedValue("content")
@@ -280,6 +291,7 @@ describe("ParseChunkService", () => {
 				fileId: "file-missing",
 				runId: "run-1",
 				normalizedPath: "/workspace/src/missing.ts",
+				relativePath: "src/missing.ts",
 			},
 		])
 		const error = Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" })
@@ -338,6 +350,7 @@ describe("ParseChunkService", () => {
 				runId: "run-1",
 				revisionId: "revision-1",
 				normalizedPath: "/workspace/src/a.ts",
+				relativePath: "src/a.ts",
 				signal: undefined,
 			}),
 		)

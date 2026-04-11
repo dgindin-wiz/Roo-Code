@@ -7,6 +7,10 @@ import { getWorkspacePath } from "../../utils/path"
 import { formatResponse } from "../prompts/responses"
 import { VectorStoreSearchResult } from "../../services/code-index/interfaces"
 import type { ToolUse } from "../../shared/tools"
+import {
+	buildSymbolSignatureFallback,
+	extractDeclarationSignature,
+} from "../../services/code-index-v2/shared/chunkSurfaces"
 
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 
@@ -14,6 +18,13 @@ interface CodebaseSearchParams {
 	query: string
 	path?: string
 }
+
+type SearchResultContextRole = "primary" | "parent" | "sibling"
+
+const PRIMARY_SNIPPET_MAX_LINES = 80
+const PRIMARY_SNIPPET_HEAD_LINES = 30
+const PRIMARY_SNIPPET_TAIL_LINES = 10
+const SCORE_CLIFF_RATIO = 0.5
 
 function summarizeMatchReasons(matchReasons?: string[]): string | undefined {
 	if (!matchReasons || matchReasons.length === 0) {
@@ -45,6 +56,124 @@ function summarizeMatchReasons(matchReasons?: string[]): string | undefined {
 		return "Kind-aware match"
 	}
 	return "Related match"
+}
+
+function getContextRole(matchReasons?: string[]): SearchResultContextRole {
+	if (matchReasons?.includes("expanded parent context")) {
+		return "parent"
+	}
+	if (matchReasons?.includes("expanded sibling context")) {
+		return "sibling"
+	}
+	return "primary"
+}
+
+function groupSearchResults(results: VectorStoreSearchResult[]) {
+	const groups: Array<{ primary: VectorStoreSearchResult; context: VectorStoreSearchResult[] }> = []
+
+	for (const result of results) {
+		const role = getContextRole(result.matchReasons)
+		if (role !== "primary" && groups.length > 0) {
+			groups[groups.length - 1]?.context.push(result)
+			continue
+		}
+
+		groups.push({
+			primary: result,
+			context: [],
+		})
+	}
+
+	return groups
+}
+
+function truncateResultGroups(groups: Array<{ primary: VectorStoreSearchResult; context: VectorStoreSearchResult[] }>) {
+	if (groups.length <= 1) {
+		return groups
+	}
+
+	const topScore = getResultScore(groups[0]?.primary)
+	if (topScore <= 0) {
+		return groups
+	}
+
+	let keepCount = groups.length
+	for (let index = 1; index < groups.length; index++) {
+		if (getResultScore(groups[index]?.primary) < topScore * SCORE_CLIFF_RATIO) {
+			keepCount = index
+			break
+		}
+	}
+
+	return groups.slice(0, Math.max(1, keepCount))
+}
+
+function getResultScore(result: VectorStoreSearchResult | undefined): number {
+	if (!result) {
+		return 0
+	}
+
+	return result.rerankScore ?? result.score
+}
+
+function buildSnippetForResult(result: VectorStoreSearchResult): string {
+	const codeChunk = typeof result.payload?.codeChunk === "string" ? result.payload.codeChunk.trim() : ""
+	if (!codeChunk) {
+		return ""
+	}
+
+	const role = getContextRole(result.matchReasons)
+	if (role !== "primary") {
+		return buildContextSnippet(result, codeChunk)
+	}
+
+	const lines = codeChunk.split(/\r?\n/)
+	if ((result.payload?.chunkKind === "file" || lines.length > PRIMARY_SNIPPET_MAX_LINES) && lines.length > 40) {
+		return buildHeadTailSnippet(lines)
+	}
+
+	return codeChunk
+}
+
+function buildContextSnippet(result: VectorStoreSearchResult, codeChunk: string): string {
+	const lines = codeChunk.split(/\r?\n/)
+	const signature =
+		extractDeclarationSignature(codeChunk) ??
+		buildSymbolSignatureFallback({
+			relativePath: typeof result.payload?.filePath === "string" ? result.payload.filePath : "",
+			language: typeof result.payload?.language === "string" ? result.payload.language : undefined,
+			chunkKind: typeof result.payload?.chunkKind === "string" ? result.payload.chunkKind : undefined,
+			symbolName: typeof result.payload?.symbolName === "string" ? result.payload.symbolName : undefined,
+			symbolQualifiedName:
+				typeof result.payload?.symbolQualifiedName === "string"
+					? result.payload.symbolQualifiedName
+					: undefined,
+			parentSymbolName:
+				typeof result.payload?.parentSymbolName === "string" ? result.payload.parentSymbolName : undefined,
+			startLine: typeof result.payload?.startLine === "number" ? result.payload.startLine : 0,
+			endLine: typeof result.payload?.endLine === "number" ? result.payload.endLine : 0,
+		}) ??
+		lines[0]?.trim() ??
+		codeChunk
+
+	const omittedLines = Math.max(lines.length - 1, 0)
+	return omittedLines > 0 ? `${signature}\n${buildOmittedLinesComment(omittedLines)}` : signature
+}
+
+function buildHeadTailSnippet(lines: string[]): string {
+	const head = lines.slice(0, PRIMARY_SNIPPET_HEAD_LINES)
+	const tail = lines.slice(-PRIMARY_SNIPPET_TAIL_LINES)
+	const omittedLines = Math.max(lines.length - head.length - tail.length, 0)
+
+	if (omittedLines <= 0) {
+		return lines.join("\n").trim()
+	}
+
+	return [...head, buildOmittedLinesComment(omittedLines), ...tail].join("\n").trim()
+}
+
+function buildOmittedLinesComment(omittedLines: number): string {
+	return `// ... ${omittedLines} more line${omittedLines === 1 ? "" : "s"} ...`
 }
 
 export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
@@ -102,12 +231,19 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				throw new Error("Code Indexing is not configured (Missing OpenAI Key or Qdrant URL).")
 			}
 
-			const searchResults: VectorStoreSearchResult[] = await manager.searchIndex(query, directoryPrefix)
+			const searchResults: VectorStoreSearchResult[] = await manager.searchIndex(query, {
+				directoryPrefix,
+			})
 
 			if (!searchResults || searchResults.length === 0) {
 				pushToolResult(`No relevant code snippets found for the query: "${query}"`)
 				return
 			}
+
+			const retainedResults = truncateResultGroups(groupSearchResults(searchResults)).flatMap((group) => [
+				group.primary,
+				...group.context,
+			])
 
 			const jsonResult = {
 				query,
@@ -132,7 +268,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				}>
 			}
 
-			searchResults.forEach((result) => {
+			retainedResults.forEach((result) => {
 				if (!result.payload) return
 				if (!("filePath" in result.payload)) return
 
@@ -158,7 +294,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 					summary: typeof result.payload.summary === "string" ? result.payload.summary : undefined,
 					matchLabel: summarizeMatchReasons(result.matchReasons),
 					matchReasons: Array.isArray(result.matchReasons) ? result.matchReasons : undefined,
-					codeChunk: result.payload.codeChunk.trim(),
+					codeChunk: buildSnippetForResult(result),
 				})
 			})
 

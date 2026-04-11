@@ -1,6 +1,7 @@
 import { createHash } from "crypto"
 import { EmbeddingAdapter } from "../adapters/EmbeddingAdapter"
 import { VectorPoint, VectorStoreAdapter } from "../adapters/VectorStoreAdapter"
+import { buildRawCodeVariantContent } from "../shared/chunkSurfaces"
 
 export interface EmbedUpsertChunkInput {
 	chunkId: string
@@ -51,12 +52,24 @@ export function getChunkVariantsForEmbedding(
 		return variants
 	}
 
+	const rawCode = buildRawCodeVariantContent({
+		relativePath: chunk.relativePath,
+		content: chunk.content,
+		language: chunk.language ?? null,
+		chunkKind: chunk.chunkKind ?? null,
+		symbolName: chunk.symbolName ?? null,
+		symbolQualifiedName: chunk.symbolQualifiedName ?? null,
+		parentSymbolName: chunk.parentSymbolName ?? null,
+		startLine: chunk.startLine,
+		endLine: chunk.endLine,
+	})
+
 	return [
 		{
 			variantId: `legacy:${chunk.chunkId}`,
 			chunkId: chunk.chunkId,
 			variantType: "raw_code",
-			content: chunk.searchText || chunk.content,
+			content: rawCode,
 		},
 	]
 }

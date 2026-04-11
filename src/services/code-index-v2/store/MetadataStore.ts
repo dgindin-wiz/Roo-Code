@@ -1394,7 +1394,9 @@ export class MetadataStore {
 					active_fr.revision_id AS latestRevisionId,
 					active_fr.content_hash AS latestRevisionContentHash,
 					active_fr.fast_fingerprint AS latestRevisionFastFingerprint,
-					active_fr.state AS latestRevisionState
+					active_fr.state AS latestRevisionState,
+					active_fr.parser_version AS latestRevisionParserVersion,
+					active_fr.chunker_version AS latestRevisionChunkerVersion
 				FROM files f
 				LEFT JOIN file_revisions active_fr ON active_fr.revision_id = f.active_revision_id
 				WHERE f.workspace_id = ? AND f.ignore_state = 'included' AND f.tombstoned = 0
@@ -1432,7 +1434,9 @@ export class MetadataStore {
 					active_fr.revision_id AS latestRevisionId,
 					active_fr.content_hash AS latestRevisionContentHash,
 					active_fr.fast_fingerprint AS latestRevisionFastFingerprint,
-					active_fr.state AS latestRevisionState
+					active_fr.state AS latestRevisionState,
+					active_fr.parser_version AS latestRevisionParserVersion,
+					active_fr.chunker_version AS latestRevisionChunkerVersion
 				FROM files f
 				LEFT JOIN file_revisions active_fr ON active_fr.revision_id = f.active_revision_id
 				WHERE f.workspace_id = ? AND f.ignore_state = 'included' AND f.tombstoned = 0 AND f.relative_path IN (${placeholders})
@@ -2035,6 +2039,8 @@ export class MetadataStore {
 		fileId: string,
 		contentHash: string,
 		fastFingerprint?: string | null,
+		parserVersion?: string | null,
+		chunkerVersion?: string | null,
 	): Promise<FileRevisionRecord | undefined> {
 		return this.db()
 			.prepare(
@@ -2055,11 +2061,15 @@ export class MetadataStore {
 				WHERE file_id = ?
 					AND content_hash = ?
 					AND COALESCE(fast_fingerprint, '') = COALESCE(?, '')
+					AND COALESCE(parser_version, '') = COALESCE(?, '')
+					AND COALESCE(chunker_version, '') = COALESCE(?, '')
 					AND state IN ('hashed', 'parsed')
 				ORDER BY discovered_at DESC
 				LIMIT 1`,
 			)
-			.get(fileId, contentHash, fastFingerprint ?? null) as FileRevisionRecord | undefined
+			.get(fileId, contentHash, fastFingerprint ?? null, parserVersion ?? null, chunkerVersion ?? null) as
+			| FileRevisionRecord
+			| undefined
 	}
 
 	async adoptRevisionToRun(revisionId: string, runId: string): Promise<void> {

@@ -35,6 +35,7 @@ vi.mock("../logging/IndexDebugLoggerV2", () => ({
 		log: vi.fn(),
 		updateTrackedProcessSnapshot: vi.fn(),
 		clearTrackedProcessSnapshot: vi.fn(),
+		getDiagnosticsDirectory: vi.fn(() => "/tmp/roo-code-index-v2-diagnostics"),
 	},
 }))
 
@@ -54,6 +55,7 @@ describe("SidecarParseExecutor", () => {
 			runId: "run-1",
 			revisionId: "revision-1",
 			normalizedPath: "/workspace/src/example.ts",
+			relativePath: "src/example.ts",
 		})
 
 		expect(child.sentMessages[0]).toEqual({
@@ -98,6 +100,7 @@ describe("SidecarParseExecutor", () => {
 			runId: "run-1",
 			revisionId: "revision-1",
 			normalizedPath: "/workspace/src/example.ts",
+			relativePath: "src/example.ts",
 		})
 
 		const rejection = expect(parsePromise).rejects.toThrow(
@@ -113,6 +116,7 @@ describe("SidecarParseExecutor", () => {
 			runId: "run-1",
 			revisionId: "revision-2",
 			normalizedPath: "/workspace/src/other.ts",
+			relativePath: "src/other.ts",
 		})
 		replacementChild.emit("message", {
 			type: "ready",
@@ -145,6 +149,7 @@ describe("SidecarParseExecutor", () => {
 			runId: "run-1",
 			revisionId: "revision-1",
 			normalizedPath: "/workspace/src/example.ts",
+			relativePath: "src/example.ts",
 			signal: abortController.signal,
 		})
 
@@ -164,6 +169,7 @@ describe("SidecarParseExecutor", () => {
 			runId: "run-1",
 			revisionId: "revision-1",
 			normalizedPath: "/workspace/src/example.ts",
+			relativePath: "src/example.ts",
 		})
 
 		child.emit("error", new Error("spawn EACCES"))

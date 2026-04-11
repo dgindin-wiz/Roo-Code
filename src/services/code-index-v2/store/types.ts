@@ -39,6 +39,8 @@ export interface FileRecordWithRevision extends FileRecord {
 	latestRevisionContentHash: string | null
 	latestRevisionFastFingerprint: string | null
 	latestRevisionState: string | null
+	latestRevisionParserVersion: string | null
+	latestRevisionChunkerVersion: string | null
 }
 
 export interface FileRecordInput {

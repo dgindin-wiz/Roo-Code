@@ -1,5 +1,6 @@
 import { createHash } from "crypto"
 import { ParsedChunk } from "../adapters/ParserAdapter"
+import { buildRawCodeVariantContent, buildSymbolSignatureVariant, ChunkSurfaceInput } from "../shared/chunkSurfaces"
 
 export interface ParsedChunkUpsertInput {
 	chunkFingerprint: string
@@ -38,6 +39,7 @@ export function buildChunkVariants(
 		chunkId: string
 		content: string
 		searchText?: string | null
+		summary?: string | null
 		tokenEstimate?: number | null
 		symbolQualifiedName?: string | null
 		symbolName?: string | null
@@ -50,15 +52,27 @@ export function buildChunkVariants(
 	relativePath: string,
 ): Array<{
 	chunkId: string
-	variantType: "raw_code" | "symbol_signature"
+	variantType: "raw_code" | "summary" | "symbol_signature"
 	content: string
 	contentHash: string
 	tokenEstimate?: number | null
 	state: "parsed"
 }> {
+	const rawCode = buildRawCodeVariantContent({
+		relativePath,
+		content: chunk.content,
+		language: chunk.language ?? null,
+		chunkKind: chunk.chunkKind ?? null,
+		symbolName: chunk.symbolName ?? null,
+		symbolQualifiedName: chunk.symbolQualifiedName ?? null,
+		parentSymbolName: chunk.parentSymbolName ?? null,
+		startLine: chunk.startLine,
+		endLine: chunk.endLine,
+	})
+
 	const variants: Array<{
 		chunkId: string
-		variantType: "raw_code" | "symbol_signature"
+		variantType: "raw_code" | "summary" | "symbol_signature"
 		content: string
 		contentHash: string
 		tokenEstimate?: number | null
@@ -67,16 +81,35 @@ export function buildChunkVariants(
 		{
 			chunkId: chunk.chunkId,
 			variantType: "raw_code",
-			content: chunk.searchText ?? chunk.content,
-			contentHash: createHash("sha256")
-				.update(chunk.searchText ?? chunk.content)
-				.digest("hex"),
+			content: rawCode,
+			contentHash: createHash("sha256").update(rawCode).digest("hex"),
 			tokenEstimate: chunk.tokenEstimate ?? null,
 			state: "parsed",
 		},
 	]
 
-	const signature = buildSymbolSignatureVariant(chunk, relativePath)
+	const summary = chunk.summary?.trim()
+	if (summary) {
+		variants.push({
+			chunkId: chunk.chunkId,
+			variantType: "summary",
+			content: summary,
+			contentHash: createHash("sha256").update(summary).digest("hex"),
+			state: "parsed",
+		})
+	}
+
+	const signature = buildSymbolSignatureVariant({
+		relativePath,
+		content: chunk.content,
+		language: chunk.language ?? null,
+		chunkKind: chunk.chunkKind ?? null,
+		symbolName: chunk.symbolName ?? null,
+		symbolQualifiedName: chunk.symbolQualifiedName ?? null,
+		parentSymbolName: chunk.parentSymbolName ?? null,
+		startLine: chunk.startLine,
+		endLine: chunk.endLine,
+	} satisfies ChunkSurfaceInput)
 	if (signature) {
 		variants.push({
 			chunkId: chunk.chunkId,
@@ -88,34 +121,4 @@ export function buildChunkVariants(
 	}
 
 	return variants
-}
-
-export function buildSymbolSignatureVariant(
-	chunk: {
-		symbolQualifiedName?: string | null
-		symbolName?: string | null
-		language?: string | null
-		chunkKind?: string | null
-		parentSymbolName?: string | null
-		startLine: number
-		endLine: number
-	},
-	relativePath: string,
-): string | null {
-	const symbolName = chunk.symbolQualifiedName ?? chunk.symbolName
-	if (!symbolName) {
-		return null
-	}
-
-	const parts = [
-		chunk.language ?? "unknown",
-		chunk.chunkKind ?? "chunk",
-		symbolName,
-		`path ${relativePath}`,
-		`lines ${chunk.startLine}-${chunk.endLine}`,
-	]
-	if (chunk.parentSymbolName && chunk.parentSymbolName !== symbolName) {
-		parts.push(`parent ${chunk.parentSymbolName}`)
-	}
-	return parts.join(" | ")
 }

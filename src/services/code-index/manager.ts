@@ -667,24 +667,29 @@ export class CodeIndexManager {
 		return this._engineV2.retryWarningFiles(filter, relativePaths)
 	}
 
-	public async searchIndex(query: string, directoryPrefix?: string): Promise<VectorStoreSearchResult[]>
-	public async searchIndex(query: string, limit?: number): Promise<VectorStoreSearchResult[]>
 	public async searchIndex(
 		query: string,
-		directoryPrefixOrLimit?: string | number,
+		options?: {
+			directoryPrefix?: string
+			limit?: number
+		},
 	): Promise<VectorStoreSearchResult[]> {
 		if (!this.isFeatureEnabled) {
 			return []
 		}
 		this.assertInitialized()
 
+		const directoryPrefix = options?.directoryPrefix
+		const limit = options?.limit
+
 		if (this.selectedEngine === CODE_INDEX_V2_ENGINE_ID) {
-			const limit = typeof directoryPrefixOrLimit === "number" ? directoryPrefixOrLimit : 50
-			return this._engineV2!.search(query, limit)
+			return this._engineV2!.search(query, limit ?? this._configManager!.currentSearchMaxResults, {
+				directoryPrefix,
+			})
 		}
 
-		const directoryPrefix = typeof directoryPrefixOrLimit === "string" ? directoryPrefixOrLimit : undefined
-		return this._searchService!.searchIndex(query, directoryPrefix)
+		const results = await this._searchService!.searchIndex(query, directoryPrefix)
+		return typeof limit === "number" ? results.slice(0, Math.max(1, limit)) : results
 	}
 
 	public async searchIndexDebug(query: string, limit: number): Promise<CodeIndexDebugSearchTrace | undefined> {

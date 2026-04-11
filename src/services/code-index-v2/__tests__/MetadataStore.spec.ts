@@ -29,6 +29,7 @@ vi.mock("vscode", () => {
 })
 
 import { MetadataStore } from "../store/MetadataStore"
+import { CODE_INDEX_V2_CHUNKER_VERSION, CODE_INDEX_V2_PARSER_VERSION } from "../shared/chunkSurfaces"
 
 describe("MetadataStore integration", () => {
 	let tempRoot: string
@@ -785,8 +786,8 @@ describe("MetadataStore integration", () => {
 			runId: staleRunId,
 			contentHash: "reuse-content-hash",
 			fastFingerprint: "99:55",
-			parserVersion: "parser-v1",
-			chunkerVersion: "chunker-v1",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
 			state: "hashed",
 		})
 		await store.upsertChunks([
@@ -810,7 +811,13 @@ describe("MetadataStore integration", () => {
 		expect(preservedRevision.state).toBe("parsed")
 		expect((await store.getChunksForRevision(revision.revisionId))[0]?.state).toBe("parsed")
 
-		const reusableRevision = await store.findReusableRevision(file.fileId, "reuse-content-hash", "99:55")
+		const reusableRevision = await store.findReusableRevision(
+			file.fileId,
+			"reuse-content-hash",
+			"99:55",
+			CODE_INDEX_V2_PARSER_VERSION,
+			CODE_INDEX_V2_CHUNKER_VERSION,
+		)
 		expect(reusableRevision?.revisionId).toBe(revision.revisionId)
 
 		await store.dispose()
@@ -1127,8 +1134,8 @@ describe("MetadataStore integration", () => {
 			runId: stoppedRunId,
 			contentHash: "stopped-content-hash",
 			fastFingerprint: "20:10",
-			parserVersion: "parser-v1",
-			chunkerVersion: "chunker-v1",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
 			state: "parsed",
 		})
 		await store.upsertChunks([
@@ -1158,7 +1165,13 @@ describe("MetadataStore integration", () => {
 		const cleanup = await store.cleanupStaleRuns()
 		expect(cleanup.staleRunIds).toEqual([])
 
-		const reusableRevision = await store.findReusableRevision(file.fileId, "stopped-content-hash", "20:10")
+		const reusableRevision = await store.findReusableRevision(
+			file.fileId,
+			"stopped-content-hash",
+			"20:10",
+			CODE_INDEX_V2_PARSER_VERSION,
+			CODE_INDEX_V2_CHUNKER_VERSION,
+		)
 		expect(reusableRevision?.revisionId).toBe(revision.revisionId)
 
 		const resumedRunId = await store.beginRun("initial-discovery")
@@ -1191,8 +1204,8 @@ describe("MetadataStore integration", () => {
 			runId: oldRunId,
 			contentHash: "old-content-hash",
 			fastFingerprint: "144:88",
-			parserVersion: "parser-v1",
-			chunkerVersion: "chunker-v1",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
 			state: "planned",
 		})
 		await store.upsertChunks([
@@ -1229,7 +1242,13 @@ describe("MetadataStore integration", () => {
 		expect(cleanup.expiredChunksGarbageCollected).toBe(1)
 		expect(cleanup.expiredRunsDeleted).toBe(1)
 
-		const reusableRevision = await store.findReusableRevision(oldFile.fileId, "old-content-hash", "144:88")
+		const reusableRevision = await store.findReusableRevision(
+			oldFile.fileId,
+			"old-content-hash",
+			"144:88",
+			CODE_INDEX_V2_PARSER_VERSION,
+			CODE_INDEX_V2_CHUNKER_VERSION,
+		)
 		expect(reusableRevision).toBeUndefined()
 
 		await store.dispose()

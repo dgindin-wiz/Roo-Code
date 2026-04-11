@@ -15,5 +15,10 @@ export interface ParsedChunk {
 
 export interface ParserAdapter {
 	readonly parserVersion: string
-	parseFile(input: { filePath: string; content: string; maxFileSizeBytes?: number }): Promise<ParsedChunk[]>
+	parseFile(input: {
+		filePath: string
+		relativePath: string
+		content: string
+		maxFileSizeBytes?: number
+	}): Promise<ParsedChunk[]>
 }

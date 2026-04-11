@@ -39,6 +39,7 @@ export class SidecarParseExecutor {
 		runId: string
 		revisionId: string
 		normalizedPath: string
+		relativePath: string
 		maxFileSizeBytes?: number
 		laneId?: number
 		signal?: AbortSignal
@@ -53,6 +54,7 @@ export class SidecarParseExecutor {
 				runId: input.runId,
 				revisionId: input.revisionId,
 				normalizedPath: input.normalizedPath,
+				relativePath: input.relativePath,
 				maxFileSizeBytes: input.maxFileSizeBytes,
 			},
 			input.signal,

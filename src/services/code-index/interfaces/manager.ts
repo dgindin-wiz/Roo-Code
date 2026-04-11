@@ -81,10 +81,16 @@ export interface ICodeIndexManager {
 	/**
 	 * Searches the index
 	 * @param query Query string
-	 * @param limit Maximum number of results to return
+	 * @param options Search options
 	 * @returns Promise resolving to search results
 	 */
-	searchIndex(query: string, limit: number): Promise<VectorStoreSearchResult[]>
+	searchIndex(
+		query: string,
+		options?: {
+			directoryPrefix?: string
+			limit?: number
+		},
+	): Promise<VectorStoreSearchResult[]>
 
 	/**
 	 * Gets the current status of the indexing system

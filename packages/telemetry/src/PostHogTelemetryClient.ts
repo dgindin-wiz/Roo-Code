@@ -18,11 +18,31 @@ import { BaseTelemetryClient } from "./BaseTelemetryClient"
 
 type VSCodeModule = typeof import("vscode")
 
-const require = createRequire(import.meta.url)
+function createOptionalRequire(): NodeJS.Require | undefined {
+	try {
+		if (typeof import.meta !== "undefined" && import.meta.url) {
+			return createRequire(import.meta.url)
+		}
+	} catch {
+		// Ignore and try the bundled CJS path next.
+	}
+
+	try {
+		if (typeof __filename === "string" && __filename) {
+			return createRequire(__filename)
+		}
+	} catch {
+		// Ignore and fall back to undefined.
+	}
+
+	return undefined
+}
+
+const require = createOptionalRequire()
 
 let vscodeModule: VSCodeModule | undefined
 try {
-	vscodeModule = require("vscode") as VSCodeModule
+	vscodeModule = require?.("vscode") as VSCodeModule | undefined
 } catch {
 	vscodeModule = undefined
 }
