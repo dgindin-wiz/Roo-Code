@@ -111,27 +111,53 @@ export const toRelativePath = (filePath: string, cwd: string) => {
 	return filePath.endsWith("/") ? relativePath + "/" : relativePath
 }
 
-export const getWorkspacePath = (defaultCwdPath = "") => {
-	const cwdPath = vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath).at(0) || defaultCwdPath
+export const getWorkspaceFolderForPath = (contextPath?: string): vscode.WorkspaceFolder | undefined => {
+	if (contextPath && contextPath.trim().length > 0) {
+		const normalizedPath = normalizePath(contextPath)
+		const exactFolder = vscode.workspace.workspaceFolders?.find((folder) =>
+			arePathsEqual(folder.uri.fsPath, normalizedPath),
+		)
+		if (exactFolder) {
+			return exactFolder
+		}
+
+		try {
+			const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(normalizedPath))
+			if (workspaceFolder) {
+				return workspaceFolder
+			}
+		} catch {
+			// Ignore invalid or non-file paths and fall through.
+		}
+	}
+
+	return undefined
+}
+
+export const getCurrentWorkspaceFolder = (): vscode.WorkspaceFolder | undefined => {
 	const currentFileUri = vscode.window.activeTextEditor?.document.uri
 	if (currentFileUri) {
 		const workspaceFolder = vscode.workspace.getWorkspaceFolder(currentFileUri)
-		return workspaceFolder?.uri.fsPath || cwdPath
+		if (workspaceFolder) {
+			return workspaceFolder
+		}
 	}
-	return cwdPath
+
+	return vscode.workspace.workspaceFolders?.[0]
+}
+
+export const getWorkspacePath = (defaultCwdPath = "") => {
+	return getCurrentWorkspaceFolder()?.uri.fsPath || defaultCwdPath
 }
 
 export const getWorkspacePathForContext = (contextPath?: string): string => {
-	// If context path provided, find its workspace
+	const workspaceFolder = getWorkspaceFolderForPath(contextPath)
+	if (workspaceFolder) {
+		return workspaceFolder.uri.fsPath
+	}
 	if (contextPath) {
-		const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(contextPath))
-		if (workspaceFolder) {
-			return workspaceFolder.uri.fsPath
-		}
-		// Debug logging when falling back
 		console.debug(`[CodeIndex] No workspace found for context path: ${contextPath}, falling back to default`)
 	}
 
-	// Fall back to current behavior
 	return getWorkspacePath()
 }

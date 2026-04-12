@@ -9,6 +9,7 @@ import type {
 	IndexingServiceSnapshot,
 } from "@roo-code/types"
 import { IndexDebugLogger } from "./debug-logger"
+import { IndexDebugLoggerV2 } from "../code-index-v2/logging/IndexDebugLoggerV2"
 
 export type IndexingState = "Standby" | "Indexing" | "Indexed" | "Error" | "Stopping"
 
@@ -114,6 +115,8 @@ export function formatEta(ms: number): string {
 }
 
 export class CodeIndexStateManager {
+	private _loggerEngine: "legacy" | "v2" = "legacy"
+	private _loggerWorkspacePath: string | undefined
 	private _systemStatus: IndexingState = "Standby"
 	private _statusMessage: string = ""
 	private _processedItems: number = 0
@@ -171,6 +174,11 @@ export class CodeIndexStateManager {
 
 	public get state(): IndexingState {
 		return this._systemStatus
+	}
+
+	public setLoggerContext(engine: "legacy" | "v2", workspacePath?: string): void {
+		this._loggerEngine = engine
+		this._loggerWorkspacePath = workspacePath
 	}
 
 	public getCurrentStatus() {
@@ -333,7 +341,7 @@ export class CodeIndexStateManager {
 			}
 
 			this.emitProgressUpdate({ forceImmediate: true })
-			IndexDebugLogger.log("StateManager", "setSystemState", {
+			this.logDebug("setSystemState", {
 				phaseTransition: true,
 				newState,
 				message: message?.substring(0, 80),
@@ -354,7 +362,7 @@ export class CodeIndexStateManager {
 		this._lastCompletedPipelineSnapshot = undefined
 
 		this.emitProgressUpdate({ forceImmediate: true })
-		IndexDebugLogger.log("StateManager", "resetIndexingState", {
+		this.logDebug("resetIndexingState", {
 			phaseTransition: true,
 			message: message.substring(0, 120),
 		})
@@ -379,7 +387,7 @@ export class CodeIndexStateManager {
 		this._interruptionKind = interruptionKind
 		this._resumeContext = resumeContext
 		this.emitProgressUpdate({ forceImmediate: true })
-		IndexDebugLogger.log("StateManager", "setRecoveryContext", {
+		this.logDebug("setRecoveryContext", {
 			interruptionKind,
 			resumeContext,
 		})
@@ -402,7 +410,7 @@ export class CodeIndexStateManager {
 		this._statusMessage = `Checking ${totalFiles.toLocaleString()} files for changes...`
 
 		this.emitProgressUpdate()
-		IndexDebugLogger.log("StateManager", "reportScanProgress", { scannedFiles, totalFiles })
+		this.logDebug("reportScanProgress", { scannedFiles, totalFiles })
 	}
 
 	/**
@@ -463,7 +471,7 @@ export class CodeIndexStateManager {
 		this._statusMessage = `${prefix}${totalBlocks.toLocaleString()} blocks to index${changedSuffix}`
 
 		this.emitProgressUpdate()
-		IndexDebugLogger.log("StateManager", "startEmbedPhase", {
+		this.logDebug("startEmbedPhase", {
 			phaseTransition: true,
 			totalBlocks,
 			isEstimate,
@@ -504,14 +512,16 @@ export class CodeIndexStateManager {
 		const filesChanged = filesParsed !== undefined && filesParsed !== this._filesParsed
 		const changed = blocksChanged || totalChanged || filesChanged
 		if (!changed && this._systemStatus === "Indexing") {
-			IndexDebugLogger.logSuppressed("StateManager", "reportEmbedProgress", {
-				blocksEmbedded,
-				revisedTotal,
-				filesParsed,
-				storedBlocks: this._blocksEmbedded,
-				storedTotal: this._totalBlocks,
-				storedFiles: this._filesParsed,
-			})
+			if (this._loggerEngine === "legacy") {
+				IndexDebugLogger.logSuppressed("StateManager", "reportEmbedProgress", {
+					blocksEmbedded,
+					revisedTotal,
+					filesParsed,
+					storedBlocks: this._blocksEmbedded,
+					storedTotal: this._totalBlocks,
+					storedFiles: this._filesParsed,
+				})
+			}
 			return
 		}
 
@@ -554,7 +564,7 @@ export class CodeIndexStateManager {
 		// This happens when the cache-based block estimate lags behind actual
 		// embedding output (e.g. stale cache entries, concurrent parse/embed).
 		if (effectiveEmbedded > this._totalBlocks) {
-			IndexDebugLogger.log("StateManager", "auto-revise-total", {
+			this.logDebug("auto-revise-total", {
 				reason: "effectiveEmbedded > totalBlocks",
 				oldTotal: this._totalBlocks,
 				newTotal: effectiveEmbedded,
@@ -623,7 +633,7 @@ export class CodeIndexStateManager {
 		this._statusMessage = `${blockLine}${fileLine}${detailLine}`
 
 		this.emitProgressUpdate({ forceImmediate: true })
-		IndexDebugLogger.log("StateManager", "reportEmbedProgress", {
+		this.logDebug("reportEmbedProgress", {
 			blocksEmbedded,
 			revisedTotal,
 			filesParsed,
@@ -662,13 +672,13 @@ export class CodeIndexStateManager {
 				totalFiles > 0 ? `Index up-to-date — ${totalFiles.toLocaleString()} files` : "Index up-to-date"
 		}
 		this.emitProgressUpdate({ forceImmediate: true })
-		IndexDebugLogger.log("StateManager", "reportComplete", { phaseTransition: true, totalBlocks, totalFiles })
+		this.logDebug("reportComplete", { phaseTransition: true, totalBlocks, totalFiles })
 	}
 
 	public setResilienceStats(stats: Partial<IndexingResilienceStats>): void {
 		this.applyResilienceStats(stats)
 		this.emitProgressUpdate({ forceImmediate: true })
-		IndexDebugLogger.log("StateManager", "setResilienceStats", {
+		this.logDebug("setResilienceStats", {
 			...this._resilienceStats,
 		})
 	}
@@ -676,7 +686,7 @@ export class CodeIndexStateManager {
 	public setOversizedDetails(details: OversizedDetail[]): void {
 		this._oversizedDetails = details
 		this.emitProgressUpdate({ forceImmediate: true })
-		IndexDebugLogger.log("StateManager", "setOversizedDetails", {
+		this.logDebug("setOversizedDetails", {
 			count: details.length,
 		})
 	}
@@ -735,7 +745,7 @@ export class CodeIndexStateManager {
 		}
 
 		this.emitProgressUpdate()
-		IndexDebugLogger.log("StateManager", "reportCustomProgress", {
+		this.logDebug("reportCustomProgress", {
 			message: message.substring(0, 120),
 			processedItems,
 			totalItems,
@@ -758,7 +768,7 @@ export class CodeIndexStateManager {
 			this._statusMessage = this.composeStatusMessage(this._statusMessage.split("\n")[0] ?? this._statusMessage)
 		}
 		this.emitProgressUpdate()
-		IndexDebugLogger.log("StateManager", "reportHeartbeat", {
+		this.logDebug("reportHeartbeat", {
 			message: this._statusMessage.substring(0, 120),
 			phase: this._phase,
 			detailedStage: this._detailedStage,
@@ -773,7 +783,7 @@ export class CodeIndexStateManager {
 			this._statusMessage = this.composeStatusMessage(this._statusMessage.split("\n")[0] ?? this._statusMessage)
 			this.emitProgressUpdate()
 		}
-		IndexDebugLogger.log("StateManager", "setActivityDetail", {
+		this.logDebug("setActivityDetail", {
 			detail: detail.substring(0, 120),
 			phase: this._phase,
 			detailedStage: this._detailedStage,
@@ -1604,6 +1614,19 @@ export class CodeIndexStateManager {
 				this.emitProgressUpdate()
 			}
 		}
+	}
+
+	private logDebug(message: string, data: Record<string, unknown>): void {
+		if (this._loggerEngine === "v2") {
+			IndexDebugLoggerV2.log("basic", "StateManager", message, {
+				component: "StateManager",
+				workspacePath: this._loggerWorkspacePath,
+				...data,
+			})
+			return
+		}
+
+		IndexDebugLogger.log("StateManager", message, data)
 	}
 
 	public dispose(): void {

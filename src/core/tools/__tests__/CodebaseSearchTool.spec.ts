@@ -32,7 +32,7 @@ describe("codebaseSearchTool", () => {
 		})
 
 		mockTask = {
-			cwd: "/workspace",
+			cwd: "/workspace/packages/wiz",
 			consecutiveMistakeCount: 0,
 			didToolFailInCurrentTurn: false,
 			sayAndCreateMissingParamError: vi.fn().mockResolvedValue("Missing parameter error"),
@@ -87,6 +87,7 @@ describe("codebaseSearchTool", () => {
 
 		await codebaseSearchTool.handle(mockTask, block, mockCallbacks)
 
+		expect(mockGetInstance).toHaveBeenCalledWith({}, "/workspace/packages/wiz")
 		expect(mockSearchIndex).toHaveBeenCalledWith("validateToken", {
 			directoryPrefix: "src/auth",
 		})
@@ -172,6 +173,7 @@ describe("codebaseSearchTool", () => {
 
 		await codebaseSearchTool.handle(mockTask, block, mockCallbacks)
 
+		expect(mockGetInstance).toHaveBeenCalledWith({}, "/workspace/packages/wiz")
 		const [, payload] =
 			mockTask.say.mock.calls.find(([event]: [string, string]) => event === "codebase_search_result") ?? []
 		expect(payload).toContain('"filePath":"src/auth/service.ts"')

@@ -68,12 +68,21 @@ export type RegisterCommandOptions = {
 	provider: ClineProvider
 }
 
+function getCurrentCodeIndexManager(
+	context: vscode.ExtensionContext,
+	provider: ClineProvider,
+): CodeIndexManager | undefined {
+	const activeProvider = ClineProvider.getVisibleInstance() ?? provider
+	const workspacePath = activeProvider.getCurrentCodeIndexWorkspacePath()
+	return workspacePath ? CodeIndexManager.getInstance(context, workspacePath) : CodeIndexManager.getInstance(context)
+}
+
 export async function runCodeIndexEvalForCurrentWorkspace({
 	context,
 	outputChannel,
 	provider,
 }: RegisterCommandOptions): Promise<void> {
-	const manager = CodeIndexManager.getInstance(context)
+	const manager = getCurrentCodeIndexManager(context, provider)
 	if (!manager) {
 		outputChannel.appendLine("[CodeIndexEval] No workspace manager is available.")
 		outputChannel.show(true)
@@ -263,7 +272,7 @@ const getCommandsMap = ({ context, outputChannel, provider }: RegisterCommandOpt
 	},
 	startCodeIndexing: async () => {
 		IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-start-indexing-requested")
-		const manager = CodeIndexManager.getInstance(context)
+		const manager = getCurrentCodeIndexManager(context, provider)
 		if (!manager) {
 			IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-start-indexing-no-manager")
 			vscode.window.showWarningMessage(t("embeddings:orchestrator.indexingRequiresWorkspace"))
@@ -291,31 +300,17 @@ const getCommandsMap = ({ context, outputChannel, provider }: RegisterCommandOpt
 	},
 	stopCodeIndexing: async () => {
 		IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-stop-indexing-requested")
-		const managers = CodeIndexManager.getAllInstances()
-		if (managers.length === 0) {
+		const manager = getCurrentCodeIndexManager(context, provider)
+		if (!manager) {
 			IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-stop-indexing-no-manager")
 			vscode.window.showWarningMessage(t("embeddings:orchestrator.indexingRequiresWorkspace"))
 			return
 		}
 
 		try {
-			const results = await Promise.allSettled(managers.map((manager) => manager.stopIndexing()))
-			const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected")
-			if (rejected.length > 0) {
-				const message =
-					rejected[0]?.reason instanceof Error ? rejected[0].reason.message : String(rejected[0]?.reason)
-				IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-stop-indexing-failed", {
-					managerCount: managers.length,
-					errorMessage: message,
-				})
-				outputChannel.appendLine(`[CodeIndexCommands] Failed to stop indexing: ${message}`)
-				vscode.window.showErrorMessage(`Failed to stop code indexing: ${message}`)
-				return
-			}
-
-			const status = managers[0]?.getCurrentStatus()
+			await manager.stopIndexing()
+			const status = manager.getCurrentStatus()
 			IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-stop-indexing-complete", {
-				managerCount: managers.length,
 				message: status?.message,
 			})
 			vscode.window.showInformationMessage(status?.message || "Code indexing stopped.")
@@ -331,31 +326,17 @@ const getCommandsMap = ({ context, outputChannel, provider }: RegisterCommandOpt
 	forceStopCodeIndexing: async () => {
 		IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-force-stop-indexing-requested")
 		outputChannel.appendLine("[CodeIndexCommands] Emergency stop requested.")
-		const managers = CodeIndexManager.getAllInstances()
-		if (managers.length === 0) {
+		const manager = getCurrentCodeIndexManager(context, provider)
+		if (!manager) {
 			IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-force-stop-indexing-no-manager")
 			vscode.window.showWarningMessage(t("embeddings:orchestrator.indexingRequiresWorkspace"))
 			return
 		}
 
 		try {
-			const results = await Promise.allSettled(managers.map((manager) => manager.stopIndexing()))
-			const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected")
-			if (rejected.length > 0) {
-				const message =
-					rejected[0]?.reason instanceof Error ? rejected[0].reason.message : String(rejected[0]?.reason)
-				IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-force-stop-indexing-failed", {
-					managerCount: managers.length,
-					errorMessage: message,
-				})
-				outputChannel.appendLine(`[CodeIndexCommands] Emergency stop failed: ${message}`)
-				vscode.window.showErrorMessage(`Emergency stop failed: ${message}`)
-				return
-			}
-
-			const status = managers[0]?.getCurrentStatus()
+			await manager.stopIndexing()
+			const status = manager.getCurrentStatus()
 			IndexDebugLoggerV2.log("basic", "CodeIndexCommands", "command-force-stop-indexing-complete", {
-				managerCount: managers.length,
 				message: status?.message,
 			})
 			outputChannel.appendLine(

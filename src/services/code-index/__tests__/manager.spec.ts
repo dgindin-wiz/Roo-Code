@@ -3,6 +3,35 @@ import { CodeIndexServiceFactory } from "../service-factory"
 import { afterEach, beforeEach, describe, expect, it, vi, type MockedClass } from "vitest"
 import * as path from "path"
 
+const {
+	testWorkspacePath: mockedTestWorkspacePath,
+	mockedPathSep,
+	workspaceFolderState,
+} = vi.hoisted(() => {
+	const testPath = require("path")
+	const testWorkspacePath = testPath.join(testPath.sep, "test", "workspace")
+	const createWorkspaceFolder = (fsPath: string, name = testPath.basename(fsPath), index = 0) => ({
+		uri: {
+			fsPath,
+			scheme: "file",
+			authority: "",
+			path: fsPath,
+			toString: (_skipEncoding?: boolean) => `file://${fsPath}`,
+		},
+		name,
+		index,
+	})
+
+	return {
+		testWorkspacePath,
+		mockedPathSep: testPath.sep,
+		workspaceFolderState: {
+			workspaceFolders: [createWorkspaceFolder(testWorkspacePath, "test", 0)],
+			createWorkspaceFolder,
+		},
+	}
+})
+
 const { mockCodeIndexEngineV2, MockedCodeIndexEngineV2Class } = vi.hoisted(() => {
 	const engine = {
 		start: vi.fn().mockResolvedValue(undefined),
@@ -38,8 +67,6 @@ function mockUri(fsPath: string, scheme = "file") {
 
 // Mock vscode module
 vi.mock("vscode", () => {
-	const testPath = require("path")
-	const testWorkspacePath = testPath.join(testPath.sep, "test", "workspace")
 	return {
 		Uri: {
 			file: (p: string) => ({
@@ -55,19 +82,12 @@ vi.mock("vscode", () => {
 			activeTextEditor: null,
 		},
 		workspace: {
-			workspaceFolders: [
-				{
-					uri: {
-						fsPath: testWorkspacePath,
-						scheme: "file",
-						authority: "",
-						path: testWorkspacePath,
-						toString: (_skipEncoding?: boolean) => `file://${testWorkspacePath}`,
-					},
-					name: "test",
-					index: 0,
-				},
-			],
+			get workspaceFolders() {
+				return workspaceFolderState.workspaceFolders
+			},
+			set workspaceFolders(value) {
+				workspaceFolderState.workspaceFolders = value
+			},
 			createFileSystemWatcher: vi.fn().mockReturnValue({
 				onDidCreate: vi.fn().mockReturnValue({ dispose: vi.fn() }),
 				onDidChange: vi.fn().mockReturnValue({ dispose: vi.fn() }),
@@ -97,7 +117,13 @@ vi.mock("vscode", () => {
 					return defaultValue
 				}),
 			}),
-			getWorkspaceFolder: vi.fn(),
+			getWorkspaceFolder: vi.fn((uri: { fsPath: string }) =>
+				workspaceFolderState.workspaceFolders.find(
+					(folder: any) =>
+						uri.fsPath === folder.uri.fsPath ||
+						uri.fsPath.startsWith(`${folder.uri.fsPath}${mockedPathSep}`),
+				),
+			),
 		},
 		RelativePattern: vi.fn().mockImplementation((base: any, pattern: any) => ({ base, pattern })),
 	}
@@ -105,10 +131,18 @@ vi.mock("vscode", () => {
 
 // Mock only the essential dependencies
 vi.mock("../../../utils/path", () => {
-	const testPath = require("path")
-	const testWorkspacePath = testPath.join(testPath.sep, "test", "workspace")
 	return {
-		getWorkspacePath: vi.fn(() => testWorkspacePath),
+		getWorkspacePath: vi.fn(() => mockedTestWorkspacePath),
+		getWorkspaceFolderForPath: vi.fn((contextPath?: string) => {
+			if (!contextPath) {
+				return undefined
+			}
+			return workspaceFolderState.workspaceFolders.find(
+				(folder: any) =>
+					contextPath === folder.uri.fsPath || contextPath.startsWith(`${folder.uri.fsPath}${mockedPathSep}`),
+			)
+		}),
+		getCurrentWorkspaceFolder: vi.fn(() => workspaceFolderState.workspaceFolders[0]),
 	}
 })
 
@@ -144,6 +178,7 @@ vi.mock("../state-manager", () => ({
 		getCurrentStatus: vi.fn(),
 		dispose: vi.fn(),
 		setSystemState: vi.fn(),
+		setLoggerContext: vi.fn(),
 		setResilienceStats: vi.fn(),
 	})),
 }))
@@ -1148,6 +1183,24 @@ describe("CodeIndexManager - handleSettingsChange regression", () => {
 			expect(managerB.isWorkspaceEnabled).toBe(true)
 
 			CodeIndexManager.disposeAll()
+		})
+
+		it("should normalize nested paths to the containing workspace root", () => {
+			CodeIndexManager.disposeAll()
+
+			const nestedWorkspacePath = path.join(testWorkspacePath, "packages", "wiz")
+			workspaceFolderState.workspaceFolders = [
+				{
+					uri: mockUri(testWorkspacePath),
+					name: "workspace",
+					index: 0,
+				},
+			]
+
+			const rootManager = CodeIndexManager.getInstance(mockContext as any, testWorkspacePath)
+			const nestedManager = CodeIndexManager.getInstance(mockContext as any, nestedWorkspacePath)
+
+			expect(nestedManager).toBe(rootManager)
 		})
 	})
 

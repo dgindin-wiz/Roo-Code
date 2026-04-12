@@ -126,7 +126,7 @@ export class SidecarParseExecutor {
 			execArgv: [],
 			env: {
 				...process.env,
-				ROO_CODE_INDEX_V2_DIAGNOSTICS_DIR: IndexDebugLoggerV2.getDiagnosticsDirectory(),
+				ROO_CODE_INDEX_V2_DIAGNOSTICS_DIR: IndexDebugLoggerV2.getDiagnosticsDirectory(this.workspacePath),
 			},
 		})
 		lane.child = child
@@ -136,6 +136,7 @@ export class SidecarParseExecutor {
 				processRole: "host",
 				sidecarLane: lane.index + 1,
 				sidecarPid: child.pid,
+				workspacePath: this.workspacePath,
 			})
 		})
 		child.stdout?.on("data", (chunk: Buffer | string) => {
@@ -149,6 +150,7 @@ export class SidecarParseExecutor {
 				sidecarLane: lane.index + 1,
 				sidecarPid: child.pid,
 				errorMessage: line.slice(0, 1000),
+				workspacePath: this.workspacePath,
 			})
 		})
 		child.stderr?.on("data", (chunk: Buffer | string) => {
@@ -162,6 +164,7 @@ export class SidecarParseExecutor {
 				sidecarLane: lane.index + 1,
 				sidecarPid: child.pid,
 				errorMessage: line.slice(0, 1000),
+				workspacePath: this.workspacePath,
 			})
 		})
 		child.on("message", (message: ParseSidecarChildToHostMessage) => {
@@ -174,6 +177,7 @@ export class SidecarParseExecutor {
 				sidecarLane: lane.index + 1,
 				sidecarPid: child.pid,
 				errorMessage: error.message,
+				workspacePath: this.workspacePath,
 			})
 			for (const pending of lane.pending.values()) {
 				pending.reject(error)
@@ -181,10 +185,10 @@ export class SidecarParseExecutor {
 			lane.pending.clear()
 			lane.child = undefined
 			lane.ready = undefined
-			IndexDebugLoggerV2.clearTrackedProcessSnapshot(`parse:${lane.index + 1}`)
+			IndexDebugLoggerV2.clearTrackedProcessSnapshot(this.getTrackedProcessKey(lane))
 		})
 		child.on("exit", (code, signal) => {
-			IndexDebugLoggerV2.clearTrackedProcessSnapshot(`parse:${lane.index + 1}`)
+			IndexDebugLoggerV2.clearTrackedProcessSnapshot(this.getTrackedProcessKey(lane))
 			IndexDebugLoggerV2.log("basic", "CodeIndexParseSidecar", "parse-sidecar-exit", {
 				component: "CodeIndexParseSidecar",
 				processRole: "sidecar",
@@ -192,6 +196,7 @@ export class SidecarParseExecutor {
 				sidecarPid: child.pid,
 				exitCode: code,
 				exitSignal: signal,
+				workspacePath: this.workspacePath,
 			})
 			const error = new Error(
 				`Code index parse sidecar exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "null"})`,
@@ -211,6 +216,7 @@ export class SidecarParseExecutor {
 				sidecarPid: child.pid,
 				exitCode: code,
 				exitSignal: signal,
+				workspacePath: this.workspacePath,
 			})
 		})
 
@@ -230,6 +236,7 @@ export class SidecarParseExecutor {
 				processRole: "host",
 				sidecarLane: lane.index + 1,
 				sidecarPid: child.pid,
+				workspacePath: this.workspacePath,
 			})
 			lane.child?.send({
 				type: "init",
@@ -296,13 +303,15 @@ export class SidecarParseExecutor {
 					sidecarPid: lane.child?.pid,
 					memory: message.memory,
 					cpu: message.cpu,
+					workspacePath: this.workspacePath,
 				})
 				return
 			case "ready":
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
-					`parse:${lane.index + 1}`,
+					this.getTrackedProcessKey(lane),
 					"parseSidecars",
 					`parse-lane-${lane.index + 1}`,
+					this.workspacePath,
 					message.pid,
 					message.memory,
 					message.cpu,
@@ -314,6 +323,7 @@ export class SidecarParseExecutor {
 					sidecarPid: message.pid,
 					memory: message.memory,
 					cpu: message.cpu,
+					workspacePath: this.workspacePath,
 				})
 				for (const [requestId, pending] of lane.pending) {
 					if (requestId.startsWith("ready:init-")) {
@@ -328,9 +338,10 @@ export class SidecarParseExecutor {
 				if (!pending) return
 				lane.pending.delete(message.requestId)
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
-					`parse:${lane.index + 1}`,
+					this.getTrackedProcessKey(lane),
 					"parseSidecars",
 					`parse-lane-${lane.index + 1}`,
+					this.workspacePath,
 					lane.child?.pid,
 					message.memory,
 					message.cpu,
@@ -345,6 +356,7 @@ export class SidecarParseExecutor {
 					chunkCount: message.chunks.length,
 					memory: message.memory,
 					cpu: message.cpu,
+					workspacePath: this.workspacePath,
 				})
 				pending.resolve({
 					chunks: message.chunks,
@@ -362,9 +374,10 @@ export class SidecarParseExecutor {
 			}
 			case "error": {
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
-					`parse:${lane.index + 1}`,
+					this.getTrackedProcessKey(lane),
 					"parseSidecars",
 					`parse-lane-${lane.index + 1}`,
+					this.workspacePath,
 					lane.child?.pid,
 					message.memory,
 					message.cpu,
@@ -378,6 +391,7 @@ export class SidecarParseExecutor {
 					errorMessage: message.errorMessage,
 					memory: message.memory,
 					cpu: message.cpu,
+					workspacePath: this.workspacePath,
 				})
 				if (message.requestId) {
 					const pending = lane.pending.get(message.requestId)
@@ -400,12 +414,13 @@ export class SidecarParseExecutor {
 			sidecarPid: lane.child?.pid,
 			errorMessage: error.message,
 			jobId: reason,
+			workspacePath: this.workspacePath,
 		})
 		this.rejectPendingReadyRequests(lane, error)
 		lane.child?.kill()
 		lane.child = undefined
 		lane.ready = undefined
-		IndexDebugLoggerV2.clearTrackedProcessSnapshot(`parse:${lane.index + 1}`)
+		IndexDebugLoggerV2.clearTrackedProcessSnapshot(this.getTrackedProcessKey(lane))
 	}
 
 	private rejectPendingReadyRequests(lane: ParseLane, error: Error) {
@@ -487,5 +502,9 @@ export class SidecarParseExecutor {
 	private nextRequestId(prefix: string) {
 		this.requestCounter += 1
 		return `${prefix}:${this.requestCounter}`
+	}
+
+	private getTrackedProcessKey(lane: ParseLane): string {
+		return `${this.workspacePath}:parse:${lane.index + 1}`
 	}
 }

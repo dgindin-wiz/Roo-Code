@@ -19,6 +19,8 @@ import { TelemetryEventName } from "@roo-code/types"
 import { getConfiguredCodeIndexEngine } from "../code-index-v2/settings"
 import { CODE_INDEX_V2_ENGINE_ID, CodeIndexEngineKind } from "../code-index-v2/shared/constants"
 import { CodeIndexDebugSearchTrace, CodeIndexEngineV2, ICodeIndexEngine, IndexDebugLoggerV2 } from "../code-index-v2"
+import { ensureWorkspaceCodeIndexConfig, getWorkspaceCodeIndexConfig } from "./workspace-config"
+import { getCurrentWorkspaceFolder, getWorkspaceFolderForPath } from "../../utils/path"
 
 export class CodeIndexManager {
 	private static readonly V2_STARTUP_IDLE_DELAY_MS = 6_000
@@ -56,18 +58,14 @@ export class CodeIndexManager {
 		let folder: vscode.WorkspaceFolder | undefined
 
 		if (workspacePath) {
-			folder = vscode.workspace.workspaceFolders?.find((f) => f.uri.fsPath === workspacePath)
-		} else {
-			const activeEditor = vscode.window.activeTextEditor
-			if (activeEditor) {
-				folder = vscode.workspace.getWorkspaceFolder(activeEditor.document.uri)
+			folder = getWorkspaceFolderForPath(workspacePath)
+			if (folder) {
+				workspacePath = folder.uri.fsPath
 			}
+		} else {
+			folder = getCurrentWorkspaceFolder()
 			if (!folder) {
-				const workspaceFolders = vscode.workspace.workspaceFolders
-				if (!workspaceFolders || workspaceFolders.length === 0) {
-					return undefined
-				}
-				folder = workspaceFolders[0]
+				return undefined
 			}
 			workspacePath = folder.uri.fsPath
 		}
@@ -244,13 +242,26 @@ export class CodeIndexManager {
 	public async initialize(contextProxy: ContextProxy): Promise<{ requiresRestart: boolean }> {
 		// Store contextProxy for later re-initialization (e.g. recovery from Error state)
 		this._contextProxy = contextProxy
+		const legacyCodeIndexConfig = this.getLegacyCodeIndexConfig(contextProxy)
+		await ensureWorkspaceCodeIndexConfig(this.context, this.workspacePath, legacyCodeIndexConfig, this._folderUri)
 
 		// 1. ConfigManager Initialization and Configuration Loading
 		if (!this._configManager) {
-			this._configManager = new CodeIndexConfigManager(contextProxy)
+			this._configManager = new CodeIndexConfigManager(contextProxy, () =>
+				getWorkspaceCodeIndexConfig(
+					this.context,
+					this.workspacePath,
+					this.getLegacyCodeIndexConfig(contextProxy),
+					this._folderUri,
+				),
+			)
 		}
 		// Load configuration once to get current state and restart requirements
 		const { requiresRestart } = await this._configManager.loadConfiguration()
+		this._stateManager.setLoggerContext(
+			this.selectedEngine === CODE_INDEX_V2_ENGINE_ID ? "v2" : "legacy",
+			this.workspacePath,
+		)
 
 		// 2. Check if feature is enabled
 		if (!this.isFeatureEnabled) {
@@ -803,6 +814,10 @@ export class CodeIndexManager {
 	public async handleSettingsChange(): Promise<void> {
 		if (this._configManager) {
 			const { requiresRestart } = await this._configManager.loadConfiguration()
+			this._stateManager.setLoggerContext(
+				this.selectedEngine === CODE_INDEX_V2_ENGINE_ID ? "v2" : "legacy",
+				this.workspacePath,
+			)
 
 			const isFeatureEnabled = this.isFeatureEnabled
 			const isFeatureConfigured = this.isFeatureConfigured
@@ -1063,6 +1078,13 @@ export class CodeIndexManager {
 
 	private isStoppedV2Status(status: Awaited<ReturnType<ICodeIndexEngine["getStatus"]>>): boolean {
 		return status.state === "idle" && /indexing stopped/i.test(status.message ?? "")
+	}
+
+	private getLegacyCodeIndexConfig(contextProxy: Pick<ContextProxy, "getGlobalState"> | undefined) {
+		if (!contextProxy || typeof contextProxy.getGlobalState !== "function") {
+			return undefined
+		}
+		return contextProxy.getGlobalState("codebaseIndexConfig")
 	}
 
 	private startV2StartupWatchdog(): () => void {

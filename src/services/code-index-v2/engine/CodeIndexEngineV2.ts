@@ -171,7 +171,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		// Point the logger at the workspace-scoped diagnostics file before the
 		// first session-start write so early startup events do not land in the
 		// home-directory fallback log.
-		IndexDebugLoggerV2.configureDiagnosticsDirectory(this.metadataStore.getDiagnosticsDirectoryPath())
+		IndexDebugLoggerV2.configureDiagnosticsDirectory(
+			this.metadataStore.getDiagnosticsDirectoryPath(),
+			this.workspacePath,
+		)
 		IndexDebugLoggerV2.setContext({
 			engine: this.engine,
 			component: "CodeIndexEngineV2",

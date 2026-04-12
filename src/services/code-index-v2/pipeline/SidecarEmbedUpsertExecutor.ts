@@ -176,7 +176,7 @@ export class SidecarEmbedUpsertExecutor {
 			execArgv: [],
 			env: {
 				...process.env,
-				ROO_CODE_INDEX_V2_DIAGNOSTICS_DIR: IndexDebugLoggerV2.getDiagnosticsDirectory(),
+				ROO_CODE_INDEX_V2_DIAGNOSTICS_DIR: IndexDebugLoggerV2.getDiagnosticsDirectory(this.workspacePath),
 			},
 		})
 		lane.child = child
@@ -184,7 +184,7 @@ export class SidecarEmbedUpsertExecutor {
 			this.handleChildMessage(lane, message)
 		})
 		child.on("exit", (code, signal) => {
-			IndexDebugLoggerV2.clearTrackedProcessSnapshot(`embed:${lane.index + 1}`)
+			IndexDebugLoggerV2.clearTrackedProcessSnapshot(this.getTrackedProcessKey(lane))
 			IndexDebugLoggerV2.log("basic", "CodeIndexIndexingSidecar", "sidecar-exit", {
 				component: "CodeIndexIndexingSidecar",
 				processRole: "sidecar",
@@ -192,6 +192,7 @@ export class SidecarEmbedUpsertExecutor {
 				sidecarPid: child.pid,
 				exitCode: code,
 				exitSignal: signal,
+				workspacePath: this.workspacePath,
 			})
 			const error = new Error(
 				`Code index sidecar exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "null"})`,
@@ -208,6 +209,7 @@ export class SidecarEmbedUpsertExecutor {
 			processRole: "host",
 			sidecarLane: lane.index + 1,
 			sidecarScriptPath: this.sidecarScriptPath,
+			workspacePath: this.workspacePath,
 		})
 
 		await new Promise<void>((resolve, reject) => {
@@ -244,9 +246,10 @@ export class SidecarEmbedUpsertExecutor {
 		switch (message.type) {
 			case "ready": {
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
-					`embed:${lane.index + 1}`,
+					this.getTrackedProcessKey(lane),
 					"embedSidecars",
 					`embed-lane-${lane.index + 1}`,
+					this.workspacePath,
 					message.pid,
 					message.memory,
 					message.cpu,
@@ -258,6 +261,7 @@ export class SidecarEmbedUpsertExecutor {
 					sidecarPid: message.pid,
 					memory: message.memory,
 					cpu: message.cpu,
+					workspacePath: this.workspacePath,
 				})
 				for (const [requestId, pending] of lane.pending) {
 					if (requestId.startsWith("ready:init-")) {
@@ -270,9 +274,10 @@ export class SidecarEmbedUpsertExecutor {
 			}
 			case "log": {
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
-					`embed:${lane.index + 1}`,
+					this.getTrackedProcessKey(lane),
 					"embedSidecars",
 					`embed-lane-${lane.index + 1}`,
+					this.workspacePath,
 					lane.child?.pid,
 					(message.context?.memory as any) ?? undefined,
 					(message.context?.cpu as any) ?? undefined,
@@ -282,6 +287,7 @@ export class SidecarEmbedUpsertExecutor {
 					sidecarLane: lane.index + 1,
 					sidecarPid: lane.child?.pid,
 					...(message.context ?? {}),
+					workspacePath: this.workspacePath,
 				})
 				return
 			}
@@ -292,9 +298,10 @@ export class SidecarEmbedUpsertExecutor {
 				}
 				lane.pending.delete(message.requestId)
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
-					`embed:${lane.index + 1}`,
+					this.getTrackedProcessKey(lane),
 					"embedSidecars",
 					`embed-lane-${lane.index + 1}`,
+					this.workspacePath,
 					lane.child?.pid,
 					message.memory,
 					message.cpu,
@@ -310,6 +317,7 @@ export class SidecarEmbedUpsertExecutor {
 					upsertLatencyMs: message.upsertLatencyMs,
 					memory: message.memory,
 					cpu: message.cpu,
+					workspacePath: this.workspacePath,
 				})
 				pending.resolve({
 					embeddingCount: message.embeddingCount,
@@ -331,9 +339,10 @@ export class SidecarEmbedUpsertExecutor {
 			}
 			case "error": {
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
-					`embed:${lane.index + 1}`,
+					this.getTrackedProcessKey(lane),
 					"embedSidecars",
 					`embed-lane-${lane.index + 1}`,
+					this.workspacePath,
 					lane.child?.pid,
 					message.memory,
 					message.cpu,
@@ -348,6 +357,7 @@ export class SidecarEmbedUpsertExecutor {
 					retryable: message.retryable,
 					memory: message.memory,
 					cpu: message.cpu,
+					workspacePath: this.workspacePath,
 				})
 				if (message.requestId) {
 					const pending = lane.pending.get(message.requestId)
@@ -364,5 +374,9 @@ export class SidecarEmbedUpsertExecutor {
 	private nextRequestId(prefix: string) {
 		this.requestCounter += 1
 		return `${prefix}:${this.requestCounter}`
+	}
+
+	private getTrackedProcessKey(lane: SidecarLane): string {
+		return `${this.workspacePath}:embed:${lane.index + 1}`
 	}
 }

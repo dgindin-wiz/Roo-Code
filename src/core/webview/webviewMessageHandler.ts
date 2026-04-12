@@ -13,6 +13,7 @@ import {
 	type TelemetrySetting,
 	type UserSettingsConfig,
 	type ModelRecord,
+	type CodebaseIndexConfig,
 	type Command as SlashCommand,
 	type WebviewMessage,
 	type EditQueuedMessagePayload,
@@ -48,6 +49,11 @@ import { type RouterName, toRouterName } from "../../shared/api"
 import { MessageEnhancer } from "./messageEnhancer"
 
 import { CodeIndexManager } from "../../services/code-index/manager"
+import {
+	ensureWorkspaceCodeIndexConfig,
+	getWorkspaceCodeIndexConfig,
+	setWorkspaceCodeIndexConfig,
+} from "../../services/code-index/workspace-config"
 import { checkExistKey } from "../../shared/checkExistApiConfig"
 import { experimentDefault } from "../../shared/experiments"
 import { Terminal } from "../../integrations/terminal/Terminal"
@@ -961,6 +967,7 @@ export const webviewMessageHandler = async (
 			await exportSettings({
 				providerSettingsManager: provider.providerSettingsManager,
 				contextProxy: provider.contextProxy,
+				provider,
 			})
 
 			break
@@ -2537,13 +2544,19 @@ export const webviewMessageHandler = async (
 			const settingsRecord = settings as Record<string, unknown>
 
 			try {
+				const workspacePath = provider.getCurrentCodeIndexWorkspacePath()
+				const legacyConfig = getGlobalState("codebaseIndexConfig")
+				const currentConfig: CodebaseIndexConfig =
+					(workspacePath
+						? ((await ensureWorkspaceCodeIndexConfig(provider.context, workspacePath, legacyConfig),
+							getWorkspaceCodeIndexConfig(provider.context, workspacePath, legacyConfig)) ?? {})
+						: legacyConfig) ?? {}
+
 				// Check if embedder provider has changed
-				const currentConfig = getGlobalState("codebaseIndexConfig") || {}
 				const embedderProviderChanged =
 					currentConfig.codebaseIndexEmbedderProvider !== settings.codebaseIndexEmbedderProvider
 
-				// Save global state settings atomically
-				const globalStateConfig = {
+				const workspaceConfig = {
 					...currentConfig,
 					codebaseIndexEnabled: settings.codebaseIndexEnabled,
 					codebaseIndexQdrantUrl: settings.codebaseIndexQdrantUrl,
@@ -2561,8 +2574,9 @@ export const webviewMessageHandler = async (
 					codebaseIndexOversizedFileApprovals: settings.codebaseIndexOversizedFileApprovals,
 				}
 
-				// Save global state first
-				await updateGlobalState("codebaseIndexConfig", globalStateConfig)
+				if (workspacePath) {
+					await setWorkspaceCodeIndexConfig(provider.context, workspacePath, workspaceConfig)
+				}
 
 				for (const { stateKey, configurationKey } of CODE_INDEX_VSCODE_SETTINGS) {
 					if (Object.prototype.hasOwnProperty.call(settings, stateKey)) {
@@ -2614,7 +2628,7 @@ export const webviewMessageHandler = async (
 				await provider.postMessageToWebview({
 					type: "codeIndexSettingsSaved",
 					success: true,
-					settings: globalStateConfig,
+					settings: workspaceConfig,
 				})
 
 				// Update webview state

@@ -1,4 +1,5 @@
 import * as vscode from "vscode"
+import type { CodebaseIndexConfig } from "@roo-code/types"
 import { ApiHandlerOptions } from "../../shared/api"
 import { ContextProxy } from "../../core/config/ContextProxy"
 import { EmbedderProvider } from "./interfaces/manager"
@@ -13,6 +14,7 @@ import { Package } from "../../shared/package"
  */
 export class CodeIndexConfigManager {
 	private static readonly DEFAULT_MAX_FILE_SIZE_MB = 1
+	private readonly getStoredCodebaseIndexConfig: () => CodebaseIndexConfig | undefined
 	private codebaseIndexEnabled: boolean = false
 	private embedderProvider: EmbedderProvider = "openai"
 	private modelId?: string
@@ -41,7 +43,12 @@ export class CodeIndexConfigManager {
 	private includeDefaultIgnoredGeneratedPaths: boolean = false
 	private embeddingLaneConcurrency: number = 2
 
-	constructor(private readonly contextProxy: ContextProxy) {
+	constructor(
+		private readonly contextProxy: ContextProxy,
+		getStoredCodebaseIndexConfig?: () => CodebaseIndexConfig | undefined,
+	) {
+		this.getStoredCodebaseIndexConfig =
+			getStoredCodebaseIndexConfig ?? (() => this.contextProxy?.getGlobalState("codebaseIndexConfig"))
 		// Initialize with current configuration to avoid false restart triggers
 		this._loadAndSetConfiguration()
 	}
@@ -59,7 +66,7 @@ export class CodeIndexConfigManager {
 	 */
 	private _loadAndSetConfiguration(): void {
 		// Load configuration from storage
-		const codebaseIndexConfig = this.contextProxy?.getGlobalState("codebaseIndexConfig") ?? {
+		const codebaseIndexConfig = this.getStoredCodebaseIndexConfig() ?? {
 			codebaseIndexEnabled: false,
 			codebaseIndexQdrantUrl: "http://localhost:6333",
 			codebaseIndexEmbedderProvider: "openai",

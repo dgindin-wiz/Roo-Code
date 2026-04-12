@@ -36,6 +36,7 @@ export class IndexDebugLoggerV2 {
 		buildTimestamp: Package.buildTimestamp,
 		sha: Package.sha,
 	}
+	private static readonly _workspaceDiagnosticsDirs = new Map<string, string>()
 	private static _diagnosticsDir = process.env[CODE_INDEX_V2_LOG_ENV_VAR]
 	private static _logPath = this.computeLogPath(this._diagnosticsDir)
 	private static _lastCpuSample:
@@ -49,6 +50,7 @@ export class IndexDebugLoggerV2 {
 		{
 			group: string
 			label: string
+			workspacePath?: string
 			pid?: number
 			memory?: CodeIndexV2MemorySnapshot
 			cpu?: CodeIndexV2CpuSnapshot
@@ -107,10 +109,11 @@ export class IndexDebugLoggerV2 {
 			reportedMemory,
 			reportedCpu,
 			reportedGpu,
-			trackedProcesses: this.getTrackedProcessSummary(),
+			trackedProcesses: this.getTrackedProcessSummary(restContext.workspacePath),
 		}
 
 		const line = JSON.stringify(payload)
+		const logPath = this.resolveLogPath(restContext.workspacePath)
 
 		try {
 			this.getChannel().appendLine(`[CodeIndexV2] ${message}`)
@@ -120,9 +123,9 @@ export class IndexDebugLoggerV2 {
 
 		if (this.isEnabled()) {
 			try {
-				this.ensureLogDirectory()
-				this.rotateIfNeeded()
-				fs.appendFileSync(this._logPath, line + "\n")
+				this.ensureLogDirectory(logPath)
+				this.rotateIfNeeded(logPath)
+				fs.appendFileSync(logPath, line + "\n")
 			} catch {
 				// Best effort only.
 			}
@@ -184,6 +187,7 @@ export class IndexDebugLoggerV2 {
 		key: string,
 		group: string,
 		label: string,
+		workspacePath: string | undefined,
 		pid: number | undefined,
 		memory: CodeIndexV2MemorySnapshot | undefined,
 		cpu?: CodeIndexV2CpuSnapshot,
@@ -191,6 +195,7 @@ export class IndexDebugLoggerV2 {
 		this._trackedProcesses.set(key, {
 			group,
 			label,
+			workspacePath,
 			pid,
 			memory,
 			cpu,
@@ -202,7 +207,16 @@ export class IndexDebugLoggerV2 {
 		this._trackedProcesses.delete(key)
 	}
 
-	static configureDiagnosticsDirectory(directoryPath: string | undefined): void {
+	static configureDiagnosticsDirectory(directoryPath: string | undefined, workspacePath?: string): void {
+		if (workspacePath) {
+			if (directoryPath) {
+				this._workspaceDiagnosticsDirs.set(workspacePath, directoryPath)
+			} else {
+				this._workspaceDiagnosticsDirs.delete(workspacePath)
+			}
+			return
+		}
+
 		this._diagnosticsDir = directoryPath
 		if (directoryPath) {
 			process.env[CODE_INDEX_V2_LOG_ENV_VAR] = directoryPath
@@ -212,20 +226,23 @@ export class IndexDebugLoggerV2 {
 		this._logPath = this.computeLogPath(directoryPath)
 	}
 
-	static getDiagnosticsDirectory(): string {
-		return path.dirname(this._logPath)
+	static getDiagnosticsDirectory(workspacePath?: string): string {
+		return path.dirname(this.getLogPath(workspacePath))
 	}
 
-	static getLogPath(): string {
-		return this._logPath
+	static getLogPath(workspacePath?: string): string {
+		return this.resolveLogPath(workspacePath)
 	}
 
 	static getBuildInfo(): typeof IndexDebugLoggerV2._build {
 		return { ...this._build }
 	}
 
-	static getTrackedProcessSummary(): Record<string, unknown> | undefined {
-		if (this._trackedProcesses.size === 0) {
+	static getTrackedProcessSummary(workspacePath?: string): Record<string, unknown> | undefined {
+		const trackedProcesses = Array.from(this._trackedProcesses.values()).filter(
+			(tracked) => tracked.workspacePath === undefined || tracked.workspacePath === workspacePath,
+		)
+		if (trackedProcesses.length === 0) {
 			return undefined
 		}
 
@@ -239,7 +256,7 @@ export class IndexDebugLoggerV2 {
 			}
 		>()
 
-		for (const tracked of this._trackedProcesses.values()) {
+		for (const tracked of trackedProcesses) {
 			const entry = groups.get(tracked.group) ?? {
 				count: 0,
 				totalRssMB: 0,
@@ -261,14 +278,15 @@ export class IndexDebugLoggerV2 {
 		}
 
 		return {
-			totalTrackedProcesses: this._trackedProcesses.size,
+			totalTrackedProcesses: trackedProcesses.length,
 			totalTrackedRssMB,
 			byGroup,
 		}
 	}
 
-	static listLogFiles(): string[] {
-		const diagnosticsDir = this.getDiagnosticsDirectory()
+	static listLogFiles(workspacePath?: string): string[] {
+		const diagnosticsDir = this.getDiagnosticsDirectory(workspacePath)
+		const logPath = this.getLogPath(workspacePath)
 		try {
 			const entries = fs
 				.readdirSync(diagnosticsDir)
@@ -285,7 +303,7 @@ export class IndexDebugLoggerV2 {
 				return leftMtime - rightMtime
 			})
 		} catch {
-			return fs.existsSync(this._logPath) ? [this._logPath] : []
+			return fs.existsSync(logPath) ? [logPath] : []
 		}
 	}
 
@@ -306,14 +324,22 @@ export class IndexDebugLoggerV2 {
 		return path.join(os.homedir(), CODE_INDEX_V2_DIAGNOSTICS_DIR_BASENAME, CODE_INDEX_V2_LOG_BASENAME)
 	}
 
-	private static ensureLogDirectory(): void {
-		fs.mkdirSync(path.dirname(this._logPath), { recursive: true })
+	private static resolveLogPath(workspacePath?: string): string {
+		const diagnosticsDir =
+			workspacePath && this._workspaceDiagnosticsDirs.has(workspacePath)
+				? this._workspaceDiagnosticsDirs.get(workspacePath)
+				: this._diagnosticsDir
+		return this.computeLogPath(diagnosticsDir)
 	}
 
-	private static rotateIfNeeded(): void {
+	private static ensureLogDirectory(logPath: string): void {
+		fs.mkdirSync(path.dirname(logPath), { recursive: true })
+	}
+
+	private static rotateIfNeeded(logPath: string): void {
 		let stat: fs.Stats | undefined
 		try {
-			stat = fs.statSync(this._logPath)
+			stat = fs.statSync(logPath)
 		} catch {
 			return
 		}
@@ -322,7 +348,7 @@ export class IndexDebugLoggerV2 {
 		}
 
 		for (let index = CODE_INDEX_V2_LOG_MAX_ROTATED_FILES; index >= 1; index--) {
-			const rotatedPath = `${this._logPath}.${index}.gz`
+			const rotatedPath = `${logPath}.${index}.gz`
 			if (!fs.existsSync(rotatedPath)) {
 				continue
 			}
@@ -330,13 +356,13 @@ export class IndexDebugLoggerV2 {
 				fs.unlinkSync(rotatedPath)
 				continue
 			}
-			fs.renameSync(rotatedPath, `${this._logPath}.${index + 1}.gz`)
+			fs.renameSync(rotatedPath, `${logPath}.${index + 1}.gz`)
 		}
 
-		const currentContents = fs.readFileSync(this._logPath)
+		const currentContents = fs.readFileSync(logPath)
 		const compressed = zlib.gzipSync(currentContents)
-		fs.writeFileSync(`${this._logPath}.1.gz`, compressed)
-		fs.truncateSync(this._logPath, 0)
+		fs.writeFileSync(`${logPath}.1.gz`, compressed)
+		fs.truncateSync(logPath, 0)
 	}
 
 	private static safeStatMtime(entryPath: string): number {

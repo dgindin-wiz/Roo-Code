@@ -13,6 +13,7 @@ import { ProviderSettingsManager } from "../ProviderSettingsManager"
 import { ContextProxy } from "../ContextProxy"
 import { CustomModesManager } from "../CustomModesManager"
 import { safeWriteJson } from "../../../utils/safeWriteJson"
+import { getWorkspaceCodeIndexConfigKey } from "../../../services/code-index/workspace-config"
 
 import type { Mock } from "vitest"
 
@@ -21,6 +22,28 @@ vi.mock("vscode", () => ({
 		getConfiguration: vi.fn().mockReturnValue({
 			get: vi.fn(),
 		}),
+		workspaceFolders: [
+			{
+				uri: {
+					fsPath: "/mock/workspace",
+					toString: () => "file:///mock/workspace",
+				},
+				name: "workspace",
+				index: 0,
+			},
+		],
+		getWorkspaceFolder: vi.fn((uri: { fsPath: string }) =>
+			uri.fsPath === "/mock/workspace" || uri.fsPath.startsWith("/mock/workspace/")
+				? {
+						uri: {
+							fsPath: "/mock/workspace",
+							toString: () => "file:///mock/workspace",
+						},
+						name: "workspace",
+						index: 0,
+					}
+				: undefined,
+		),
 	},
 	window: {
 		showOpenDialog: vi.fn(),
@@ -30,7 +53,10 @@ vi.mock("vscode", () => ({
 		showWarningMessage: vi.fn(),
 	},
 	Uri: {
-		file: vi.fn((filePath) => ({ fsPath: filePath })),
+		file: vi.fn((filePath) => ({
+			fsPath: filePath,
+			toString: () => `file://${filePath}`,
+		})),
 	},
 }))
 
@@ -99,6 +125,7 @@ describe("importExport", () => {
 	let mockContextProxy: ReturnType<typeof vi.mocked<ContextProxy>>
 	let mockExtensionContext: ReturnType<typeof vi.mocked<vscode.ExtensionContext>>
 	let mockCustomModesManager: ReturnType<typeof vi.mocked<CustomModesManager>>
+	let workspaceStateStore: Record<string, unknown>
 
 	beforeEach(() => {
 		vi.clearAllMocks()
@@ -126,11 +153,18 @@ describe("importExport", () => {
 		>
 
 		const map = new Map<string, string>()
+		workspaceStateStore = {}
 
 		mockExtensionContext = {
 			secrets: {
 				get: vi.fn().mockImplementation((key: string) => map.get(key)),
 				store: vi.fn().mockImplementation((key: string, value: string) => map.set(key, value)),
+			},
+			workspaceState: {
+				get: vi.fn((key: string, defaultValue?: unknown) => workspaceStateStore[key] ?? defaultValue),
+				update: vi.fn(async (key: string, value: unknown) => {
+					workspaceStateStore[key] = value
+				}),
 			},
 		} as unknown as ReturnType<typeof vi.mocked<vscode.ExtensionContext>>
 	})
@@ -156,6 +190,61 @@ describe("importExport", () => {
 			expect(fs.readFile).not.toHaveBeenCalled()
 			expect(mockProviderSettingsManager.import).not.toHaveBeenCalled()
 			expect(mockContextProxy.setValues).not.toHaveBeenCalled()
+		})
+
+		it("should import code index config into the current workspace when provider context is supplied", async () => {
+			;(vscode.window.showOpenDialog as Mock).mockResolvedValue([{ fsPath: "/mock/path/settings.json" }])
+			;(fs.readFile as Mock).mockResolvedValue(
+				JSON.stringify({
+					providerProfiles: {
+						currentApiConfigName: "imported",
+						apiConfigs: {
+							imported: {
+								apiProvider: "openai",
+								id: "imported-id",
+							},
+						},
+						modeApiConfigs: {},
+					},
+					globalSettings: {
+						autoApprovalEnabled: true,
+						codebaseIndexConfig: {
+							codebaseIndexEnabled: true,
+							codebaseIndexQdrantUrl: "http://workspace-qdrant",
+						},
+					},
+				}),
+			)
+			mockProviderSettingsManager.export.mockResolvedValue({
+				currentApiConfigName: "existing",
+				apiConfigs: {
+					existing: {
+						apiProvider: "anthropic" as ProviderName,
+						id: "existing-id",
+					},
+				},
+				modeApiConfigs: {},
+			})
+			mockProviderSettingsManager.listConfig.mockResolvedValue([])
+
+			const result = await importSettings({
+				providerSettingsManager: mockProviderSettingsManager,
+				contextProxy: mockContextProxy,
+				customModesManager: mockCustomModesManager,
+				provider: {
+					context: mockExtensionContext,
+					getCurrentCodeIndexWorkspacePath: () => "/mock/workspace",
+				},
+			})
+
+			expect(result.success).toBe(true)
+			expect(mockContextProxy.setValues).toHaveBeenCalledWith({
+				autoApprovalEnabled: true,
+			})
+			expect(workspaceStateStore[getWorkspaceCodeIndexConfigKey("/mock/workspace")]).toEqual({
+				codebaseIndexEnabled: true,
+				codebaseIndexQdrantUrl: "http://workspace-qdrant",
+			})
 		})
 
 		it("should import settings successfully from a valid file", async () => {
@@ -1073,6 +1162,50 @@ describe("importExport", () => {
 			expect(safeWriteJson).toHaveBeenCalledWith("/mock/path/roo-code-settings.json", {
 				providerProfiles: mockProviderProfiles,
 				globalSettings: mockGlobalSettings,
+			})
+		})
+
+		it("should export the current workspace code index config when provider context is supplied", async () => {
+			;(vscode.window.showSaveDialog as Mock).mockResolvedValue({
+				fsPath: "/mock/path/roo-code-settings.json",
+			})
+
+			const mockProviderProfiles = {
+				currentApiConfigName: "test",
+				apiConfigs: { test: { apiProvider: "openai" as ProviderName, id: "test-id" } },
+				migrations: { rateLimitSecondsMigrated: false },
+			}
+			const legacyConfig = {
+				codebaseIndexEnabled: false,
+				codebaseIndexQdrantUrl: "http://legacy-qdrant",
+			}
+			const workspaceConfig = {
+				codebaseIndexEnabled: true,
+				codebaseIndexQdrantUrl: "http://workspace-qdrant",
+			}
+
+			mockProviderSettingsManager.export.mockResolvedValue(mockProviderProfiles)
+			mockContextProxy.export.mockResolvedValue({
+				mode: "code",
+				codebaseIndexConfig: legacyConfig,
+			})
+			workspaceStateStore[getWorkspaceCodeIndexConfigKey("/mock/workspace")] = workspaceConfig
+
+			await exportSettings({
+				providerSettingsManager: mockProviderSettingsManager,
+				contextProxy: mockContextProxy,
+				provider: {
+					context: mockExtensionContext,
+					getCurrentCodeIndexWorkspacePath: () => "/mock/workspace",
+				},
+			})
+
+			expect(safeWriteJson).toHaveBeenCalledWith("/mock/path/roo-code-settings.json", {
+				providerProfiles: mockProviderProfiles,
+				globalSettings: {
+					mode: "code",
+					codebaseIndexConfig: workspaceConfig,
+				},
 			})
 		})
 

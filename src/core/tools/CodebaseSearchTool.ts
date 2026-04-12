@@ -218,7 +218,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				throw new Error("Extension context is not available.")
 			}
 
-			const manager = CodeIndexManager.getInstance(context)
+			const manager = CodeIndexManager.getInstance(context, workspacePath)
 
 			if (!manager) {
 				throw new Error("CodeIndexManager is not available.")

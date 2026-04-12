@@ -202,7 +202,7 @@ export class MetadataStore {
 		await vscode.workspace.fs.createDirectory(this.rootDir)
 		await vscode.workspace.fs.createDirectory(this.persistentRootDir)
 		await vscode.workspace.fs.createDirectory(this.diagnosticsRootDir)
-		IndexDebugLoggerV2.configureDiagnosticsDirectory(this.diagnosticsRootDir.fsPath)
+		IndexDebugLoggerV2.configureDiagnosticsDirectory(this.diagnosticsRootDir.fsPath, this.workspacePath)
 		this._openDatabase()
 		this._openTelemetryDatabase()
 		this._initializeSchema()

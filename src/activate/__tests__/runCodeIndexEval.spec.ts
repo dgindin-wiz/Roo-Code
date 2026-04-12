@@ -42,6 +42,7 @@ describe("runCodeIndexEvalForCurrentWorkspace", () => {
 
 	const mockProvider = {
 		contextProxy: {},
+		getCurrentCodeIndexWorkspacePath: vi.fn().mockReturnValue("/mock/workspace"),
 	} as any
 
 	beforeEach(() => {
@@ -114,6 +115,7 @@ describe("runCodeIndexEvalForCurrentWorkspace", () => {
 			provider: mockProvider,
 		})
 
+		expect(CodeIndexManager.getInstance).toHaveBeenCalledWith({}, "/mock/workspace")
 		expect(mockManager.searchIndexDebug).toHaveBeenCalledWith("codebase search tool output formatting", 5)
 		expect(mockManager.searchIndexDebug).toHaveBeenCalledWith("schema.ts CREATE TABLE chunk_variants", 5)
 		expect(mockManager.searchIndexDebug).toHaveBeenCalledWith(
@@ -148,6 +150,7 @@ describe("runCodeIndexEvalForCurrentWorkspace", () => {
 			provider: mockProvider,
 		})
 
+		expect(CodeIndexManager.getInstance).toHaveBeenCalledWith({}, "/mock/workspace")
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
 			"[CodeIndexEval] The active code index engine is 'legacy'. Switch to 'v2' to run the V2 retrieval eval.",
 		)

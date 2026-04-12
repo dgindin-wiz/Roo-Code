@@ -11,6 +11,7 @@ import {
 	providerSettingsWithIdSchema,
 	isProviderName,
 	type ProviderSettingsWithId,
+	type CodebaseIndexConfig,
 } from "@roo-code/types"
 import { TelemetryService } from "@roo-code/telemetry"
 
@@ -19,6 +20,11 @@ import { ContextProxy } from "./ContextProxy"
 import { CustomModesManager } from "./CustomModesManager"
 import { resolveDefaultSaveUri, saveLastExportPath } from "../../utils/export"
 import { t } from "../../i18n"
+import {
+	ensureWorkspaceCodeIndexConfig,
+	getWorkspaceCodeIndexConfig,
+	setWorkspaceCodeIndexConfig,
+} from "../../services/code-index/workspace-config"
 
 export type ImportOptions = {
 	providerSettingsManager: ProviderSettingsManager
@@ -29,9 +35,15 @@ export type ImportOptions = {
 type ExportOptions = {
 	providerSettingsManager: ProviderSettingsManager
 	contextProxy: ContextProxy
+	provider?: {
+		context?: vscode.ExtensionContext
+		getCurrentCodeIndexWorkspacePath?: () => string | undefined
+	}
 }
 type ImportWithProviderOptions = ImportOptions & {
 	provider: {
+		context?: vscode.ExtensionContext
+		getCurrentCodeIndexWorkspacePath?: () => string | undefined
 		settingsImportedAt?: number
 		postStateToWebview: () => Promise<void>
 	}
@@ -62,6 +74,21 @@ function sanitizeProviderConfig(configName: string, apiConfig: unknown): { confi
 	return { config: apiConfig }
 }
 
+async function getWorkspaceScopedCodeIndexConfig(
+	provider:
+		| { context?: vscode.ExtensionContext; getCurrentCodeIndexWorkspacePath?: () => string | undefined }
+		| undefined,
+	legacyConfig?: CodebaseIndexConfig,
+): Promise<CodebaseIndexConfig | undefined> {
+	const workspacePath = provider?.getCurrentCodeIndexWorkspacePath?.()
+	if (!provider?.context || !workspacePath) {
+		return legacyConfig
+	}
+
+	await ensureWorkspaceCodeIndexConfig(provider.context, workspacePath, legacyConfig)
+	return getWorkspaceCodeIndexConfig(provider.context, workspacePath, legacyConfig)
+}
+
 /**
  * Imports configuration from a specific file path
  * Shares base functionality for import settings for both the manual
@@ -74,7 +101,14 @@ function sanitizeProviderConfig(configName: string, apiConfig: unknown): { confi
  */
 export async function importSettingsFromPath(
 	filePath: string,
-	{ providerSettingsManager, contextProxy, customModesManager }: ImportOptions,
+	{
+		providerSettingsManager,
+		contextProxy,
+		customModesManager,
+		provider,
+	}: ImportOptions & {
+		provider?: { context?: vscode.ExtensionContext; getCurrentCodeIndexWorkspacePath?: () => string | undefined }
+	},
 ) {
 	// Use a lenient schema that accepts any apiConfigs, then validate each individually
 	const lenientProviderProfilesSchema = providerProfilesSchema.extend({
@@ -91,6 +125,8 @@ export async function importSettingsFromPath(
 
 		const rawData = JSON.parse(await fs.readFile(filePath, "utf-8"))
 		const { providerProfiles: rawProviderProfiles, globalSettings = {} } = lenientSchema.parse(rawData)
+		const { codebaseIndexConfig: importedCodebaseIndexConfig, ...globalSettingsWithoutCodeIndexConfig } =
+			globalSettings
 
 		// Track warnings for profiles that had issues
 		const warnings: string[] = []
@@ -160,8 +196,16 @@ export async function importSettingsFromPath(
 		// OpenAI Compatible settings are now correctly stored in codebaseIndexConfig
 		// They will be imported automatically with the config - no special handling needed
 
+		const workspacePath = provider?.getCurrentCodeIndexWorkspacePath?.()
 		await providerSettingsManager.import(providerProfiles)
-		await contextProxy.setValues(globalSettings)
+		if (provider?.context && workspacePath) {
+			await contextProxy.setValues(globalSettingsWithoutCodeIndexConfig)
+			if (importedCodebaseIndexConfig) {
+				await setWorkspaceCodeIndexConfig(provider.context, workspacePath, importedCodebaseIndexConfig)
+			}
+		} else {
+			await contextProxy.setValues(globalSettings)
+		}
 
 		// Set the current provider.
 		const currentProviderName = providerProfiles.currentApiConfigName
@@ -179,7 +223,13 @@ export async function importSettingsFromPath(
 
 		return {
 			providerProfiles,
-			globalSettings,
+			globalSettings:
+				provider?.context && workspacePath
+					? ({
+							...globalSettingsWithoutCodeIndexConfig,
+							codebaseIndexConfig: importedCodebaseIndexConfig,
+						} as typeof globalSettings)
+					: globalSettings,
 			success: true,
 			warnings: warnings.length > 0 ? warnings : undefined,
 		}
@@ -202,7 +252,14 @@ export async function importSettingsFromPath(
  * @param options - Import options containing managers and proxy
  * @returns Promise resolving to import result
  */
-export const importSettings = async ({ providerSettingsManager, contextProxy, customModesManager }: ImportOptions) => {
+export const importSettings = async ({
+	providerSettingsManager,
+	contextProxy,
+	customModesManager,
+	provider,
+}: ImportOptions & {
+	provider?: { context?: vscode.ExtensionContext; getCurrentCodeIndexWorkspacePath?: () => string | undefined }
+}) => {
 	// Use the last export path as a sensible default, falling back to Downloads
 	const defaultUri = resolveDefaultSaveUri(contextProxy, "lastSettingsExportPath", "roo-code-settings.json", {
 		useWorkspace: false,
@@ -223,6 +280,7 @@ export const importSettings = async ({ providerSettingsManager, contextProxy, cu
 		providerSettingsManager,
 		contextProxy,
 		customModesManager,
+		provider,
 	})
 }
 
@@ -233,17 +291,25 @@ export const importSettings = async ({ providerSettingsManager, contextProxy, cu
  * @returns Promise resolving to import result
  */
 export const importSettingsFromFile = async (
-	{ providerSettingsManager, contextProxy, customModesManager }: ImportOptions,
+	{
+		providerSettingsManager,
+		contextProxy,
+		customModesManager,
+		provider,
+	}: ImportOptions & {
+		provider?: { context?: vscode.ExtensionContext; getCurrentCodeIndexWorkspacePath?: () => string | undefined }
+	},
 	fileUri: vscode.Uri,
 ) => {
 	return importSettingsFromPath(fileUri.fsPath, {
 		providerSettingsManager,
 		contextProxy,
 		customModesManager,
+		provider,
 	})
 }
 
-export const exportSettings = async ({ providerSettingsManager, contextProxy }: ExportOptions) => {
+export const exportSettings = async ({ providerSettingsManager, contextProxy, provider }: ExportOptions) => {
 	const defaultUri = await resolveDefaultSaveUri(contextProxy, "lastSettingsExportPath", "roo-code-settings.json", {
 		useWorkspace: false,
 		fallbackDir: path.join(os.homedir(), "Downloads"),
@@ -262,7 +328,11 @@ export const exportSettings = async ({ providerSettingsManager, contextProxy }: 
 
 	try {
 		const providerProfiles = await providerSettingsManager.export()
-		const globalSettings = await contextProxy.export()
+		const globalSettings = (await contextProxy.export()) ?? {}
+		const workspaceCodeIndexConfig = await getWorkspaceScopedCodeIndexConfig(
+			provider,
+			globalSettings.codebaseIndexConfig,
+		)
 
 		// It's okay if there are no global settings, but if there are no
 		// provider profile configured then don't export. If we wanted to
@@ -277,7 +347,13 @@ export const exportSettings = async ({ providerSettingsManager, contextProxy }: 
 
 		const dirname = path.dirname(uri.fsPath)
 		await fs.mkdir(dirname, { recursive: true })
-		await safeWriteJson(uri.fsPath, { providerProfiles, globalSettings })
+		await safeWriteJson(uri.fsPath, {
+			providerProfiles,
+			globalSettings: {
+				...globalSettings,
+				codebaseIndexConfig: workspaceCodeIndexConfig,
+			},
+		})
 	} catch (e) {
 		console.error("Failed to export settings:", e)
 		// Don't re-throw - the UI will handle showing error messages
@@ -305,6 +381,7 @@ export const importSettingsWithFeedback = async (
 				providerSettingsManager,
 				contextProxy,
 				customModesManager,
+				provider,
 			})
 		} catch (error) {
 			result = {
@@ -313,7 +390,7 @@ export const importSettingsWithFeedback = async (
 			}
 		}
 	} else {
-		result = await importSettings({ providerSettingsManager, contextProxy, customModesManager })
+		result = await importSettings({ providerSettingsManager, contextProxy, customModesManager, provider })
 	}
 
 	if (result.success) {

@@ -37,6 +37,7 @@ import {
 	type ExtensionMessage,
 	type ExtensionState,
 	type MarketplaceInstalledMetadata,
+	type CodebaseIndexConfig,
 	RooCodeEventName,
 	requestyDefaultModelId,
 	openRouterDefaultModelId,
@@ -80,7 +81,7 @@ import { SkillsManager } from "../../services/skills/SkillsManager"
 import { fileExistsAtPath } from "../../utils/fs"
 import { setTtsEnabled, setTtsSpeed } from "../../utils/tts"
 import { getWorkspaceGitInfo } from "../../utils/git"
-import { getWorkspacePath } from "../../utils/path"
+import { getWorkspacePath, getWorkspacePathForContext } from "../../utils/path"
 import { OrganizationAllowListViolationError } from "../../utils/errors"
 
 import { setPanel } from "../../activate/registerCommands"
@@ -104,6 +105,7 @@ import { getUri } from "./getUri"
 import { REQUESTY_BASE_URL } from "../../shared/utils/requesty"
 import { validateAndFixToolResultIds } from "../task/validateToolResultIds"
 import { IndexDebugLoggerV2 } from "../../services/code-index-v2/logging/IndexDebugLoggerV2"
+import { ensureWorkspaceCodeIndexConfig, getWorkspaceCodeIndexConfig } from "../../services/code-index/workspace-config"
 
 /**
  * https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/default/weather-webview/src/providers/WeatherViewProvider.ts
@@ -2022,6 +2024,24 @@ export class ClineProvider
 		await this.postStateToWebview()
 	}
 
+	public getCurrentCodeIndexWorkspacePath(): string | undefined {
+		const taskWorkspacePath = this.getCurrentTask()?.cwd
+		const resolvedWorkspacePath = getWorkspacePathForContext(taskWorkspacePath || this.currentWorkspacePath)
+		return resolvedWorkspacePath || this.currentWorkspacePath || getWorkspacePath()
+	}
+
+	private async getCurrentWorkspaceCodeIndexConfig(
+		legacyConfig?: CodebaseIndexConfig,
+	): Promise<CodebaseIndexConfig | undefined> {
+		const workspacePath = this.getCurrentCodeIndexWorkspacePath()
+		if (!workspacePath) {
+			return legacyConfig
+		}
+
+		await ensureWorkspaceCodeIndexConfig(this.context, workspacePath, legacyConfig)
+		return getWorkspaceCodeIndexConfig(this.context, workspacePath, legacyConfig)
+	}
+
 	private mergePendingStatePostKind(
 		previous: "full" | "noTaskHistory" | "noMessages" | null,
 		next: "full" | "noTaskHistory" | "noMessages",
@@ -2555,6 +2575,7 @@ export class ClineProvider
 	> {
 		const stateValues = this.contextProxy.getValues()
 		const customModes = await this.customModesManager.getCustomModes()
+		const codebaseIndexConfig = await this.getCurrentWorkspaceCodeIndexConfig(stateValues.codebaseIndexConfig)
 
 		// Determine apiProvider with the same logic as before, while filtering retired providers.
 		const apiProvider: ProviderName =
@@ -2718,16 +2739,13 @@ export class ClineProvider
 			customCondensingPrompt: stateValues.customCondensingPrompt,
 			codebaseIndexModels: stateValues.codebaseIndexModels ?? EMBEDDING_MODEL_PROFILES,
 			codebaseIndexConfig: {
-				codebaseIndexEnabled: stateValues.codebaseIndexConfig?.codebaseIndexEnabled ?? false,
-				codebaseIndexQdrantUrl:
-					stateValues.codebaseIndexConfig?.codebaseIndexQdrantUrl ?? "http://localhost:6333",
-				codebaseIndexMaxFileSizeMb: stateValues.codebaseIndexConfig?.codebaseIndexMaxFileSizeMb ?? 1,
-				codebaseIndexEmbedderProvider:
-					stateValues.codebaseIndexConfig?.codebaseIndexEmbedderProvider ?? "openai",
-				codebaseIndexEmbedderBaseUrl: stateValues.codebaseIndexConfig?.codebaseIndexEmbedderBaseUrl ?? "",
-				codebaseIndexEmbedderModelId: stateValues.codebaseIndexConfig?.codebaseIndexEmbedderModelId ?? "",
-				codebaseIndexEmbedderModelDimension:
-					stateValues.codebaseIndexConfig?.codebaseIndexEmbedderModelDimension,
+				codebaseIndexEnabled: codebaseIndexConfig?.codebaseIndexEnabled ?? false,
+				codebaseIndexQdrantUrl: codebaseIndexConfig?.codebaseIndexQdrantUrl ?? "http://localhost:6333",
+				codebaseIndexMaxFileSizeMb: codebaseIndexConfig?.codebaseIndexMaxFileSizeMb ?? 1,
+				codebaseIndexEmbedderProvider: codebaseIndexConfig?.codebaseIndexEmbedderProvider ?? "openai",
+				codebaseIndexEmbedderBaseUrl: codebaseIndexConfig?.codebaseIndexEmbedderBaseUrl ?? "",
+				codebaseIndexEmbedderModelId: codebaseIndexConfig?.codebaseIndexEmbedderModelId ?? "",
+				codebaseIndexEmbedderModelDimension: codebaseIndexConfig?.codebaseIndexEmbedderModelDimension,
 				codebaseIndexMaxFiles: vscode.workspace
 					.getConfiguration(Package.name)
 					.get<number>("codeIndex.maxFiles", 100000),
@@ -2746,16 +2764,13 @@ export class ClineProvider
 				codebaseIndexRespectGitIgnore: vscode.workspace
 					.getConfiguration(Package.name)
 					.get<boolean>("codeIndex.respectGitIgnore", true),
-				codebaseIndexOpenAiCompatibleBaseUrl:
-					stateValues.codebaseIndexConfig?.codebaseIndexOpenAiCompatibleBaseUrl,
-				codebaseIndexSearchMaxResults: stateValues.codebaseIndexConfig?.codebaseIndexSearchMaxResults,
-				codebaseIndexSearchMinScore: stateValues.codebaseIndexConfig?.codebaseIndexSearchMinScore,
-				codebaseIndexBedrockRegion: stateValues.codebaseIndexConfig?.codebaseIndexBedrockRegion,
-				codebaseIndexBedrockProfile: stateValues.codebaseIndexConfig?.codebaseIndexBedrockProfile,
-				codebaseIndexOpenRouterSpecificProvider:
-					stateValues.codebaseIndexConfig?.codebaseIndexOpenRouterSpecificProvider,
-				codebaseIndexOversizedFileApprovals:
-					stateValues.codebaseIndexConfig?.codebaseIndexOversizedFileApprovals ?? [],
+				codebaseIndexOpenAiCompatibleBaseUrl: codebaseIndexConfig?.codebaseIndexOpenAiCompatibleBaseUrl,
+				codebaseIndexSearchMaxResults: codebaseIndexConfig?.codebaseIndexSearchMaxResults,
+				codebaseIndexSearchMinScore: codebaseIndexConfig?.codebaseIndexSearchMinScore,
+				codebaseIndexBedrockRegion: codebaseIndexConfig?.codebaseIndexBedrockRegion,
+				codebaseIndexBedrockProfile: codebaseIndexConfig?.codebaseIndexBedrockProfile,
+				codebaseIndexOpenRouterSpecificProvider: codebaseIndexConfig?.codebaseIndexOpenRouterSpecificProvider,
+				codebaseIndexOversizedFileApprovals: codebaseIndexConfig?.codebaseIndexOversizedFileApprovals ?? [],
 			},
 			profileThresholds: stateValues.profileThresholds ?? {},
 			lockApiConfigAcrossModes: this.context.workspaceState.get("lockApiConfigAcrossModes", false),
@@ -2970,7 +2985,8 @@ export class ClineProvider
 	 * @returns CodeIndexManager instance for the current workspace or the default one
 	 */
 	public getCurrentWorkspaceCodeIndexManager(): CodeIndexManager | undefined {
-		return CodeIndexManager.getInstance(this.context)
+		const workspacePath = this.getCurrentCodeIndexWorkspacePath()
+		return workspacePath ? CodeIndexManager.getInstance(this.context, workspacePath) : undefined
 	}
 
 	public syncCurrentCodeIndexStatusToWebview(): void {
