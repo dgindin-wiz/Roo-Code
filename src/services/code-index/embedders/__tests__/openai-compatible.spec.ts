@@ -397,6 +397,80 @@ describe("OpenAICompatibleEmbedder", () => {
 				expect(mockEmbeddingsCreate).toHaveBeenCalledTimes(1)
 			})
 
+			it("should stay token-based until an adaptive provider cap is learned", async () => {
+				const testTexts = Array.from({ length: 260 }, (_, index) => `text-${index}`)
+
+				mockEmbeddingsCreate.mockImplementation(async (args: any) => {
+					const input = args.input as string[]
+					return {
+						data: input.map(() => ({ embedding: [0.1, 0.2, 0.3] })),
+						usage: { prompt_tokens: input.length, total_tokens: input.length },
+					}
+				})
+
+				const result = await embedder.createEmbeddings(testTexts)
+
+				expect(mockEmbeddingsCreate).toHaveBeenCalledTimes(1)
+				expect(mockEmbeddingsCreate).toHaveBeenCalledWith({
+					input: testTexts,
+					model: testModelId,
+					encoding_format: "base64",
+				})
+				expect(result.embeddings).toHaveLength(testTexts.length)
+				expect(result.usage).toEqual({
+					promptTokens: testTexts.length,
+					totalTokens: testTexts.length,
+				})
+			})
+
+			it("should split future provider requests using a learned adaptive cap", async () => {
+				const testTexts = Array.from({ length: 260 }, (_, index) => `text-${index}`)
+				;(embedder as any).providerRequestItemCap = 128
+
+				mockEmbeddingsCreate.mockImplementation(async (args: any) => {
+					const input = args.input as string[]
+					return {
+						data: input.map(() => ({ embedding: [0.1, 0.2, 0.3] })),
+						usage: { prompt_tokens: input.length, total_tokens: input.length },
+					}
+				})
+
+				const result = await embedder.createEmbeddings(testTexts)
+
+				expect(mockEmbeddingsCreate).toHaveBeenCalledTimes(3)
+				expect(mockEmbeddingsCreate.mock.calls[0]?.[0]).toMatchObject({
+					input: testTexts.slice(0, 128),
+					model: testModelId,
+					encoding_format: "base64",
+				})
+				expect(mockEmbeddingsCreate.mock.calls[1]?.[0]).toMatchObject({
+					input: testTexts.slice(128, 256),
+					model: testModelId,
+					encoding_format: "base64",
+				})
+				expect(mockEmbeddingsCreate.mock.calls[2]?.[0]).toMatchObject({
+					input: testTexts.slice(256),
+					model: testModelId,
+					encoding_format: "base64",
+				})
+				expect(result.embeddings).toHaveLength(testTexts.length)
+			})
+
+			it("should learn a smaller adaptive cap from slow provider responses", () => {
+				;(embedder as any).updateProviderRequestItemCap(360, 5_000, testModelId)
+
+				expect((embedder as any).providerRequestItemCap).toBe(288)
+			})
+
+			it("should relax a learned adaptive cap after sustained fast responses", () => {
+				;(embedder as any).providerRequestItemCap = 128
+				;(embedder as any).updateProviderRequestItemCap(128, 900, testModelId)
+				;(embedder as any).updateProviderRequestItemCap(128, 950, testModelId)
+				;(embedder as any).updateProviderRequestItemCap(128, 1_000, testModelId)
+
+				expect((embedder as any).providerRequestItemCap).toBe(160)
+			})
+
 			it("should skip texts that exceed MAX_ITEM_TOKENS", async () => {
 				const normalText = "Hello world"
 				const oversizedText = "a".repeat(MAX_ITEM_TOKENS * 5) // Exceeds MAX_ITEM_TOKENS
