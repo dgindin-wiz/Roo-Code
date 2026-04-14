@@ -1,5 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { DiffPlanner } from "../pipeline/DiffPlanner"
+import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
+
+vi.mock("../logging/IndexDebugLoggerV2", () => ({
+	IndexDebugLoggerV2: {
+		log: vi.fn(),
+	},
+}))
 
 describe("DiffPlanner", () => {
 	const createDeps = () => {
@@ -177,5 +184,41 @@ describe("DiffPlanner", () => {
 		expect(summary.plannedRevisions).toBe(1)
 		expect(summary.upsertJobs).toBe(2)
 		expect(summary.deleteJobs).toBe(1)
+	})
+
+	it("logs planner slice latency and queued jobs for each diff-planning slice", async () => {
+		const { metadataStore } = createDeps()
+		metadataStore.getRevisionsByState.mockResolvedValue([
+			{
+				revisionId: "revision-new",
+				fileId: "file-1",
+				runId: "run-1",
+			},
+		])
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
+		metadataStore.getChunksForRevision.mockResolvedValue([
+			{
+				chunkId: "chunk-new",
+				chunkFingerprint: "fp-new",
+				state: "parsed",
+				vectorPointId: null,
+			},
+		])
+		const logSpy = vi.spyOn(IndexDebugLoggerV2, "log").mockImplementation(() => {})
+
+		const planner = new DiffPlanner(metadataStore as any)
+		const summary = await planner.run("run-1")
+
+		const completeCall = logSpy.mock.calls.find(([, , message]) => message === "diff-plan-complete")
+		expect(completeCall?.[3]).toEqual(
+			expect.objectContaining({
+				runId: "run-1",
+				plannedRevisions: 1,
+				upsertJobs: 1,
+				deleteJobs: 0,
+				plannerSliceLatencyMs: expect.any(Number),
+			}),
+		)
+		expect(summary.plannerSliceLatencyMs).toEqual(expect.any(Number))
 	})
 })

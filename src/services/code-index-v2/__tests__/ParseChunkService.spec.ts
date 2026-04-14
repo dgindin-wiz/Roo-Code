@@ -1,5 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { ParseChunkService } from "../pipeline/ParseChunkService"
+import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
+
+vi.mock("../logging/IndexDebugLoggerV2", () => ({
+	IndexDebugLoggerV2: {
+		log: vi.fn(),
+	},
+}))
 
 describe("ParseChunkService", () => {
 	const createDeps = () => {
@@ -49,6 +56,7 @@ describe("ParseChunkService", () => {
 	}
 
 	beforeEach(() => {
+		vi.useRealTimers()
 		vi.clearAllMocks()
 	})
 
@@ -251,6 +259,48 @@ describe("ParseChunkService", () => {
 		expect(metadataStore.upsertChunkVariants).toHaveBeenCalledTimes(1)
 		expect(metadataStore.markRevisionState).toHaveBeenCalledWith("revision-1", "parsed")
 		expect(summary.parsedChunks).toBe(1)
+	})
+
+	it("logs parse metadata write timings for each stored revision batch", async () => {
+		const { metadataStore, workspaceAdapter, parserAdapter } = createDeps()
+		metadataStore.getRevisionsByState.mockResolvedValue([
+			{
+				revisionId: "revision-1",
+				fileId: "file-1",
+				runId: "run-1",
+				normalizedPath: "/workspace/src/a.ts",
+				relativePath: "src/a.ts",
+			},
+		])
+		workspaceAdapter.readFile.mockResolvedValue("export const value = 1")
+		parserAdapter.parseFile.mockResolvedValue([
+			{
+				chunkFingerprint: "fp-1",
+				startLine: 1,
+				endLine: 1,
+				content: "export const value = 1",
+				searchText: "Path: src/a.ts\n\nexport const value = 1",
+			},
+		])
+		const logSpy = vi.spyOn(IndexDebugLoggerV2, "log").mockImplementation(() => {})
+
+		const service = new ParseChunkService(metadataStore as any, workspaceAdapter as any, parserAdapter as any)
+		await service.run("run-1")
+
+		const timingCall = logSpy.mock.calls.find(([, , message]) => message === "parse-chunk-revision-stored")
+		expect(timingCall?.[3]).toEqual(
+			expect.objectContaining({
+				runId: "run-1",
+				revisionId: "revision-1",
+				relativePath: "src/a.ts",
+				insertedChunkCount: 1,
+				insertedVariantCount: expect.any(Number),
+				chunkInsertLatencyMs: expect.any(Number),
+				chunkVariantInsertLatencyMs: expect.any(Number),
+				revisionStateUpdateLatencyMs: expect.any(Number),
+				metadataWriteLatencyMs: expect.any(Number),
+			}),
+		)
 	})
 
 	it("parses multiple revisions with bounded concurrency", async () => {

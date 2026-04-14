@@ -1336,6 +1336,129 @@ describe("EmbedUpsertWorker", () => {
 		expect(vectorStore.recycleClient).toHaveBeenCalled()
 	})
 
+	it("does not enter hard pressure when only host-side sidecar delay is high", async () => {
+		vi.useFakeTimers()
+		const { metadataStore, embeddingAdapter, vectorStore } = createWorkerDeps()
+		mockConfigValues["codeIndex.embeddingBatchSize"] = 1
+		mockConfigValues["codeIndex.embeddingLaneConcurrency"] = 1
+		const now = Date.now()
+		const jobs = Array.from({ length: 4 }, (_, index) => ({
+			jobId: `job-${index + 1}`,
+			workspaceId: "workspace-1",
+			runId: "run-1",
+			jobType: "upsert",
+			entityId: `chunk-${index + 1}`,
+			state: "running" as const,
+			priority: 100,
+			attemptCount: 1,
+			nextAttemptAt: now,
+			lastError: null,
+			createdAt: now,
+			updatedAt: now,
+		}))
+		const chunks = jobs.map((job, index) => ({
+			chunkId: job.entityId,
+			revisionId: `revision-${index + 1}`,
+			chunkFingerprint: `fp-${index + 1}`,
+			startLine: 1,
+			endLine: 2,
+			content: `content-${index + 1}`,
+			contentHash: `hash-${index + 1}`,
+			tokenEstimate: 5,
+			embeddingModel: null,
+			vectorPointId: null,
+			state: "parsed" as const,
+			createdAt: now,
+			updatedAt: now,
+			fileId: `file-${index + 1}`,
+			workspaceId: "workspace-1",
+			relativePath: `src/file-${index + 1}.ts`,
+			normalizedPath: `/workspace/src/file-${index + 1}.ts`,
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+		}))
+		let claimIndex = 0
+		metadataStore.claimJobs.mockImplementation(async (jobType: string, limit: number) => {
+			if (jobType === "delete") {
+				return []
+			}
+			if (claimIndex >= jobs.length) {
+				return []
+			}
+			const claimed = jobs.slice(claimIndex, claimIndex + limit)
+			claimIndex += claimed.length
+			return claimed
+		})
+		metadataStore.getChunksByIds.mockImplementation(async (chunkIds: string[]) =>
+			chunks.filter((chunk) => chunkIds.includes(chunk.chunkId)),
+		)
+		metadataStore.getNextRetryAt.mockResolvedValue(undefined)
+		metadataStore.getRevisionsByState.mockResolvedValue(
+			chunks.map((chunk) => ({ revisionId: chunk.revisionId, fileId: chunk.fileId, runId: "run-1" })),
+		)
+		metadataStore.getRevisionJobResolution.mockResolvedValue({
+			doneJobs: 1,
+			queuedJobs: 0,
+			runningJobs: 0,
+			terminalFailedJobs: 0,
+			totalJobs: 1,
+		})
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
+		const upsertExecutor = {
+			executeUpsertBatch: vi
+				.fn()
+				.mockImplementationOnce(async () => {
+					await vi.advanceTimersByTimeAsync(100)
+					return {
+						embeddingCount: 1,
+						embedLatencyMs: 70,
+						upsertLatencyMs: 20,
+						pointIds: ["point-1"],
+						sidecarRoundTripLatencyMs: 100,
+						sidecarDeliveryDelayMs: 10,
+						variantTelemetry: {
+							storedVariantCount: 1,
+							embeddedVariantCount: 1,
+							storedVariantCountsByType: { raw_code: 1 },
+							embeddedVariantCountsByType: { raw_code: 1 },
+							skippedVectorizationReasons: {},
+						},
+					}
+				})
+				.mockImplementation(async (_runId: string, _laneId: number, items: any[]) => {
+					await vi.advanceTimersByTimeAsync(6_000)
+					return {
+						embeddingCount: items.length,
+						embedLatencyMs: 900,
+						upsertLatencyMs: 100,
+						pointIds: items.map((_: unknown, index: number) => `point-${index + 1}`),
+						sidecarRoundTripLatencyMs: 6_000,
+						sidecarDeliveryDelayMs: 5_000,
+						variantTelemetry: {
+							storedVariantCount: items.length,
+							embeddedVariantCount: items.length,
+							storedVariantCountsByType: { raw_code: items.length },
+							embeddedVariantCountsByType: { raw_code: items.length },
+							skippedVectorizationReasons: {},
+						},
+					}
+				}),
+		}
+		const logSpy = vi.spyOn(IndexDebugLoggerV2, "log").mockImplementation(() => {})
+
+		const worker = new EmbedUpsertWorker(
+			metadataStore as any,
+			embeddingAdapter as any,
+			vectorStore as any,
+			upsertExecutor as any,
+		)
+		const summary = await worker.run("run-1")
+
+		expect(summary.pressureState).not.toBe("hard")
+		expect(summary.averagePressureLatencyMs).toBeLessThan((EmbedUpsertWorker as any).HARD_PRESSURE_BATCH_LATENCY_MS)
+		expect(logSpy.mock.calls.some(([, , message]) => message === "embed-upsert-pressure-state-changed")).toBe(false)
+	})
+
 	it("routes worker heartbeat and completion telemetry with workspacePath", async () => {
 		vi.useFakeTimers()
 		const { metadataStore, embeddingAdapter, vectorStore } = createWorkerDeps()

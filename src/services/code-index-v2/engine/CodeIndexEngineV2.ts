@@ -48,6 +48,7 @@ import {
 	ICodeIndexEngine,
 } from "./interfaces"
 import { CodeIndexV2GpuSnapshot } from "../logging/log-types"
+import { buildPipelineBacklogSample, shouldPrioritizePlannerRefill } from "./pipelineDiagnostics"
 
 type QueryIntent = {
 	pathHints: string[]
@@ -3325,6 +3326,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			let parseFinished = false
 			let drainError: unknown
 			let lastBacklogRefreshAt = 0
+			let lastBacklogSampleAt = 0
 			let lastRunHeartbeatAt = 0
 			let lastMaintenanceAt = 0
 			let totalParseThrottleMs = 0
@@ -3340,8 +3342,16 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						averageEmbedLatencyMs?: number
 						averageUpsertLatencyMs?: number
 						averageMetadataCommitLatencyMs?: number
+						averageSidecarRoundTripLatencyMs?: number
+						averageSidecarDeliveryDelayMs?: number
+						averageHostFinalizeLatencyMs?: number
+						averagePressureLatencyMs?: number
 						averageIdleGapMs?: number
 						lastBatchLatencyMs?: number
+						lastSidecarRoundTripLatencyMs?: number
+						lastSidecarDeliveryDelayMs?: number
+						lastHostFinalizeLatencyMs?: number
+						lastPressureLatencyMs?: number
 						batchesCompleted?: number
 						retryingChunks?: number
 						terminallyFailedChunks?: number
@@ -3846,6 +3856,28 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					{ forceImmediate },
 				)
 			}
+			const emitBacklogSample = (force = false) => {
+				const now = Date.now()
+				if (!force && now - lastBacklogSampleAt < CodeIndexEngineV2.PIPELINE_POLL_INTERVAL_MS) {
+					return
+				}
+				lastBacklogSampleAt = now
+				IndexDebugLoggerV2.log(
+					"basic",
+					"CodeIndexEngineV2",
+					"pipeline-backlog-sample",
+					buildPipelineBacklogSample({
+						engine: this.engine,
+						runId,
+						workspacePath: this.workspacePath,
+						stage: latestTelemetryStage,
+						metrics: latestBacklogMetrics,
+						parseSchedulingThrottled,
+						embedQueueDepth: this.getEmbedQueueDepth(latestBacklogMetrics),
+						latestSyncTelemetry,
+					}),
+				)
+			}
 			const refreshBacklogMetrics = async (force = false) => {
 				const now = Date.now()
 				if (force || now - lastBacklogRefreshAt >= CodeIndexEngineV2.PIPELINE_POLL_INTERVAL_MS) {
@@ -3867,6 +3899,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					)
 				}
 				syncPipelineSnapshot(force)
+				emitBacklogSample(force)
 				return latestBacklogMetrics
 			}
 			const updateResilienceStats = () => {
@@ -4118,8 +4151,16 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						averageEmbedLatencyMs,
 						averageUpsertLatencyMs,
 						averageMetadataCommitLatencyMs,
+						averageSidecarRoundTripLatencyMs,
+						averageSidecarDeliveryDelayMs,
+						averageHostFinalizeLatencyMs,
+						averagePressureLatencyMs,
 						averageIdleGapMs,
 						lastBatchLatencyMs,
+						lastSidecarRoundTripLatencyMs,
+						lastSidecarDeliveryDelayMs,
+						lastHostFinalizeLatencyMs,
+						lastPressureLatencyMs,
 						peakBatchLatencyMs,
 						peakIdleGapMs,
 						peakBatchSize,
@@ -4158,8 +4199,16 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 							averageEmbedLatencyMs,
 							averageUpsertLatencyMs,
 							averageMetadataCommitLatencyMs,
+							averageSidecarRoundTripLatencyMs,
+							averageSidecarDeliveryDelayMs,
+							averageHostFinalizeLatencyMs,
+							averagePressureLatencyMs,
 							averageIdleGapMs,
 							lastBatchLatencyMs,
+							lastSidecarRoundTripLatencyMs,
+							lastSidecarDeliveryDelayMs,
+							lastHostFinalizeLatencyMs,
+							lastPressureLatencyMs,
 							peakBatchLatencyMs,
 							peakIdleGapMs,
 							peakBatchSize,
@@ -4235,14 +4284,32 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						}
 						ensureEmbedPhaseStarted(false, "planning_vectors")
 						updateEmbeddingDetail()
-						const diffPlanningStartedAt = Date.now()
-						await diffPlanner.run(runId, signal, {
-							limit: schedulerProfile.plannerRevisionSlice,
-							maxJobs: schedulerProfile.plannerJobBudget,
-						})
-						diffPlanningMs += Date.now() - diffPlanningStartedAt
-						await refreshBacklogMetrics(true)
-						await persistRunSnapshot()
+
+						for (;;) {
+							const diffPlanningStartedAt = Date.now()
+							const plannerSummary = await diffPlanner.run(runId, signal, {
+								limit: schedulerProfile.plannerRevisionSlice,
+								maxJobs: schedulerProfile.plannerJobBudget,
+							})
+							diffPlanningMs += Date.now() - diffPlanningStartedAt
+							await refreshBacklogMetrics(true)
+							await persistRunSnapshot()
+
+							const plannerMadeProgress =
+								plannerSummary.plannedRevisions > 0 ||
+								plannerSummary.upsertJobs > 0 ||
+								plannerSummary.deleteJobs > 0
+							if (
+								!shouldPrioritizePlannerRefill({
+									embedPhaseStarted,
+									metrics: latestBacklogMetrics,
+									stagedChunkHighWatermark: schedulerProfile.stagedChunkHighWatermark,
+								}) ||
+								!plannerMadeProgress
+							) {
+								break
+							}
+						}
 					}
 
 					if (

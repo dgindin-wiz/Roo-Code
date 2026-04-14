@@ -18,6 +18,7 @@ import {
 interface PendingRequest<T> {
 	resolve: (value: T) => void
 	reject: (error: Error) => void
+	startedAtMs?: number
 }
 
 interface SidecarLane {
@@ -249,7 +250,7 @@ export class SidecarEmbedUpsertExecutor {
 		}
 
 		return new Promise<T>((resolve, reject) => {
-			lane.pending.set(requestId, { resolve, reject })
+			lane.pending.set(requestId, { resolve, reject, startedAtMs: Date.now() })
 			lane.child?.send(message)
 		})
 	}
@@ -309,6 +310,15 @@ export class SidecarEmbedUpsertExecutor {
 					return
 				}
 				lane.pending.delete(message.requestId)
+				const receivedAtMs = Date.now()
+				const sidecarRoundTripLatencyMs =
+					typeof pending.startedAtMs === "number"
+						? Math.max(receivedAtMs - pending.startedAtMs, 0)
+						: undefined
+				const sidecarDeliveryDelayMs =
+					typeof sidecarRoundTripLatencyMs === "number"
+						? Math.max(sidecarRoundTripLatencyMs - message.embedLatencyMs - message.upsertLatencyMs, 0)
+						: undefined
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
 					this.getTrackedProcessKey(lane),
 					"embedSidecars",
@@ -327,6 +337,8 @@ export class SidecarEmbedUpsertExecutor {
 					embeddingCount: message.embeddingCount,
 					embedLatencyMs: message.embedLatencyMs,
 					upsertLatencyMs: message.upsertLatencyMs,
+					sidecarRoundTripLatencyMs,
+					sidecarDeliveryDelayMs,
 					memory: message.memory,
 					cpu: message.cpu,
 					workspacePath: this.workspacePath,
@@ -336,6 +348,8 @@ export class SidecarEmbedUpsertExecutor {
 					embeddingCount: message.embeddingCount,
 					embedLatencyMs: message.embedLatencyMs,
 					upsertLatencyMs: message.upsertLatencyMs,
+					sidecarRoundTripLatencyMs,
+					sidecarDeliveryDelayMs,
 					pointIds: message.pointIds,
 					variantTelemetry: message.variantTelemetry,
 				})

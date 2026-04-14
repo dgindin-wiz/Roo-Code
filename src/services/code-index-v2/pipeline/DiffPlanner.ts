@@ -9,6 +9,7 @@ export interface DiffPlannerSummary {
 	reusedFingerprintUpserts: number
 	deletedMissingFingerprintChunks: number
 	safetyFallbackRevisions: number
+	plannerSliceLatencyMs: number
 }
 
 export class DiffPlanner {
@@ -19,6 +20,7 @@ export class DiffPlanner {
 		signal?: AbortSignal,
 		options?: { revisionIds?: string[]; limit?: number; maxJobs?: number },
 	): Promise<DiffPlannerSummary> {
+		const plannerSliceStartedAt = Date.now()
 		const workspaceId = this.metadataStore.getWorkspaceId()
 		const revisionIdSet = options?.revisionIds ? new Set(options.revisionIds) : undefined
 		const revisions = await this.metadataStore.getRevisionsByState(workspaceId, "parsed", {
@@ -121,6 +123,10 @@ export class DiffPlanner {
 		IndexDebugLoggerV2.log("basic", "DiffPlanner", "diff-plan-complete", {
 			component: "DiffPlanner",
 			runId,
+			plannerSliceLatencyMs: Date.now() - plannerSliceStartedAt,
+			plannedRevisions,
+			upsertJobs,
+			deleteJobs,
 			jobId: `${plannedRevisions}:${upsertJobs}:${deleteJobs}`,
 			reusedFingerprintUpserts,
 			deletedMissingFingerprintChunks,
@@ -139,6 +145,7 @@ export class DiffPlanner {
 			reusedFingerprintUpserts,
 			deletedMissingFingerprintChunks,
 			safetyFallbackRevisions,
+			plannerSliceLatencyMs: Date.now() - plannerSliceStartedAt,
 		}
 	}
 }

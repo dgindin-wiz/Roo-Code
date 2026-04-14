@@ -7,6 +7,7 @@ import {
 	executeUpsertBatch,
 	getChunkVariantsForEmbedding,
 	type EmbedUpsertBatchItem,
+	type EmbedUpsertExecutionResult,
 } from "./EmbedUpsertExecution"
 import { MetadataStore } from "../store/MetadataStore"
 import {
@@ -39,6 +40,10 @@ export interface EmbedUpsertSummary {
 	averageEmbedLatencyMs?: number
 	averageUpsertLatencyMs?: number
 	averageMetadataCommitLatencyMs?: number
+	averageSidecarRoundTripLatencyMs?: number
+	averageSidecarDeliveryDelayMs?: number
+	averageHostFinalizeLatencyMs?: number
+	averagePressureLatencyMs?: number
 	averageIdleGapMs?: number
 	peakChunksPerSecond?: number
 	peakBatchLatencyMs?: number
@@ -90,12 +95,20 @@ export interface EmbedUpsertProgress {
 	lastEmbedLatencyMs?: number
 	lastUpsertLatencyMs?: number
 	lastMetadataCommitLatencyMs?: number
+	lastSidecarRoundTripLatencyMs?: number
+	lastSidecarDeliveryDelayMs?: number
+	lastHostFinalizeLatencyMs?: number
+	lastPressureLatencyMs?: number
 	lastIdleGapMs?: number
 	lastBatchLatencyMs?: number
 	averageBatchLatencyMs?: number
 	averageEmbedLatencyMs?: number
 	averageUpsertLatencyMs?: number
 	averageMetadataCommitLatencyMs?: number
+	averageSidecarRoundTripLatencyMs?: number
+	averageSidecarDeliveryDelayMs?: number
+	averageHostFinalizeLatencyMs?: number
+	averagePressureLatencyMs?: number
 	averageIdleGapMs?: number
 	chunksPerSecond?: number
 	peakChunksPerSecond?: number
@@ -144,6 +157,10 @@ interface BatchTelemetry {
 	embedLatencyMs?: number
 	upsertLatencyMs?: number
 	metadataCommitLatencyMs?: number
+	sidecarRoundTripLatencyMs?: number
+	sidecarDeliveryDelayMs?: number
+	hostFinalizeLatencyMs?: number
+	pressureLatencyMs?: number
 	totalLatencyMs: number
 }
 
@@ -153,19 +170,7 @@ interface EmbedUpsertExecutor {
 		laneId: number,
 		items: EmbedUpsertBatchItem[],
 		signal?: AbortSignal,
-	): Promise<{
-		embeddingCount: number
-		embedLatencyMs: number
-		upsertLatencyMs: number
-		pointIds: string[]
-		variantTelemetry: {
-			storedVariantCount: number
-			embeddedVariantCount: number
-			storedVariantCountsByType: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
-			embeddedVariantCountsByType: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
-			skippedVectorizationReasons: Record<string, number>
-		}
-	}>
+	): Promise<EmbedUpsertExecutionResult>
 	recycleClients?(reason: "pressure" | "interval" | "shutdown"): Promise<void>
 	dispose?(): Promise<void>
 }
@@ -328,6 +333,10 @@ export class EmbedUpsertWorker {
 		let totalEmbedLatencyMs = 0
 		let totalUpsertLatencyMs = 0
 		let totalMetadataCommitLatencyMs = 0
+		let totalSidecarRoundTripLatencyMs = 0
+		let totalSidecarDeliveryDelayMs = 0
+		let totalHostFinalizeLatencyMs = 0
+		let totalPressureLatencyMs = 0
 		let totalIdleGapMs = 0
 		let totalEmbeddingCount = 0
 		let totalRequestedChunkCount = 0
@@ -455,8 +464,9 @@ export class EmbedUpsertWorker {
 			softMemoryPressure: boolean
 		} => {
 			const memory = IndexDebugLoggerV2.getMemorySnapshot()
-			if (batchTelemetry?.totalLatencyMs) {
-				recentBatchLatencies.push(batchTelemetry.totalLatencyMs)
+			const pressureLatencyMs = batchTelemetry?.pressureLatencyMs ?? batchTelemetry?.totalLatencyMs
+			if (pressureLatencyMs) {
+				recentBatchLatencies.push(pressureLatencyMs)
 				if (recentBatchLatencies.length > 4) {
 					recentBatchLatencies.shift()
 				}
@@ -578,6 +588,9 @@ export class EmbedUpsertWorker {
 		const maybeLogHeartbeat = async (
 			chunksPerSecond: number | undefined,
 			averageBatchLatencyMs: number | undefined,
+			averagePressureLatencyMs: number | undefined,
+			averageHostFinalizeLatencyMs: number | undefined,
+			averageSidecarDeliveryDelayMs: number | undefined,
 			memory: ReturnType<typeof IndexDebugLoggerV2.getMemorySnapshot>,
 			options: {
 				hardMemoryPressure: boolean
@@ -607,6 +620,9 @@ export class EmbedUpsertWorker {
 				effectiveBatchSize,
 				chunksPerSecond,
 				averageBatchLatencyMs,
+				averagePressureLatencyMs,
+				averageHostFinalizeLatencyMs,
+				averageSidecarDeliveryDelayMs,
 				pressureState,
 				pressureReasons: latestPressureReasons,
 				rssMB: memory.rssMB,
@@ -728,6 +744,10 @@ export class EmbedUpsertWorker {
 				totalEmbedLatencyMs += batchTelemetry.embedLatencyMs ?? 0
 				totalUpsertLatencyMs += batchTelemetry.upsertLatencyMs ?? 0
 				totalMetadataCommitLatencyMs += batchTelemetry.metadataCommitLatencyMs ?? 0
+				totalSidecarRoundTripLatencyMs += batchTelemetry.sidecarRoundTripLatencyMs ?? 0
+				totalSidecarDeliveryDelayMs += batchTelemetry.sidecarDeliveryDelayMs ?? 0
+				totalHostFinalizeLatencyMs += batchTelemetry.hostFinalizeLatencyMs ?? 0
+				totalPressureLatencyMs += batchTelemetry.pressureLatencyMs ?? 0
 				totalIdleGapMs += batchTelemetry.idleGapMs ?? 0
 				totalEmbeddingCount += batchTelemetry.embeddingCount
 				totalRequestedChunkCount += batchTelemetry.batchSize
@@ -749,6 +769,14 @@ export class EmbedUpsertWorker {
 				peakChunksPerSecond = Math.max(peakChunksPerSecond, chunksPerSecond)
 			}
 			const averageBatchLatencyMs = batchesCompleted > 0 ? totalBatchLatencyMs / batchesCompleted : undefined
+			const averageSidecarRoundTripLatencyMs =
+				batchesCompleted > 0 ? totalSidecarRoundTripLatencyMs / batchesCompleted : undefined
+			const averageSidecarDeliveryDelayMs =
+				batchesCompleted > 0 ? totalSidecarDeliveryDelayMs / batchesCompleted : undefined
+			const averageHostFinalizeLatencyMs =
+				batchesCompleted > 0 ? totalHostFinalizeLatencyMs / batchesCompleted : undefined
+			const averagePressureLatencyMs =
+				batchesCompleted > 0 ? totalPressureLatencyMs / batchesCompleted : undefined
 			const providerBatchUtilization =
 				batchTelemetry && batchTelemetry.embeddingCount > 0
 					? Number((batchTelemetry.embeddingCount / Math.max(batchTelemetry.batchSize, 1)).toFixed(3))
@@ -775,6 +803,7 @@ export class EmbedUpsertWorker {
 					peakInFlightChunkCount: this.peakInFlightChunkCount,
 					chunksPerSecond,
 					averageBatchLatencyMs,
+					averagePressureLatencyMs,
 					rssMB: memory.rssMB,
 					heapUsedMB: memory.heapUsedMB,
 					externalMB: memory.externalMB,
@@ -798,6 +827,7 @@ export class EmbedUpsertWorker {
 						chunksPerSecond,
 						peakChunksPerSecond,
 						averageBatchLatencyMs,
+						averagePressureLatencyMs,
 						pressureState,
 						laneConcurrency: effectiveLaneConcurrency,
 						effectiveBatchSize,
@@ -833,6 +863,10 @@ export class EmbedUpsertWorker {
 				lastEmbedLatencyMs: batchTelemetry?.embedLatencyMs,
 				lastUpsertLatencyMs: batchTelemetry?.upsertLatencyMs,
 				lastMetadataCommitLatencyMs: batchTelemetry?.metadataCommitLatencyMs,
+				lastSidecarRoundTripLatencyMs: batchTelemetry?.sidecarRoundTripLatencyMs,
+				lastSidecarDeliveryDelayMs: batchTelemetry?.sidecarDeliveryDelayMs,
+				lastHostFinalizeLatencyMs: batchTelemetry?.hostFinalizeLatencyMs,
+				lastPressureLatencyMs: batchTelemetry?.pressureLatencyMs,
 				lastIdleGapMs: batchTelemetry?.idleGapMs,
 				lastBatchLatencyMs: batchTelemetry?.totalLatencyMs,
 				averageBatchLatencyMs,
@@ -840,6 +874,10 @@ export class EmbedUpsertWorker {
 				averageUpsertLatencyMs: batchesCompleted > 0 ? totalUpsertLatencyMs / batchesCompleted : undefined,
 				averageMetadataCommitLatencyMs:
 					batchesCompleted > 0 ? totalMetadataCommitLatencyMs / batchesCompleted : undefined,
+				averageSidecarRoundTripLatencyMs,
+				averageSidecarDeliveryDelayMs,
+				averageHostFinalizeLatencyMs,
+				averagePressureLatencyMs,
 				averageIdleGapMs: batchesCompleted > 0 ? totalIdleGapMs / batchesCompleted : undefined,
 				chunksPerSecond,
 				peakChunksPerSecond: peakChunksPerSecond > 0 ? peakChunksPerSecond : undefined,
@@ -890,6 +928,10 @@ export class EmbedUpsertWorker {
 					embedLatencyMs: batchTelemetry.embedLatencyMs,
 					upsertLatencyMs: batchTelemetry.upsertLatencyMs,
 					metadataCommitLatencyMs: batchTelemetry.metadataCommitLatencyMs,
+					sidecarRoundTripLatencyMs: batchTelemetry.sidecarRoundTripLatencyMs,
+					sidecarDeliveryDelayMs: batchTelemetry.sidecarDeliveryDelayMs,
+					hostFinalizeLatencyMs: batchTelemetry.hostFinalizeLatencyMs,
+					pressureLatencyMs: batchTelemetry.pressureLatencyMs,
 					idleGapMs: batchTelemetry.idleGapMs,
 					providerBatchUtilization,
 					embeddingsPerChunk: utilizationMetrics.embeddingsPerChunk,
@@ -908,6 +950,9 @@ export class EmbedUpsertWorker {
 			await maybeLogHeartbeat(
 				chunksPerSecond,
 				averageBatchLatencyMs,
+				averagePressureLatencyMs,
+				averageHostFinalizeLatencyMs,
+				averageSidecarDeliveryDelayMs,
 				memory,
 				{
 					hardMemoryPressure,
@@ -1140,6 +1185,13 @@ export class EmbedUpsertWorker {
 			averageUpsertLatencyMs: batchesCompleted > 0 ? totalUpsertLatencyMs / batchesCompleted : undefined,
 			averageMetadataCommitLatencyMs:
 				batchesCompleted > 0 ? totalMetadataCommitLatencyMs / batchesCompleted : undefined,
+			averageSidecarRoundTripLatencyMs:
+				batchesCompleted > 0 ? totalSidecarRoundTripLatencyMs / batchesCompleted : undefined,
+			averageSidecarDeliveryDelayMs:
+				batchesCompleted > 0 ? totalSidecarDeliveryDelayMs / batchesCompleted : undefined,
+			averageHostFinalizeLatencyMs:
+				batchesCompleted > 0 ? totalHostFinalizeLatencyMs / batchesCompleted : undefined,
+			averagePressureLatencyMs: batchesCompleted > 0 ? totalPressureLatencyMs / batchesCompleted : undefined,
 			averageIdleGapMs: batchesCompleted > 0 ? totalIdleGapMs / batchesCompleted : undefined,
 			peakChunksPerSecond: peakChunksPerSecond > 0 ? peakChunksPerSecond : undefined,
 			peakBatchLatencyMs: peakBatchLatencyMs > 0 ? peakBatchLatencyMs : undefined,
@@ -1195,6 +1247,13 @@ export class EmbedUpsertWorker {
 			averageUpsertLatencyMs: batchesCompleted > 0 ? totalUpsertLatencyMs / batchesCompleted : undefined,
 			averageMetadataCommitLatencyMs:
 				batchesCompleted > 0 ? totalMetadataCommitLatencyMs / batchesCompleted : undefined,
+			averageSidecarRoundTripLatencyMs:
+				batchesCompleted > 0 ? totalSidecarRoundTripLatencyMs / batchesCompleted : undefined,
+			averageSidecarDeliveryDelayMs:
+				batchesCompleted > 0 ? totalSidecarDeliveryDelayMs / batchesCompleted : undefined,
+			averageHostFinalizeLatencyMs:
+				batchesCompleted > 0 ? totalHostFinalizeLatencyMs / batchesCompleted : undefined,
+			averagePressureLatencyMs: batchesCompleted > 0 ? totalPressureLatencyMs / batchesCompleted : undefined,
 			averageIdleGapMs: batchesCompleted > 0 ? totalIdleGapMs / batchesCompleted : undefined,
 			peakChunksPerSecond: peakChunksPerSecond > 0 ? peakChunksPerSecond : undefined,
 			peakBatchLatencyMs: peakBatchLatencyMs > 0 ? peakBatchLatencyMs : undefined,
@@ -1651,6 +1710,17 @@ export class EmbedUpsertWorker {
 			)
 			await this.metadataStore.completeJobs(selectedJobPairs.map(({ job }) => job.jobId))
 			const metadataCommitLatencyMs = Date.now() - metadataCommitStartedAt
+			const totalLatencyMs = Date.now() - batchStartedAt
+			const sidecarRoundTripLatencyMs =
+				execution.sidecarRoundTripLatencyMs ?? execution.embedLatencyMs + execution.upsertLatencyMs
+			const sidecarDeliveryDelayMs =
+				execution.sidecarDeliveryDelayMs ??
+				Math.max(sidecarRoundTripLatencyMs - execution.embedLatencyMs - execution.upsertLatencyMs, 0)
+			const hostFinalizeLatencyMs = Math.max(
+				totalLatencyMs - sidecarRoundTripLatencyMs - metadataCommitLatencyMs,
+				0,
+			)
+			const pressureLatencyMs = execution.embedLatencyMs + execution.upsertLatencyMs + metadataCommitLatencyMs
 			this.lastBatchCompletedAt = Date.now()
 			this.completedBatchCount++
 
@@ -1669,7 +1739,11 @@ export class EmbedUpsertWorker {
 				embedLatencyMs: execution.embedLatencyMs,
 				upsertLatencyMs: execution.upsertLatencyMs,
 				metadataCommitLatencyMs,
-				totalLatencyMs: Date.now() - batchStartedAt,
+				sidecarRoundTripLatencyMs,
+				sidecarDeliveryDelayMs,
+				hostFinalizeLatencyMs,
+				pressureLatencyMs,
+				totalLatencyMs,
 			})
 		} catch (error) {
 			if (this.isConcurrencyPressureError(error)) {
@@ -1887,6 +1961,8 @@ export class EmbedUpsertWorker {
 			)
 			await this.metadataStore.completeJobs(jobPairs.map(({ job }) => job.jobId))
 			const metadataCommitLatencyMs = Date.now() - metadataCommitStartedAt
+			const totalLatencyMs = Date.now() - batchStartedAt
+			const hostFinalizeLatencyMs = Math.max(totalLatencyMs - upsertLatencyMs - metadataCommitLatencyMs, 0)
 			this.lastBatchCompletedAt = Date.now()
 			this.completedBatchCount++
 
@@ -1899,7 +1975,11 @@ export class EmbedUpsertWorker {
 				idleGapMs,
 				upsertLatencyMs,
 				metadataCommitLatencyMs,
-				totalLatencyMs: Date.now() - batchStartedAt,
+				sidecarRoundTripLatencyMs: upsertLatencyMs,
+				sidecarDeliveryDelayMs: 0,
+				hostFinalizeLatencyMs,
+				pressureLatencyMs: upsertLatencyMs + metadataCommitLatencyMs,
+				totalLatencyMs,
 			})
 		} catch (error) {
 			if (jobPairs.length === 1) {

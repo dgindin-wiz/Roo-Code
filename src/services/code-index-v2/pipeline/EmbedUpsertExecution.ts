@@ -50,6 +50,8 @@ export interface EmbedUpsertExecutionResult {
 	embedLatencyMs: number
 	upsertLatencyMs: number
 	pointIds: string[]
+	sidecarRoundTripLatencyMs?: number
+	sidecarDeliveryDelayMs?: number
 	variantTelemetry: {
 		storedVariantCount: number
 		embeddedVariantCount: number

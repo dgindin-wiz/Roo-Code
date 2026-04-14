@@ -181,6 +181,7 @@ export class ParseChunkService {
 							})
 						})()
 
+				const chunkInsertStartedAt = Date.now()
 				const insertedChunks = await this.metadataStore.upsertChunks(
 					chunks.map((chunk) => ({
 						revisionId: revision.revisionId,
@@ -200,10 +201,31 @@ export class ParseChunkService {
 						state: "parsed",
 					})),
 				)
-				await this.metadataStore.upsertChunkVariants(
-					insertedChunks.flatMap((chunk) => buildChunkVariants(chunk, revision.relativePath)),
+				const chunkInsertLatencyMs = Date.now() - chunkInsertStartedAt
+				const chunkVariants = insertedChunks.flatMap((chunk) =>
+					buildChunkVariants(chunk, revision.relativePath),
 				)
+				const chunkVariantInsertStartedAt = Date.now()
+				await this.metadataStore.upsertChunkVariants(chunkVariants)
+				const chunkVariantInsertLatencyMs = Date.now() - chunkVariantInsertStartedAt
+				const revisionStateUpdateStartedAt = Date.now()
 				await this.metadataStore.markRevisionState(revision.revisionId, "parsed")
+				const revisionStateUpdateLatencyMs = Date.now() - revisionStateUpdateStartedAt
+
+				IndexDebugLoggerV2.log("basic", "ParseChunkService", "parse-chunk-revision-stored", {
+					component: "ParseChunkService",
+					workspacePath: this.workspaceAdapter.getWorkspacePath(),
+					runId: revision.runId,
+					revisionId: revision.revisionId,
+					relativePath: revision.relativePath,
+					insertedChunkCount: insertedChunks.length,
+					insertedVariantCount: chunkVariants.length,
+					chunkInsertLatencyMs,
+					chunkVariantInsertLatencyMs,
+					revisionStateUpdateLatencyMs,
+					metadataWriteLatencyMs:
+						chunkInsertLatencyMs + chunkVariantInsertLatencyMs + revisionStateUpdateLatencyMs,
+				})
 
 				return {
 					status: "parsed",
