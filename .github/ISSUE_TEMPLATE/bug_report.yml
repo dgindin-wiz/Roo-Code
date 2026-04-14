@@ -6,8 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for your report! Please search existing issues first:
-        https://github.com/RooCodeInc/Roo-Code/issues
+        Thank you for your report.
+        Please search existing issues in this repository before filing a new one.
+        
+        Maintainers may convert this intake issue into an operational work item, or create a linked follow-on issue, if engineering investigation or implementation begins.
 
   - type: textarea
     id: problem

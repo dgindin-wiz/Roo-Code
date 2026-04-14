@@ -8,6 +8,8 @@ body:
       value: |
         Thank you for helping improve Roo Code!
         Please focus on the problem and the desired behavior in plain language.
+        
+        Maintainers may convert this intake issue into an operational work item, or create a linked follow-on issue, if engineering investigation or implementation begins.
 
   - type: textarea
     id: problem
