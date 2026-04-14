@@ -60,6 +60,13 @@ The generic workflow below applies across repositories. Roo Code also has projec
 - Join our [Discord](https://discord.gg/roocode) for community discussion.
 - Follow any repository-specific maintainer guidance in issue threads or project boards.
 
+### 4. Project-specific resources
+
+These Roo Code resources are useful when choosing or shaping work in this repository:
+
+- Check the [GitHub Project](https://github.com/orgs/RooCodeInc/projects/1) for "Issue [Unassigned]" issues.
+- For docs-focused contributions, visit [Roo Code Docs](https://github.com/RooCodeInc/Roo-Code-Docs).
+
 ## Finding & Planning Your Contribution
 
 ### Types of Contributions
@@ -81,8 +88,9 @@ All meaningful contributions start with a GitHub issue.
 
 ### Deciding What to Work On
 
-- Check the [GitHub Project](https://github.com/orgs/RooCodeInc/projects/1) for "Issue [Unassigned]" issues.
-- For docs, visit [Roo Code Docs](https://github.com/RooCodeInc/Roo-Code-Docs).
+- Start from issues that already have clear scope, impact, and acceptance criteria.
+- Prefer one coherent contribution at a time rather than mixing unrelated changes.
+- Use any project-specific resources linked above to find areas that need attention in this repository.
 
 ### Reporting Bugs
 

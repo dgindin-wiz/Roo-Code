@@ -50,6 +50,7 @@ Open
 
 ## Implementation container decision
 
+- Issue / container decision: <same Issue | follow-on Issue #<number>>
 - Canonical repo: <owner/name>
 - Head branch: <branch-name or not selected yet>
 - Base branch: <main | integration branch | default branch>

@@ -13,7 +13,7 @@
 
 **Merge target**
 
-<main | integration branch>
+<main | integration branch | default branch>
 
 **Issue resolution**
 <fully resolved | partially resolved>
