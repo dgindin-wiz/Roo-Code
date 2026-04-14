@@ -1240,6 +1240,22 @@ export class MetadataStore {
 		)
 		const deletedJobsResult = deleteJobs.run(this.workspaceHash, ...expiredRunIds) as { changes?: number }
 
+		this.db()
+			.prepare(
+				`DELETE FROM chunk_lexical_fts
+				 WHERE chunk_id IN (
+					SELECT chunk_id
+					FROM chunks
+					WHERE revision_id IN (
+						SELECT revision_id
+						FROM file_revisions
+						WHERE run_id IN (${placeholders})
+							AND state IN ('hashed', 'parsed', 'planned')
+					)
+				)`,
+			)
+			.run(...expiredRunIds)
+
 		const deleteChunks = this.db().prepare(
 			`DELETE FROM chunks
 			 WHERE revision_id IN (
@@ -1625,31 +1641,75 @@ export class MetadataStore {
 	}
 
 	async markRevisionCommitted(revisionId: string): Promise<void> {
-		this.db()
-			.prepare(`UPDATE file_revisions SET state = ?, committed_at = ? WHERE revision_id = ?`)
-			.run("committed", Date.now(), revisionId)
+		const revision = await this.getFileRevision(revisionId)
+		const now = Date.now()
+		let lexicalFtsSync: { chunkCount: number; lexicalFtsSyncLatencyMs: number } = {
+			chunkCount: 0,
+			lexicalFtsSyncLatencyMs: 0,
+		}
 
-		this.db()
-			.prepare(
-				`UPDATE files
-				 SET active_revision_id = ?, tombstoned = 0, updated_at = ?
-				 WHERE file_id = (SELECT file_id FROM file_revisions WHERE revision_id = ?)`,
-			)
-			.run(revisionId, Date.now(), revisionId)
+		this.withTransaction(() => {
+			this.db()
+				.prepare(`UPDATE file_revisions SET state = ?, committed_at = ? WHERE revision_id = ?`)
+				.run("committed", now, revisionId)
+
+			this.db()
+				.prepare(
+					`UPDATE files
+					 SET active_revision_id = ?, tombstoned = 0, updated_at = ?
+					 WHERE file_id = ?`,
+				)
+				.run(revisionId, now, revision.fileId)
+
+			lexicalFtsSync = this.refreshLexicalFtsForRevisionInTransaction(revisionId)
+		})
+
+		IndexDebugLoggerV2.log("basic", "MetadataStore", "revision-lexical-fts-synced", {
+			component: "MetadataStore",
+			workspacePath: this.workspacePath,
+			runId: revision.runId,
+			revisionId,
+			chunkCount: lexicalFtsSync.chunkCount,
+			lexicalFtsSyncLatencyMs: lexicalFtsSync.lexicalFtsSyncLatencyMs,
+			revisionState: "committed",
+		})
 	}
 
 	async markRevisionDegraded(revisionId: string, reason: string): Promise<void> {
-		this.db()
-			.prepare(`UPDATE file_revisions SET state = ?, committed_at = ?, failure_reason = ? WHERE revision_id = ?`)
-			.run("degraded", Date.now(), reason, revisionId)
+		const revision = await this.getFileRevision(revisionId)
+		const now = Date.now()
+		let lexicalFtsSync: { chunkCount: number; lexicalFtsSyncLatencyMs: number } = {
+			chunkCount: 0,
+			lexicalFtsSyncLatencyMs: 0,
+		}
 
-		this.db()
-			.prepare(
-				`UPDATE files
-				 SET active_revision_id = ?, tombstoned = 0, updated_at = ?
-				 WHERE file_id = (SELECT file_id FROM file_revisions WHERE revision_id = ?)`,
-			)
-			.run(revisionId, Date.now(), revisionId)
+		this.withTransaction(() => {
+			this.db()
+				.prepare(
+					`UPDATE file_revisions SET state = ?, committed_at = ?, failure_reason = ? WHERE revision_id = ?`,
+				)
+				.run("degraded", now, reason, revisionId)
+
+			this.db()
+				.prepare(
+					`UPDATE files
+					 SET active_revision_id = ?, tombstoned = 0, updated_at = ?
+					 WHERE file_id = ?`,
+				)
+				.run(revisionId, now, revision.fileId)
+
+			lexicalFtsSync = this.refreshLexicalFtsForRevisionInTransaction(revisionId)
+		})
+
+		IndexDebugLoggerV2.log("basic", "MetadataStore", "revision-lexical-fts-synced", {
+			component: "MetadataStore",
+			workspacePath: this.workspacePath,
+			runId: revision.runId,
+			revisionId,
+			chunkCount: lexicalFtsSync.chunkCount,
+			lexicalFtsSyncLatencyMs: lexicalFtsSync.lexicalFtsSyncLatencyMs,
+			revisionState: "degraded",
+		})
 	}
 
 	async markRevisionFailed(revisionId: string, reason: string): Promise<void> {
@@ -1665,9 +1725,26 @@ export class MetadataStore {
 	}
 
 	async markRevisionSuperseded(revisionId: string): Promise<void> {
-		this.db()
-			.prepare(`UPDATE file_revisions SET state = ?, superseded_at = ? WHERE revision_id = ?`)
-			.run("superseded", Date.now(), revisionId)
+		const revision = await this.getFileRevision(revisionId)
+		let deletedLexicalRows = 0
+
+		this.withTransaction(() => {
+			this.db()
+				.prepare(`UPDATE file_revisions SET state = ?, superseded_at = ? WHERE revision_id = ?`)
+				.run("superseded", Date.now(), revisionId)
+			deletedLexicalRows = this.deleteLexicalFtsForRevisionInTransaction(revisionId)
+		})
+
+		if (deletedLexicalRows > 0) {
+			IndexDebugLoggerV2.log("basic", "MetadataStore", "revision-lexical-fts-removed", {
+				component: "MetadataStore",
+				workspacePath: this.workspacePath,
+				runId: revision.runId,
+				revisionId,
+				removedLexicalRowCount: deletedLexicalRows,
+				reason: "superseded",
+			})
+		}
 	}
 
 	async markRevisionState(revisionId: string, state: FileRevisionRecord["state"]): Promise<void> {
@@ -2325,7 +2402,6 @@ export class MetadataStore {
 		)
 
 		let chunkInsertLatencyMs = 0
-		let lexicalFtsLatencyMs = 0
 		let chunkVariantInsertLatencyMs = 0
 		let revisionStateUpdateLatencyMs = 0
 		const transactionStartedAt = Date.now()
@@ -2357,21 +2433,6 @@ export class MetadataStore {
 				)
 			}
 			chunkInsertLatencyMs = Date.now() - chunkInsertStartedAt
-
-			const lexicalFtsStartedAt = Date.now()
-			this.upsertChunkLexicalFtsRows(
-				insertedChunks.map((chunk) => ({
-					chunkId: chunk.chunkId,
-					revisionId: chunk.revisionId,
-					relativePath: input.relativePath,
-					symbolQualifiedName: chunk.symbolQualifiedName,
-					symbolName: chunk.symbolName,
-					parentSymbolName: chunk.parentSymbolName,
-					summary: chunk.summary,
-					searchText: chunk.searchText,
-				})),
-			)
-			lexicalFtsLatencyMs = Date.now() - lexicalFtsStartedAt
 
 			const chunkVariantInsertStartedAt = Date.now()
 			for (const variant of variantRows) {
@@ -2405,12 +2466,10 @@ export class MetadataStore {
 			insertedChunks,
 			insertedVariantCount: variantRows.length,
 			chunkInsertLatencyMs,
-			lexicalFtsLatencyMs,
 			chunkVariantInsertLatencyMs,
 			revisionStateUpdateLatencyMs,
 			transactionLatencyMs,
-			metadataWriteLatencyMs:
-				chunkInsertLatencyMs + lexicalFtsLatencyMs + chunkVariantInsertLatencyMs + revisionStateUpdateLatencyMs,
+			metadataWriteLatencyMs: chunkInsertLatencyMs + chunkVariantInsertLatencyMs + revisionStateUpdateLatencyMs,
 		}
 	}
 
@@ -3126,6 +3185,79 @@ export class MetadataStore {
 				row.searchText ?? "",
 			)
 		}
+	}
+
+	async refreshLexicalFtsForRevision(
+		revisionId: string,
+	): Promise<{ chunkCount: number; lexicalFtsSyncLatencyMs: number }> {
+		return this.withTransaction(() => this.refreshLexicalFtsForRevisionInTransaction(revisionId))
+	}
+
+	async deleteLexicalFtsForRevision(revisionId: string): Promise<void> {
+		this.withTransaction(() => {
+			this.deleteLexicalFtsForRevisionInTransaction(revisionId)
+		})
+	}
+
+	private refreshLexicalFtsForRevisionInTransaction(revisionId: string): {
+		chunkCount: number
+		lexicalFtsSyncLatencyMs: number
+	} {
+		const chunkCountRow = this.db()
+			.prepare(`SELECT COUNT(*) AS count FROM chunks WHERE revision_id = ?`)
+			.get(revisionId) as { count?: number } | undefined
+		const chunkCount = Number(chunkCountRow?.count ?? 0)
+		const startedAt = Date.now()
+
+		this.deleteLexicalFtsForRevisionInTransaction(revisionId)
+
+		if (chunkCount > 0) {
+			this.db()
+				.prepare(
+					`INSERT INTO chunk_lexical_fts (
+						chunk_id,
+						relative_path,
+						symbol_qualified_name,
+						symbol_name,
+						parent_symbol_name,
+						summary,
+						search_text
+					)
+					SELECT
+						c.chunk_id,
+						COALESCE(f.relative_path, ''),
+						COALESCE(c.symbol_qualified_name, ''),
+						COALESCE(c.symbol_name, ''),
+						COALESCE(c.parent_symbol_name, ''),
+						COALESCE(c.summary, ''),
+						COALESCE(c.search_text, '')
+					FROM chunks c
+					INNER JOIN file_revisions fr ON fr.revision_id = c.revision_id
+					INNER JOIN files f ON f.file_id = fr.file_id
+					WHERE c.revision_id = ?`,
+				)
+				.run(revisionId)
+		}
+
+		return {
+			chunkCount,
+			lexicalFtsSyncLatencyMs: Date.now() - startedAt,
+		}
+	}
+
+	private deleteLexicalFtsForRevisionInTransaction(revisionId: string): number {
+		const result = this.db()
+			.prepare(
+				`DELETE FROM chunk_lexical_fts
+				WHERE chunk_id IN (
+					SELECT chunk_id
+					FROM chunks
+					WHERE revision_id = ?
+				)`,
+			)
+			.run(revisionId) as { changes?: number }
+
+		return Number(result.changes ?? 0)
 	}
 
 	private getRevisionPathMap(revisionIds: string[]): Map<string, string> {

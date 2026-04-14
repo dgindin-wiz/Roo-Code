@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest"
-import { buildPipelineBacklogSample, shouldPrioritizePlannerRefill } from "../engine/pipelineDiagnostics"
+import {
+	buildPipelineBacklogSample,
+	getParseThrottleReason,
+	shouldPrioritizePlannerRefill,
+	shouldResumeParseFromThrottle,
+} from "../engine/pipelineDiagnostics"
 
 describe("pipelineDiagnostics", () => {
 	it("keeps planner refill active only while parsed revisions exist and upsert lanes are underfed", () => {
@@ -57,6 +62,7 @@ describe("pipelineDiagnostics", () => {
 				blockingReason: "parsed_revisions_waiting_for_planning",
 			},
 			parseSchedulingThrottled: false,
+			parseThrottleReason: null,
 			plannerRefillPasses: 4,
 			latestSyncTelemetry: {
 				activeLaneCount: 1,
@@ -86,6 +92,7 @@ describe("pipelineDiagnostics", () => {
 				runningUpsertJobs: 1,
 				blockingReason: "parsed_revisions_waiting_for_planning",
 				parseSchedulingThrottled: false,
+				parseThrottleReason: null,
 				parsedChunkBacklog: 5,
 				runnableEmbedQueueDepth: 5,
 				totalVectorBacklog: 10,
@@ -102,5 +109,93 @@ describe("pipelineDiagnostics", () => {
 				lastHostFinalizeLatencyMs: 3_000,
 			}),
 		)
+	})
+
+	it("returns a planner starvation throttle reason when runnable embed work is empty but parsed backlog is ready", () => {
+		expect(
+			getParseThrottleReason({
+				embedPhaseStarted: true,
+				metrics: {
+					parsedRevisions: 12,
+					stagedChunks: 300,
+					stagedChunkBytes: 0,
+					queuedUpsertJobs: 0,
+					runningUpsertJobs: 0,
+				},
+				parsedRevisionHighWatermark: 150,
+				stagedChunkHighWatermark: 1_200,
+				stagedChunkLowWatermark: 300,
+				stagedBytesHighWatermark: 48 * 1024 * 1024,
+			}),
+		).toBe("planner_starvation_guard")
+	})
+
+	it("prefers the high watermark throttle reason over planner starvation", () => {
+		expect(
+			getParseThrottleReason({
+				embedPhaseStarted: true,
+				metrics: {
+					parsedRevisions: 150,
+					stagedChunks: 300,
+					stagedChunkBytes: 0,
+					queuedUpsertJobs: 0,
+					runningUpsertJobs: 0,
+				},
+				parsedRevisionHighWatermark: 150,
+				stagedChunkHighWatermark: 1_200,
+				stagedChunkLowWatermark: 300,
+				stagedBytesHighWatermark: 48 * 1024 * 1024,
+			}),
+		).toBe("high_watermark")
+	})
+
+	it("resumes planner starvation throttling once runnable work exists or parsed chunks fall below the low watermark", () => {
+		expect(
+			shouldResumeParseFromThrottle({
+				metrics: {
+					parsedRevisions: 12,
+					stagedChunks: 300,
+					stagedChunkBytes: 0,
+					queuedUpsertJobs: 0,
+					runningUpsertJobs: 0,
+				},
+				parseThrottleReason: "planner_starvation_guard",
+				parsedRevisionLowWatermark: 40,
+				stagedChunkLowWatermark: 300,
+				stagedBytesLowWatermark: 16 * 1024 * 1024,
+			}),
+		).toBe(false)
+
+		expect(
+			shouldResumeParseFromThrottle({
+				metrics: {
+					parsedRevisions: 12,
+					stagedChunks: 300,
+					stagedChunkBytes: 0,
+					queuedUpsertJobs: 1,
+					runningUpsertJobs: 0,
+				},
+				parseThrottleReason: "planner_starvation_guard",
+				parsedRevisionLowWatermark: 40,
+				stagedChunkLowWatermark: 300,
+				stagedBytesLowWatermark: 16 * 1024 * 1024,
+			}),
+		).toBe(true)
+
+		expect(
+			shouldResumeParseFromThrottle({
+				metrics: {
+					parsedRevisions: 12,
+					stagedChunks: 299,
+					stagedChunkBytes: 0,
+					queuedUpsertJobs: 0,
+					runningUpsertJobs: 0,
+				},
+				parseThrottleReason: "planner_starvation_guard",
+				parsedRevisionLowWatermark: 40,
+				stagedChunkLowWatermark: 300,
+				stagedBytesLowWatermark: 16 * 1024 * 1024,
+			}),
+		).toBe(true)
 	})
 })

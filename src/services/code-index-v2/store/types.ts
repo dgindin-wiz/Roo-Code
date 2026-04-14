@@ -198,7 +198,6 @@ export interface PersistParsedRevisionResult {
 	insertedChunks: ChunkRecord[]
 	insertedVariantCount: number
 	chunkInsertLatencyMs: number
-	lexicalFtsLatencyMs: number
 	chunkVariantInsertLatencyMs: number
 	revisionStateUpdateLatencyMs: number
 	transactionLatencyMs: number

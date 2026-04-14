@@ -48,7 +48,12 @@ import {
 	ICodeIndexEngine,
 } from "./interfaces"
 import { CodeIndexV2GpuSnapshot } from "../logging/log-types"
-import { buildPipelineBacklogSample, shouldPrioritizePlannerRefill } from "./pipelineDiagnostics"
+import {
+	buildPipelineBacklogSample,
+	getParseThrottleReason,
+	shouldPrioritizePlannerRefill,
+	shouldResumeParseFromThrottle,
+} from "./pipelineDiagnostics"
 
 type QueryIntent = {
 	pathHints: string[]
@@ -3323,6 +3328,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			let diffPlanningMs = 0
 			let embedUpsertMs = 0
 			let parseSchedulingThrottled = false
+			let parseThrottleReason: "high_watermark" | "planner_starvation_guard" | null = null
 			let parseFinished = false
 			let drainError: unknown
 			let lastBacklogRefreshAt = 0
@@ -3605,6 +3611,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 								detail: latestBacklogMetrics.blockingReason
 									? this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
 											parseThrottled: parseSchedulingThrottled,
+											parseThrottleReason,
 										})
 									: `${latestBacklogMetrics.stagedChunks.toLocaleString()} staged chunks`,
 								progressCurrent: Math.max(
@@ -3747,6 +3754,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 								detail: latestBacklogMetrics.blockingReason
 									? this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
 											parseThrottled: parseSchedulingThrottled,
+											parseThrottleReason,
 										})
 									: `${syncedChunksCompleted.toLocaleString()} chunks synced`,
 								progressCurrent: Math.max(syncedChunksCompleted, 0),
@@ -3874,6 +3882,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						stage: latestTelemetryStage,
 						metrics: latestBacklogMetrics,
 						parseSchedulingThrottled,
+						parseThrottleReason,
 						plannerRefillPasses: latestPlannerRefillPasses,
 						latestSyncTelemetry,
 					}),
@@ -3963,7 +3972,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					peakStagedChunks,
 					peakQueuedJobs,
 					blockingReason: parseSchedulingThrottled
-						? `parse_throttled:${latestBacklogMetrics.blockingReason}`
+						? `parse_throttled:${parseThrottleReason ?? latestBacklogMetrics.blockingReason ?? "unknown"}`
 						: latestBacklogMetrics.blockingReason,
 				})
 				const sampleEventType =
@@ -4098,6 +4107,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			const updateEmbeddingDetail = () => {
 				const blockingReasonText = this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
 					parseThrottled: parseSchedulingThrottled,
+					parseThrottleReason,
 				})
 				const throttleSuffix = parseSchedulingThrottled
 					? ` • ${blockingReasonText ?? `Parse throttled while ${latestBacklogMetrics.stagedChunks.toLocaleString()} parsed chunks and ${this.getRunnableEmbedQueueDepth(latestBacklogMetrics).toLocaleString()} runnable vector jobs drain`}`
@@ -4380,20 +4390,38 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			}
 			const waitForQueueCapacity = async () => {
 				await refreshBacklogMetrics(true)
-				if (!parseSchedulingThrottled && !this.shouldThrottleParse(latestBacklogMetrics, schedulerProfile)) {
+				const nextParseThrottleReason = this.getParseThrottleReason(
+					latestBacklogMetrics,
+					schedulerProfile,
+					embedPhaseStarted,
+				)
+				if (!parseSchedulingThrottled && !nextParseThrottleReason) {
 					return
 				}
 
 				parseSchedulingThrottled = true
+				parseThrottleReason = nextParseThrottleReason
 				const throttledStartedAt = Date.now()
 				this._status = {
 					engine: this.engine,
 					state: "running",
-					message: `Pausing parse scheduling while SQLite staging drains`,
+					message:
+						parseThrottleReason === "planner_starvation_guard"
+							? `Pausing parse scheduling while the planner refills runnable vector work`
+							: `Pausing parse scheduling while SQLite staging drains`,
 				}
 				updateEmbeddingDetail()
 				await persistRunSnapshot(true)
-				while (!this.shouldResumeParse(latestBacklogMetrics, schedulerProfile)) {
+				for (;;) {
+					const currentParseThrottleReason = this.getParseThrottleReason(
+						latestBacklogMetrics,
+						schedulerProfile,
+						embedPhaseStarted,
+					)
+					parseThrottleReason = currentParseThrottleReason
+					if (this.shouldResumeParse(latestBacklogMetrics, schedulerProfile, currentParseThrottleReason)) {
+						break
+					}
 					if (drainError) {
 						throw drainError
 					}
@@ -4407,6 +4435,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				}
 				totalParseThrottleMs += Date.now() - throttledStartedAt
 				parseSchedulingThrottled = false
+				parseThrottleReason = null
 				updateEmbeddingDetail()
 				await persistRunSnapshot(true)
 			}
@@ -4785,6 +4814,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		blockingReason?: string | null,
 		options?: {
 			parseThrottled?: boolean
+			parseThrottleReason?: "high_watermark" | "planner_starvation_guard" | null
 		},
 	): string | undefined {
 		if (!blockingReason || blockingReason === "idle") {
@@ -4792,10 +4822,21 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 
 		const normalized = blockingReason.trim()
-		if (
-			(options?.parseThrottled && normalized === "parsed_revisions_waiting_for_planning") ||
-			normalized === "parse_throttled:parsed_revisions_waiting_for_planning"
-		) {
+		if (options?.parseThrottled) {
+			if (options.parseThrottleReason === "planner_starvation_guard") {
+				return "Parsing is temporarily throttled while the planner catches up."
+			}
+			if (options.parseThrottleReason === "high_watermark") {
+				return "Parsing is temporarily throttled while staged SQLite work drains."
+			}
+		}
+		if (normalized === "parse_throttled:planner_starvation_guard") {
+			return "Parsing is temporarily throttled while the planner catches up."
+		}
+		if (normalized === "parse_throttled:high_watermark") {
+			return "Parsing is temporarily throttled while staged SQLite work drains."
+		}
+		if (normalized === "parse_throttled:parsed_revisions_waiting_for_planning") {
 			return "Parsing is temporarily throttled while the planner catches up."
 		}
 
@@ -4839,6 +4880,21 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return metrics.stagedChunks + this.getRunnableEmbedQueueDepth(metrics)
 	}
 
+	private getParseThrottleReason(
+		metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>,
+		profile: ReturnType<CodeIndexEngineV2["getSchedulerProfile"]>,
+		embedPhaseStarted: boolean,
+	): "high_watermark" | "planner_starvation_guard" | null {
+		return getParseThrottleReason({
+			embedPhaseStarted,
+			metrics,
+			parsedRevisionHighWatermark: profile.parsedRevisionHighWatermark,
+			stagedChunkHighWatermark: profile.stagedChunkHighWatermark,
+			stagedChunkLowWatermark: profile.stagedChunkLowWatermark,
+			stagedBytesHighWatermark: profile.stagedBytesHighWatermark,
+		})
+	}
+
 	private getSchedulerProfile(checkedFiles: number) {
 		const largeWorkspaceMode = checkedFiles >= CodeIndexEngineV2.LARGE_WORKSPACE_FILE_THRESHOLD
 		return {
@@ -4875,23 +4931,25 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private shouldThrottleParse(
 		metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>,
 		profile: ReturnType<CodeIndexEngineV2["getSchedulerProfile"]>,
+		options?: {
+			embedPhaseStarted?: boolean
+		},
 	): boolean {
-		return (
-			metrics.parsedRevisions >= profile.parsedRevisionHighWatermark ||
-			metrics.stagedChunks >= profile.stagedChunkHighWatermark ||
-			metrics.stagedChunkBytes >= profile.stagedBytesHighWatermark
-		)
+		return this.getParseThrottleReason(metrics, profile, options?.embedPhaseStarted ?? false) !== null
 	}
 
 	private shouldResumeParse(
 		metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>,
 		profile: ReturnType<CodeIndexEngineV2["getSchedulerProfile"]>,
+		parseThrottleReason: "high_watermark" | "planner_starvation_guard" | null,
 	): boolean {
-		return (
-			metrics.parsedRevisions <= profile.parsedRevisionLowWatermark &&
-			metrics.stagedChunks <= profile.stagedChunkLowWatermark &&
-			metrics.stagedChunkBytes <= profile.stagedBytesLowWatermark
-		)
+		return shouldResumeParseFromThrottle({
+			metrics,
+			parseThrottleReason,
+			parsedRevisionLowWatermark: profile.parsedRevisionLowWatermark,
+			stagedChunkLowWatermark: profile.stagedChunkLowWatermark,
+			stagedBytesLowWatermark: profile.stagedBytesLowWatermark,
+		})
 	}
 
 	private async waitForPipelineTick(signal?: AbortSignal): Promise<void> {

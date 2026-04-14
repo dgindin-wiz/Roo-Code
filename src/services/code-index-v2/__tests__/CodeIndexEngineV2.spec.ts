@@ -2839,6 +2839,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 					runningUpsertJobs: 0,
 				},
 				profile,
+				{ embedPhaseStarted: true },
 			),
 		).toBe(false)
 		expect(
@@ -2850,6 +2851,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 					runningUpsertJobs: 0,
 				},
 				profile,
+				null,
 			),
 		).toBe(true)
 	})

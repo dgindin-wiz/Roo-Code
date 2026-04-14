@@ -1220,6 +1220,15 @@ describe("MetadataStore integration", () => {
 				state: "parsed",
 			},
 		])
+		const db = (store as any).db() as {
+			prepare(sql: string): { get(...params: unknown[]): Record<string, unknown> | undefined }
+		}
+		const lexicalRowsBeforeCleanup = db
+			.prepare(
+				`SELECT COUNT(*) AS count FROM chunk_lexical_fts WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE revision_id = ?)`,
+			)
+			.get(oldRevision.revisionId) as { count?: number } | undefined
+		expect(lexicalRowsBeforeCleanup?.count).toBe(1)
 		const [oldChunk] = await store.getChunksForRevision(oldRevision.revisionId)
 		await store.enqueueJobs([
 			{
@@ -1242,6 +1251,10 @@ describe("MetadataStore integration", () => {
 		expect(cleanup.expiredRevisionsGarbageCollected).toBe(1)
 		expect(cleanup.expiredChunksGarbageCollected).toBe(1)
 		expect(cleanup.expiredRunsDeleted).toBe(1)
+		const lexicalRowsAfterCleanup = db
+			.prepare(`SELECT COUNT(*) AS count FROM chunk_lexical_fts WHERE chunk_id = ?`)
+			.get(oldChunk.chunkId) as { count?: number } | undefined
+		expect(lexicalRowsAfterCleanup?.count ?? 0).toBe(0)
 
 		const reusableRevision = await store.findReusableRevision(
 			oldFile.fileId,
@@ -1464,7 +1477,7 @@ describe("MetadataStore integration", () => {
 		await store.dispose()
 	})
 
-	it("persists parsed revisions with chunk rows, lexical rows, variants, and parsed state in one helper", async () => {
+	it("persists parsed revisions without lexical rows and syncs lexical FTS when the revision becomes active", async () => {
 		const context = {
 			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-8") },
 		} as any
@@ -1543,7 +1556,6 @@ describe("MetadataStore integration", () => {
 		expect(result.insertedChunks).toHaveLength(1)
 		expect(result.insertedVariantCount).toBe(2)
 		expect(result.chunkInsertLatencyMs).toEqual(expect.any(Number))
-		expect(result.lexicalFtsLatencyMs).toEqual(expect.any(Number))
 		expect(result.transactionLatencyMs).toEqual(expect.any(Number))
 
 		const storedRevision = await store.getFileRevision(revision.revisionId)
@@ -1571,12 +1583,88 @@ describe("MetadataStore integration", () => {
 				WHERE chunk_id = ?`,
 			)
 			.get("chunk-1")
-		expect(lexicalRow).toEqual(
+		expect(lexicalRow).toBeUndefined()
+
+		await store.markRevisionCommitted(revision.revisionId)
+
+		const refreshedLexicalRow = db
+			.prepare(
+				`SELECT relative_path AS relativePath, search_text AS searchText
+				FROM chunk_lexical_fts
+				WHERE chunk_id = ?`,
+			)
+			.get("chunk-1")
+		expect(refreshedLexicalRow).toEqual(
 			expect.objectContaining({
 				relativePath: "src/example.ts",
 				searchText: rawCode,
 			}),
 		)
+
+		await store.dispose()
+	})
+
+	it("removes lexical FTS rows when a revision is superseded", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-superseded-fts") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-superseded-fts")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const runId = await store.beginRun("initial-discovery")
+		const file = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/superseded.ts",
+			normalizedPath: path.join(workspacePath, "src/superseded.ts"),
+			lastSeenMtimeMs: 50,
+			lastSeenSize: 75,
+			ignoreState: "included",
+		})
+		const revision = await store.createFileRevision({
+			fileId: file.fileId,
+			runId,
+			contentHash: "superseded-content-hash",
+			fastFingerprint: "75:50",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+			state: "parsed",
+		})
+
+		await store.persistParsedRevision({
+			revisionId: revision.revisionId,
+			relativePath: "src/superseded.ts",
+			chunks: [
+				{
+					chunkId: "superseded-chunk-1",
+					chunkFingerprint: "superseded-fp-1",
+					startLine: 1,
+					endLine: 1,
+					content: "export const superseded = true",
+					searchText: "export const superseded = true",
+					contentHash: createHash("sha256").update("export const superseded = true").digest("hex"),
+					state: "parsed",
+					variants: [],
+				},
+			],
+		})
+		await store.markRevisionCommitted(revision.revisionId)
+
+		const db = (store as any).db() as {
+			prepare(sql: string): { get(...params: unknown[]): Record<string, unknown> | undefined }
+		}
+		const lexicalRowsBeforeSupersede = db
+			.prepare(`SELECT COUNT(*) AS count FROM chunk_lexical_fts WHERE chunk_id = ?`)
+			.get("superseded-chunk-1") as { count?: number } | undefined
+		expect(lexicalRowsBeforeSupersede?.count).toBe(1)
+
+		await store.markRevisionSuperseded(revision.revisionId)
+
+		const lexicalRowsAfterSupersede = db
+			.prepare(`SELECT COUNT(*) AS count FROM chunk_lexical_fts WHERE chunk_id = ?`)
+			.get("superseded-chunk-1") as { count?: number } | undefined
+		expect(lexicalRowsAfterSupersede?.count ?? 0).toBe(0)
 
 		await store.dispose()
 	})

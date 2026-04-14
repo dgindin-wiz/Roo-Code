@@ -225,7 +225,6 @@ export class ParseChunkService {
 					insertedChunkCount: persistence.insertedChunks.length,
 					insertedVariantCount: persistence.insertedVariantCount,
 					chunkInsertLatencyMs: persistence.chunkInsertLatencyMs,
-					lexicalFtsLatencyMs: persistence.lexicalFtsLatencyMs,
 					chunkVariantInsertLatencyMs: persistence.chunkVariantInsertLatencyMs,
 					revisionStateUpdateLatencyMs: persistence.revisionStateUpdateLatencyMs,
 					transactionLatencyMs: persistence.transactionLatencyMs,
