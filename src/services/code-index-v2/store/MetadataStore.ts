@@ -2169,8 +2169,9 @@ export class MetadataStore {
 		const statement = this.db().prepare(
 			`INSERT INTO chunk_variants (
 				variant_id, chunk_id, variant_type, content, content_hash, token_estimate,
-				embedding_model, vector_point_id, state, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				embedding_model, vector_point_id, vector_eligible, vector_priority,
+				vector_eligibility_reason, novelty_score, state, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
 		const insertedVariants: ChunkVariantRecord[] = []
 		this.withTransaction(() => {
@@ -2185,6 +2186,10 @@ export class MetadataStore {
 					variant.tokenEstimate ?? null,
 					variant.embeddingModel ?? null,
 					variant.vectorPointId ?? null,
+					variant.vectorEligible === false ? 0 : 1,
+					variant.vectorPriority ?? 0,
+					variant.vectorEligibilityReason ?? null,
+					variant.noveltyScore ?? null,
 					variant.state ?? "parsed",
 					now,
 					now,
@@ -2198,6 +2203,10 @@ export class MetadataStore {
 					tokenEstimate: variant.tokenEstimate ?? null,
 					embeddingModel: variant.embeddingModel ?? null,
 					vectorPointId: variant.vectorPointId ?? null,
+					vectorEligible: variant.vectorEligible !== false,
+					vectorPriority: variant.vectorPriority ?? 0,
+					vectorEligibilityReason: variant.vectorEligibilityReason ?? null,
+					noveltyScore: variant.noveltyScore ?? null,
 					state: variant.state ?? "parsed",
 					createdAt: now,
 					updatedAt: now,
@@ -2283,12 +2292,19 @@ export class MetadataStore {
 			.all(...chunkIds) as ChunkWithRevisionRecord[]
 	}
 
-	async getChunkVariantsByChunkIds(chunkIds: string[]): Promise<ChunkVariantRecord[]> {
+	async getChunkVariantsByChunkIds(
+		chunkIds: string[],
+		options?: { vectorEligibleOnly?: boolean },
+	): Promise<ChunkVariantRecord[]> {
 		if (chunkIds.length === 0) {
 			return []
 		}
 
 		const placeholders = chunkIds.map(() => "?").join(", ")
+		const clauses = [`chunk_id IN (${placeholders})`]
+		if (options?.vectorEligibleOnly) {
+			clauses.push(`vector_eligible = 1`)
+		}
 		return this.db()
 			.prepare(
 				`SELECT
@@ -2300,14 +2316,22 @@ export class MetadataStore {
 					token_estimate AS tokenEstimate,
 					embedding_model AS embeddingModel,
 					vector_point_id AS vectorPointId,
+					vector_eligible AS vectorEligible,
+					vector_priority AS vectorPriority,
+					vector_eligibility_reason AS vectorEligibilityReason,
+					novelty_score AS noveltyScore,
 					state,
 					created_at AS createdAt,
 					updated_at AS updatedAt
 				FROM chunk_variants
-				WHERE chunk_id IN (${placeholders})
-				ORDER BY chunk_id ASC, variant_type ASC`,
+				WHERE ${clauses.join(" AND ")}
+				ORDER BY chunk_id ASC, vector_priority DESC, variant_type ASC`,
 			)
-			.all(...chunkIds) as ChunkVariantRecord[]
+			.all(...chunkIds)
+			.map((row: any) => ({
+				...row,
+				vectorEligible: Boolean(row.vectorEligible),
+			})) as ChunkVariantRecord[]
 	}
 
 	async getActiveChunksByFingerprints(
@@ -3277,6 +3301,32 @@ export class MetadataStore {
 			.run(errorMessage, nextAttemptAt, Date.now(), jobId)
 	}
 
+	async releaseJobs(jobIds: string[], leaseOwner?: string): Promise<void> {
+		if (jobIds.length === 0) {
+			return
+		}
+
+		const now = Date.now()
+		const placeholders = jobIds.map(() => "?").join(", ")
+		const clauses = [`state = 'running'`, `job_id IN (${placeholders})`]
+		const params: Array<string | number> = [now]
+		if (leaseOwner) {
+			clauses.push(`lease_owner = ?`)
+		}
+		params.push(...jobIds)
+		if (leaseOwner) {
+			params.push(leaseOwner)
+		}
+
+		this.db()
+			.prepare(
+				`UPDATE jobs
+				 SET state = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+				 WHERE ${clauses.join(" AND ")}`,
+			)
+			.run(...params)
+	}
+
 	async getNextRetryAt(jobType: string, runId: string): Promise<number | undefined> {
 		const row = this.db()
 			.prepare(
@@ -3540,6 +3590,10 @@ export class MetadataStore {
 		this.ensureColumn(database, "chunks", "parent_chunk_fingerprint", "TEXT")
 		this.ensureColumn(database, "chunks", "summary", "TEXT")
 		this.ensureColumn(database, "chunks", "search_text", "TEXT")
+		this.ensureColumn(database, "chunk_variants", "vector_eligible", "INTEGER NOT NULL DEFAULT 1")
+		this.ensureColumn(database, "chunk_variants", "vector_priority", "INTEGER NOT NULL DEFAULT 0")
+		this.ensureColumn(database, "chunk_variants", "vector_eligibility_reason", "TEXT")
+		this.ensureColumn(database, "chunk_variants", "novelty_score", "REAL")
 		this.ensureColumn(database, "oversized_file_tracking", "last_modified_mtime_ms", "INTEGER")
 		this.ensureColumn(database, "index_runs", "last_heartbeat_at", "INTEGER")
 		this.ensureColumn(database, "index_runs", "heartbeat_owner", "TEXT")

@@ -31,6 +31,7 @@ describe("EmbedUpsertWorker", () => {
 			claimJobs: vi.fn(),
 			getChunksByIds: vi.fn(),
 			getChunkVariantsByChunkIds: vi.fn().mockResolvedValue([]),
+			releaseJobs: vi.fn().mockResolvedValue(undefined),
 			completeJob: vi.fn().mockResolvedValue(undefined),
 			completeJobs: vi.fn().mockResolvedValue(undefined),
 			failJob: vi.fn().mockResolvedValue(undefined),
@@ -55,6 +56,7 @@ describe("EmbedUpsertWorker", () => {
 			runtimeKind: "remote" as "local" | "remote",
 			runtimeLabel: "Remote embedder",
 			createEmbeddings: vi.fn(),
+			getRecommendedDocumentBatchSize: vi.fn(),
 			recycleClient: vi.fn().mockResolvedValue(undefined),
 		}
 
@@ -304,6 +306,81 @@ describe("EmbedUpsertWorker", () => {
 			]),
 		)
 		expect(summary.upsertedChunks).toBe(1)
+	})
+
+	it("trims a claimed chunk batch to the current embedding budget", () => {
+		const { metadataStore, embeddingAdapter, vectorStore } = createWorkerDeps()
+		embeddingAdapter.getRecommendedDocumentBatchSize = vi.fn().mockReturnValue(2)
+		const worker = new EmbedUpsertWorker(metadataStore as any, embeddingAdapter as any, vectorStore as any)
+		const now = Date.now()
+		const jobPairs = [1, 2].map((index) => ({
+			job: {
+				jobId: `job-${index}`,
+				runId: "run-1",
+				entityId: `chunk-${index}`,
+			},
+			chunk: {
+				chunkId: `chunk-${index}`,
+				revisionId: "revision-1",
+				chunkFingerprint: `fp-${index}`,
+				startLine: index,
+				endLine: index + 1,
+				content: `export function fn${index}() { return ${index} }`,
+				contentHash: `hash-${index}`,
+				tokenEstimate: 12,
+				embeddingModel: null,
+				vectorPointId: null,
+				state: "parsed" as const,
+				createdAt: now,
+				updatedAt: now,
+				fileId: "file-1",
+				workspaceId: "workspace-1",
+				relativePath: "src/a.ts",
+				normalizedPath: "/workspace/src/a.ts",
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+				chunkKind: "function",
+				symbolName: `fn${index}`,
+				symbolQualifiedName: `A.fn${index}`,
+				parentSymbolName: "A",
+				parentChunkFingerprint: null,
+				language: "ts",
+				summary: null,
+				searchText: null,
+			},
+		}))
+		const variantsByChunkId = new Map(
+			jobPairs.map(({ chunk }) => [
+				chunk.chunkId,
+				[
+					{
+						variantId: `${chunk.chunkId}-raw`,
+						chunkId: chunk.chunkId,
+						variantType: "raw_code" as const,
+						content: `raw:${chunk.chunkId}`,
+						vectorEligible: true,
+						vectorPriority: 1000,
+						vectorEligibilityReason: "canonical_grounding_surface",
+						noveltyScore: 1,
+					},
+					{
+						variantId: `${chunk.chunkId}-sig`,
+						chunkId: chunk.chunkId,
+						variantType: "symbol_signature" as const,
+						content: `sig:${chunk.chunkId}`,
+						vectorEligible: true,
+						vectorPriority: 800,
+						vectorEligibilityReason: "extracted_symbol_signature",
+						noveltyScore: 0.5,
+					},
+				],
+			]),
+		)
+
+		const selected = (worker as any).selectJobPairsWithinEmbeddingBudget(jobPairs, variantsByChunkId, 2)
+
+		expect(selected).toHaveLength(1)
+		expect(selected[0]?.job.jobId).toBe("job-1")
 	})
 
 	it("isolates a permanently failing chunk so an unrelated chunk can still commit", async () => {
@@ -1257,5 +1334,101 @@ describe("EmbedUpsertWorker", () => {
 		expect(summary.pressureState).toBe("hard")
 		expect(embeddingAdapter.recycleClient).toHaveBeenCalled()
 		expect(vectorStore.recycleClient).toHaveBeenCalled()
+	})
+
+	it("routes worker heartbeat and completion telemetry with workspacePath", async () => {
+		vi.useFakeTimers()
+		const { metadataStore, embeddingAdapter, vectorStore } = createWorkerDeps()
+		const now = Date.now()
+		const job = {
+			jobId: "job-1",
+			workspaceId: "workspace-1",
+			runId: "run-1",
+			jobType: "upsert",
+			entityId: "chunk-1",
+			state: "running" as const,
+			priority: 100,
+			attemptCount: 1,
+			nextAttemptAt: now,
+			lastError: null,
+			createdAt: now,
+			updatedAt: now,
+		}
+		const chunk = {
+			chunkId: "chunk-1",
+			revisionId: "revision-1",
+			chunkFingerprint: "fp-1",
+			startLine: 1,
+			endLine: 2,
+			content: "const ok = true",
+			contentHash: "hash-1",
+			tokenEstimate: 5,
+			embeddingModel: null,
+			vectorPointId: null,
+			state: "parsed" as const,
+			createdAt: now,
+			updatedAt: now,
+			fileId: "file-1",
+			workspaceId: "workspace-1",
+			relativePath: "src/file-1.ts",
+			normalizedPath: "/workspace/src/file-1.ts",
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+		}
+		metadataStore.claimJobs.mockImplementation(async (jobType: string) => {
+			if (jobType === "delete") {
+				return []
+			}
+			return metadataStore.claimJobs.mock.calls.filter(([type]) => type === "upsert").length === 1 ? [job] : []
+		})
+		metadataStore.getChunksByIds.mockResolvedValue([chunk])
+		metadataStore.getNextRetryAt.mockResolvedValue(undefined)
+		metadataStore.getRevisionsByState.mockResolvedValue([
+			{ revisionId: "revision-1", fileId: "file-1", runId: "run-1" },
+		])
+		metadataStore.getRevisionJobResolution.mockResolvedValue({
+			doneJobs: 1,
+			queuedJobs: 0,
+			runningJobs: 0,
+			terminalFailedJobs: 0,
+			totalJobs: 1,
+		})
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
+		embeddingAdapter.createEmbeddings.mockImplementation(async (texts: string[]) => {
+			await vi.advanceTimersByTimeAsync(5_100)
+			return { embeddings: texts.map(() => [0.1, 0.2, 0.3]) }
+		})
+		vi.spyOn(MacGpuTelemetrySampler.prototype, "sample").mockResolvedValue({
+			sampler: "ioreg",
+			utilizationPercent: 61,
+			deviceUtilizationPercent: 61,
+			inUseBytes: 2_500_000_000,
+			allocatedBytes: 6_800_000_000,
+			sampleAgeMs: 0,
+		})
+		const logSpy = vi.spyOn(IndexDebugLoggerV2, "log").mockImplementation(() => {})
+
+		const worker = new EmbedUpsertWorker(
+			metadataStore as any,
+			embeddingAdapter as any,
+			vectorStore as any,
+			undefined,
+			"/tmp/workspace-a",
+		)
+		await worker.run("run-1")
+
+		const heartbeatCall = logSpy.mock.calls.find(([, , message]) => message === "embed-upsert-heartbeat")
+		const completeCall = logSpy.mock.calls.find(([, , message]) => message === "embed-upsert-complete")
+
+		expect(heartbeatCall?.[3]).toEqual(
+			expect.objectContaining({
+				workspacePath: "/tmp/workspace-a",
+			}),
+		)
+		expect(completeCall?.[3]).toEqual(
+			expect.objectContaining({
+				workspacePath: "/tmp/workspace-a",
+			}),
+		)
 	})
 })

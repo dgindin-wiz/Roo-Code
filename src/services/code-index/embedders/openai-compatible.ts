@@ -21,6 +21,13 @@ import { Mutex } from "async-mutex"
 import { handleOpenAIError } from "../../../api/providers/utils/openai-error-handler"
 import { IndexDebugLoggerV2 } from "../../code-index-v2/logging/IndexDebugLoggerV2"
 import { EmbedderCreateEmbeddingsOptions } from "../interfaces/embedder"
+import {
+	AdaptiveEmbeddingControllerState,
+	AdaptiveProviderObservation,
+	applyAdaptiveProviderObservation,
+	cloneAdaptiveEmbeddingControllerState,
+	getAdaptiveEmbeddingRecommendedBatchSize,
+} from "../../code-index-v2/shared/adaptiveEmbeddingController"
 
 interface EmbeddingItem {
 	embedding: string | number[]
@@ -41,14 +48,6 @@ interface OpenAIEmbeddingResponse {
  */
 
 export class OpenAICompatibleEmbedder implements IEmbedder {
-	private static readonly PROVIDER_REQUEST_SOFT_LATENCY_MS = 4_000
-	private static readonly PROVIDER_REQUEST_HARD_LATENCY_MS = 7_000
-	private static readonly PROVIDER_REQUEST_FAST_LATENCY_MS = 1_500
-	private static readonly PROVIDER_REQUEST_FAST_STREAK_FOR_GROWTH = 3
-	private static readonly PROVIDER_REQUEST_MIN_ITEM_CAP = 32
-	private static readonly PROVIDER_REQUEST_SOFT_REDUCTION_FACTOR = 0.8
-	private static readonly PROVIDER_REQUEST_HARD_REDUCTION_FACTOR = 0.6
-	private static readonly PROVIDER_REQUEST_GROWTH_FACTOR = 1.25
 	private embeddingsClient: OpenAI
 	private _isolatedFetch!: IsolatedFetch
 	private readonly defaultModelId: string
@@ -56,8 +55,8 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 	private readonly apiKey: string
 	private readonly isFullUrl: boolean
 	private readonly maxItemTokens: number
-	private providerRequestItemCap?: number
-	private fastProviderRequestStreak = 0
+	private adaptiveControllerState: AdaptiveEmbeddingControllerState = {}
+	private pendingAdaptiveControllerObservations: AdaptiveProviderObservation[] = []
 
 	// Global rate limiting state shared across all instances
 	private static globalRateLimitState = {
@@ -189,17 +188,18 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 			component: "OpenAICompatibleEmbedder",
 			runId: options?.debugContext?.runId,
 			jobId: options?.debugContext?.batchId,
+			workspacePath: options?.debugContext?.workspacePath,
 			provider: "openai-compatible",
 			modelId: modelToUse,
 			outerBatchSize: options?.debugContext?.outerBatchSize ?? texts.length,
 			inputTexts: texts.length,
 			processedTexts: processedTexts.length,
 			isQuery: options?.isQuery ?? false,
-			providerRequestItemCap: this.providerRequestItemCap,
+			providerRequestItemCap: this.adaptiveControllerState.preferredRequestItemCap,
 		})
 
 		while (remainingTexts.length > 0) {
-			const activeProviderRequestItemCap = this.providerRequestItemCap
+			const activeProviderRequestItemCap = this.adaptiveControllerState.preferredRequestItemCap
 			const currentBatch: string[] = []
 			let currentBatchTokens = 0
 			const processedIndices: number[] = []
@@ -258,6 +258,7 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 					component: "OpenAICompatibleEmbedder",
 					runId: options?.debugContext?.runId,
 					jobId: options?.debugContext?.batchId,
+					workspacePath: options?.debugContext?.workspacePath,
 					provider: "openai-compatible",
 					modelId: modelToUse,
 					providerRequestIndex: providerRequests,
@@ -269,9 +270,13 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 					providerTotalTokens: batchResult.usage.totalTokens,
 				})
 
-				this.updateProviderRequestItemCap(
-					currentBatch.length,
-					batchResult.requestLatencyMs,
+				this.updateAdaptiveControllerState(
+					{
+						batchSize: currentBatch.length,
+						tokenCount: currentBatchTokens,
+						latencyMs: batchResult.requestLatencyMs,
+						isQuery: options?.isQuery,
+					},
 					modelToUse,
 					options?.debugContext,
 				)
@@ -282,13 +287,14 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 			component: "OpenAICompatibleEmbedder",
 			runId: options?.debugContext?.runId,
 			jobId: options?.debugContext?.batchId,
+			workspacePath: options?.debugContext?.workspacePath,
 			provider: "openai-compatible",
 			modelId: modelToUse,
 			outerBatchSize: options?.debugContext?.outerBatchSize ?? texts.length,
 			inputTexts: texts.length,
 			outputEmbeddings: allEmbeddings.length,
 			providerRequests,
-			providerRequestItemCap: this.providerRequestItemCap,
+			providerRequestItemCap: this.adaptiveControllerState.preferredRequestItemCap,
 			totalProviderLatencyMs: providerRequestLatencyMs,
 			averageProviderLatencyMs: providerRequests > 0 ? providerRequestLatencyMs / providerRequests : undefined,
 			peakProviderLatencyMs: peakProviderRequestLatencyMs > 0 ? peakProviderRequestLatencyMs : undefined,
@@ -322,68 +328,85 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 		return patterns.some((pattern) => pattern.test(url))
 	}
 
-	private updateProviderRequestItemCap(
+	seedAdaptiveControllerState(state?: AdaptiveEmbeddingControllerState): void {
+		this.adaptiveControllerState = cloneAdaptiveEmbeddingControllerState(state) ?? {}
+		this.pendingAdaptiveControllerObservations = []
+	}
+
+	getAdaptiveControllerState(): AdaptiveEmbeddingControllerState | undefined {
+		return cloneAdaptiveEmbeddingControllerState(this.adaptiveControllerState)
+	}
+
+	drainAdaptiveControllerObservations(): AdaptiveProviderObservation[] {
+		const drained = [...this.pendingAdaptiveControllerObservations]
+		this.pendingAdaptiveControllerObservations = []
+		return drained
+	}
+
+	getRecommendedDocumentBatchSize(): number | undefined {
+		return getAdaptiveEmbeddingRecommendedBatchSize(this.adaptiveControllerState)
+	}
+
+	get providerRequestItemCap(): number | undefined {
+		return this.adaptiveControllerState.preferredRequestItemCap
+	}
+
+	set providerRequestItemCap(value: number | undefined) {
+		this.adaptiveControllerState = {
+			...this.adaptiveControllerState,
+			preferredRequestItemCap: value,
+		}
+	}
+
+	updateProviderRequestItemCap(
 		batchSize: number,
 		requestLatencyMs: number,
 		modelId: string,
 		debugContext?: EmbedderCreateEmbeddingsOptions["debugContext"],
 	): void {
-		const previousCap = this.providerRequestItemCap
-		let nextCap = previousCap
-		let adjustmentReason: "soft_latency" | "hard_latency" | "recovered_latency" | undefined
+		this.updateAdaptiveControllerState(
+			{
+				batchSize,
+				latencyMs: requestLatencyMs,
+			},
+			modelId,
+			debugContext,
+		)
+	}
 
-		if (
-			requestLatencyMs >= OpenAICompatibleEmbedder.PROVIDER_REQUEST_HARD_LATENCY_MS &&
-			batchSize > OpenAICompatibleEmbedder.PROVIDER_REQUEST_MIN_ITEM_CAP
-		) {
-			nextCap = Math.max(
-				OpenAICompatibleEmbedder.PROVIDER_REQUEST_MIN_ITEM_CAP,
-				Math.floor(batchSize * OpenAICompatibleEmbedder.PROVIDER_REQUEST_HARD_REDUCTION_FACTOR),
-			)
-			this.fastProviderRequestStreak = 0
-			adjustmentReason = "hard_latency"
-		} else if (
-			requestLatencyMs >= OpenAICompatibleEmbedder.PROVIDER_REQUEST_SOFT_LATENCY_MS &&
-			batchSize > OpenAICompatibleEmbedder.PROVIDER_REQUEST_MIN_ITEM_CAP
-		) {
-			const reducedCap = Math.max(
-				OpenAICompatibleEmbedder.PROVIDER_REQUEST_MIN_ITEM_CAP,
-				Math.floor(batchSize * OpenAICompatibleEmbedder.PROVIDER_REQUEST_SOFT_REDUCTION_FACTOR),
-			)
-			nextCap = previousCap === undefined ? reducedCap : Math.min(previousCap, reducedCap)
-			this.fastProviderRequestStreak = 0
-			adjustmentReason = "soft_latency"
-		} else if (
-			previousCap !== undefined &&
-			requestLatencyMs <= OpenAICompatibleEmbedder.PROVIDER_REQUEST_FAST_LATENCY_MS
-		) {
-			this.fastProviderRequestStreak += 1
-
-			if (this.fastProviderRequestStreak >= OpenAICompatibleEmbedder.PROVIDER_REQUEST_FAST_STREAK_FOR_GROWTH) {
-				nextCap = Math.max(
-					previousCap + 1,
-					Math.ceil(previousCap * OpenAICompatibleEmbedder.PROVIDER_REQUEST_GROWTH_FACTOR),
-				)
-				this.fastProviderRequestStreak = 0
-				adjustmentReason = "recovered_latency"
-			}
-		} else {
-			this.fastProviderRequestStreak = 0
+	private updateAdaptiveControllerState(
+		observation: AdaptiveProviderObservation,
+		modelId: string,
+		debugContext?: EmbedderCreateEmbeddingsOptions["debugContext"],
+	): void {
+		if (observation.isQuery) {
+			return
 		}
 
-		if (nextCap !== previousCap) {
-			this.providerRequestItemCap = nextCap
+		const previousState = cloneAdaptiveEmbeddingControllerState(this.adaptiveControllerState) ?? {}
+		const result = applyAdaptiveProviderObservation(previousState, observation)
+		this.adaptiveControllerState = result.state
+		this.pendingAdaptiveControllerObservations.push({
+			...observation,
+			observedAt: observation.observedAt ?? Date.now(),
+		})
+
+		if (result.changed && previousState.preferredRequestItemCap !== result.state.preferredRequestItemCap) {
 			IndexDebugLoggerV2.log("basic", "OpenAICompatibleEmbedder", "embedder-provider-request-cap-adjusted", {
 				component: "OpenAICompatibleEmbedder",
 				runId: debugContext?.runId,
 				jobId: debugContext?.batchId,
+				workspacePath: debugContext?.workspacePath,
 				provider: "openai-compatible",
 				modelId,
-				providerRequestBatchSize: batchSize,
-				providerRequestLatencyMs: requestLatencyMs,
-				previousProviderRequestItemCap: previousCap,
-				providerRequestItemCap: nextCap,
-				adjustmentReason,
+				providerRequestBatchSize: observation.batchSize,
+				providerRequestLatencyMs: observation.latencyMs,
+				providerRequestTokens: observation.tokenCount,
+				previousProviderRequestItemCap: previousState.preferredRequestItemCap,
+				providerRequestItemCap: result.state.preferredRequestItemCap,
+				stableProviderRequestItemCap: result.state.stableRequestItemCap,
+				ewmaLatencyMs: result.state.ewmaLatencyMs,
+				adjustmentReason: result.adjustmentReason,
 			})
 		}
 	}
@@ -573,6 +596,7 @@ export class OpenAICompatibleEmbedder implements IEmbedder {
 							component: "OpenAICompatibleEmbedder",
 							runId: debugContext?.runId,
 							jobId: debugContext?.batchId,
+							workspacePath: debugContext?.workspacePath,
 							provider: "openai-compatible",
 							modelId: model,
 							attempt: attempts + 1,

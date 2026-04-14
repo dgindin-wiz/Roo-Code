@@ -511,6 +511,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 
 		expect(configureDiagnosticsDirectory).toHaveBeenCalledWith(
 			"/global-storage/code-index-v2/persistent/workspace-1/diagnostics",
+			"/workspace",
 		)
 		expect(configureDiagnosticsDirectory.mock.invocationCallOrder[0]).toBeLessThan(
 			setContext.mock.invocationCallOrder[0],

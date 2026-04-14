@@ -157,6 +157,10 @@ export interface ChunkVariantRecord {
 	tokenEstimate: number | null
 	embeddingModel: string | null
 	vectorPointId: string | null
+	vectorEligible: boolean
+	vectorPriority: number
+	vectorEligibilityReason: string | null
+	noveltyScore: number | null
 	state: ChunkVariantState
 	createdAt: number
 	updatedAt: number
@@ -170,6 +174,10 @@ export interface ChunkVariantInput {
 	tokenEstimate?: number | null
 	embeddingModel?: string | null
 	vectorPointId?: string | null
+	vectorEligible?: boolean
+	vectorPriority?: number
+	vectorEligibilityReason?: string | null
+	noveltyScore?: number | null
 	state?: ChunkVariantState
 }
 

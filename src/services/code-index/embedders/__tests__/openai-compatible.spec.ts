@@ -2,6 +2,7 @@ import type { MockedClass, MockedFunction } from "vitest"
 import { OpenAI } from "openai"
 import { OpenAICompatibleEmbedder } from "../openai-compatible"
 import { MAX_ITEM_TOKENS, INITIAL_RETRY_DELAY_MS } from "../../constants"
+import { IndexDebugLoggerV2 } from "../../../code-index-v2/logging/IndexDebugLoggerV2"
 
 // Mock the OpenAI SDK
 vitest.mock("openai")
@@ -267,6 +268,32 @@ describe("OpenAICompatibleEmbedder", () => {
 			)
 		})
 
+		it("includes workspacePath on embedder debug logs when provided in debugContext", async () => {
+			const logSpy = vitest.spyOn(IndexDebugLoggerV2, "log").mockImplementation(() => {})
+			mockEmbeddingsCreate.mockResolvedValue({
+				data: [{ embedding: [0.1, 0.2, 0.3] }],
+				usage: { prompt_tokens: 10, total_tokens: 15 },
+			})
+
+			await embedder.createEmbeddings(["Hello world"], undefined, {
+				debugContext: {
+					runId: "run-1",
+					batchId: "batch-1",
+					workspacePath: "/tmp/workspace-a",
+				},
+			})
+
+			const relevantCalls = logSpy.mock.calls.filter(([, component]) => component === "OpenAICompatibleEmbedder")
+			expect(relevantCalls.length).toBeGreaterThan(0)
+			for (const call of relevantCalls) {
+				expect(call[3]).toEqual(
+					expect.objectContaining({
+						workspacePath: "/tmp/workspace-a",
+					}),
+				)
+			}
+		})
+
 		it("should handle missing usage data gracefully", async () => {
 			const testTexts = ["Hello world"]
 			const mockResponse = {
@@ -462,13 +489,14 @@ describe("OpenAICompatibleEmbedder", () => {
 				expect((embedder as any).providerRequestItemCap).toBe(288)
 			})
 
-			it("should relax a learned adaptive cap after sustained fast responses", () => {
+			it("should recover a learned adaptive cap gradually after sustained fast responses", () => {
 				;(embedder as any).providerRequestItemCap = 128
 				;(embedder as any).updateProviderRequestItemCap(128, 900, testModelId)
 				;(embedder as any).updateProviderRequestItemCap(128, 950, testModelId)
 				;(embedder as any).updateProviderRequestItemCap(128, 1_000, testModelId)
+				;(embedder as any).updateProviderRequestItemCap(128, 1_050, testModelId)
 
-				expect((embedder as any).providerRequestItemCap).toBe(160)
+				expect((embedder as any).providerRequestItemCap).toBe(139)
 			})
 
 			it("should skip texts that exceed MAX_ITEM_TOKENS", async () => {

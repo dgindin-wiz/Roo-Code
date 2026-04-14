@@ -10,6 +10,7 @@
 - Redesign the indexing popover around service-oriented pipeline panels, a calmer host-driven run summary, clearer embedding versus vector sync visibility, default-loading lightweight webview boot flow, and new clear-database controls for destructive resets.
 - Improve local embed throughput tuning with richer utilization metrics, pressure reason tracking, adaptive Apple Silicon lane ramping under safe headroom, and updated code index settings for throughput and concurrency control.
 - Improve OpenAI-compatible embedding throughput with adaptive provider request sizing that reacts to live latency instead of relying on static endpoint-class heuristics.
+- Further accelerate Code Index V2 embedding with content-aware auxiliary surface vectorization, real embedding-budget trimming per lane, richer stored-versus-embedded variant telemetry, and a shared persisted runtime controller that keeps sidecars and future runs aligned on stable provider request sizing.
 - Harden parser, worker, workspace-adapter, telemetry, and UI behavior with broader test coverage, locale path fixes for sidecars, and supporting type/message updates across the extension and webview.
 
 ## 3.51.1

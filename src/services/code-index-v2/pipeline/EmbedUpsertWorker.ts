@@ -57,6 +57,11 @@ export interface EmbedUpsertSummary {
 	waitingForPressureMs?: number
 	providerBatchUtilization?: number
 	embeddingsPerChunk?: number
+	storedVariantsPerChunk?: number
+	embeddedVariantsPerChunk?: number
+	storedVariantCountsByType?: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+	embeddedVariantCountsByType?: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+	skippedVectorizationReasons?: Record<string, number>
 	laneOccupancyPercent?: number
 	embedActivePercent?: number
 	averageGpuUtilizationPercent?: number
@@ -110,6 +115,11 @@ export interface EmbedUpsertProgress {
 	waitingForPressureMs?: number
 	providerBatchUtilization?: number
 	embeddingsPerChunk?: number
+	storedVariantsPerChunk?: number
+	embeddedVariantsPerChunk?: number
+	storedVariantCountsByType?: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+	embeddedVariantCountsByType?: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+	skippedVectorizationReasons?: Record<string, number>
 	laneOccupancyPercent?: number
 	embedActivePercent?: number
 	averageGpuUtilizationPercent?: number
@@ -124,6 +134,11 @@ interface BatchTelemetry {
 	batchKind: "upsert" | "delete"
 	batchSize: number
 	embeddingCount: number
+	storedVariantCount?: number
+	embeddedVariantCount?: number
+	storedVariantCountsByType?: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+	embeddedVariantCountsByType?: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+	skippedVectorizationReasons?: Record<string, number>
 	laneId: number
 	idleGapMs?: number
 	embedLatencyMs?: number
@@ -143,9 +158,45 @@ interface EmbedUpsertExecutor {
 		embedLatencyMs: number
 		upsertLatencyMs: number
 		pointIds: string[]
+		variantTelemetry: {
+			storedVariantCount: number
+			embeddedVariantCount: number
+			storedVariantCountsByType: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+			embeddedVariantCountsByType: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+			skippedVectorizationReasons: Record<string, number>
+		}
 	}>
 	recycleClients?(reason: "pressure" | "interval" | "shutdown"): Promise<void>
 	dispose?(): Promise<void>
+}
+
+function incrementVariantCountMap(
+	target: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>,
+	source?: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>,
+) {
+	if (!source) {
+		return
+	}
+	for (const [variantType, count] of Object.entries(source) as Array<
+		["raw_code" | "summary" | "symbol_signature", number | undefined]
+	>) {
+		if (!count) {
+			continue
+		}
+		target[variantType] = (target[variantType] ?? 0) + count
+	}
+}
+
+function incrementReasonCountMap(target: Record<string, number>, source?: Record<string, number>) {
+	if (!source) {
+		return
+	}
+	for (const [reason, count] of Object.entries(source)) {
+		if (!count) {
+			continue
+		}
+		target[reason] = (target[reason] ?? 0) + count
+	}
 }
 
 export class EmbedUpsertWorker {
@@ -184,20 +235,31 @@ export class EmbedUpsertWorker {
 	private peakInFlightChunkCount = 0
 	private completedBatchCount = 0
 	private readonly leaseOwner = `embed-worker:${process.pid}:${Math.random().toString(16).slice(2)}`
+	private readonly workspacePath: string | undefined
 
 	constructor(
 		private readonly metadataStore: MetadataStore,
 		private readonly embeddingAdapter: EmbeddingAdapter,
 		private readonly vectorStore: VectorStoreAdapter,
 		private readonly upsertExecutor?: EmbedUpsertExecutor,
+		workspacePath?: string,
 	) {
+		this.workspacePath = workspacePath
 		const configuredBatchSize = getConfiguredEmbeddingBatchSize()
 		const configuredLaneConcurrency = getConfiguredEmbeddingLaneConcurrency()
+		const recommendedBatchSize = this.embeddingAdapter.getRecommendedDocumentBatchSize?.()
 		const useLocalBatchDefault =
-			this.embeddingAdapter.runtimeKind === "local" && !hasExplicitConfiguredEmbeddingBatchSize()
+			this.embeddingAdapter.runtimeKind === "local" &&
+			!hasExplicitConfiguredEmbeddingBatchSize() &&
+			recommendedBatchSize == null
 		const useLocalLaneDefault =
 			this.embeddingAdapter.runtimeKind === "local" && !hasExplicitConfiguredEmbeddingLaneConcurrency()
-		this.batchSize = useLocalBatchDefault ? EmbedUpsertWorker.LOCAL_DEFAULT_BATCH_SIZE : configuredBatchSize
+		this.batchSize =
+			!hasExplicitConfiguredEmbeddingBatchSize() && recommendedBatchSize != null
+				? Math.max(1, Math.min(configuredBatchSize, recommendedBatchSize))
+				: useLocalBatchDefault
+					? EmbedUpsertWorker.LOCAL_DEFAULT_BATCH_SIZE
+					: configuredBatchSize
 		this.dynamicLocalLaneRampEnabled = useLocalLaneDefault
 		this.laneConcurrency = Math.max(
 			1,
@@ -269,6 +331,12 @@ export class EmbedUpsertWorker {
 		let totalIdleGapMs = 0
 		let totalEmbeddingCount = 0
 		let totalRequestedChunkCount = 0
+		let totalStoredVariantCount = 0
+		let totalEmbeddedVariantCount = 0
+		const totalStoredVariantCountsByType: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>> = {}
+		const totalEmbeddedVariantCountsByType: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>> =
+			{}
+		const totalSkippedVectorizationReasons: Record<string, number> = {}
 		let peakChunksPerSecond = 0
 		let peakBatchLatencyMs = 0
 		let peakIdleGapMs = 0
@@ -339,6 +407,14 @@ export class EmbedUpsertWorker {
 				totalRequestedChunkCount > 0
 					? Number((totalEmbeddingCount / totalRequestedChunkCount).toFixed(3))
 					: undefined
+			const storedVariantsPerChunk =
+				totalRequestedChunkCount > 0
+					? Number((totalStoredVariantCount / totalRequestedChunkCount).toFixed(3))
+					: undefined
+			const embeddedVariantsPerChunk =
+				totalRequestedChunkCount > 0
+					? Number((totalEmbeddedVariantCount / totalRequestedChunkCount).toFixed(3))
+					: undefined
 			const laneOccupancyPercent = Number(
 				Math.min(
 					100,
@@ -351,6 +427,11 @@ export class EmbedUpsertWorker {
 			)
 			return {
 				embeddingsPerChunk,
+				storedVariantsPerChunk,
+				embeddedVariantsPerChunk,
+				storedVariantCountsByType: { ...totalStoredVariantCountsByType },
+				embeddedVariantCountsByType: { ...totalEmbeddedVariantCountsByType },
+				skippedVectorizationReasons: { ...totalSkippedVectorizationReasons },
 				laneOccupancyPercent,
 				embedActivePercent,
 				averageGpuUtilizationPercent:
@@ -516,6 +597,7 @@ export class EmbedUpsertWorker {
 			IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-heartbeat", {
 				component: "EmbedUpsertWorker",
 				runId,
+				workspacePath: this.workspacePath,
 				provider: this.embeddingAdapter.provider,
 				modelId: this.embeddingAdapter.modelId,
 				laneConcurrency: effectiveLaneConcurrency,
@@ -575,6 +657,7 @@ export class EmbedUpsertWorker {
 					IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-lane-ramped", {
 						component: "EmbedUpsertWorker",
 						runId,
+						workspacePath: this.workspacePath,
 						provider: this.embeddingAdapter.provider,
 						modelId: this.embeddingAdapter.modelId,
 						previousLaneConcurrency,
@@ -620,6 +703,7 @@ export class EmbedUpsertWorker {
 					IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-lane-ramped", {
 						component: "EmbedUpsertWorker",
 						runId,
+						workspacePath: this.workspacePath,
 						provider: this.embeddingAdapter.provider,
 						modelId: this.embeddingAdapter.modelId,
 						previousLaneConcurrency,
@@ -647,6 +731,11 @@ export class EmbedUpsertWorker {
 				totalIdleGapMs += batchTelemetry.idleGapMs ?? 0
 				totalEmbeddingCount += batchTelemetry.embeddingCount
 				totalRequestedChunkCount += batchTelemetry.batchSize
+				totalStoredVariantCount += batchTelemetry.storedVariantCount ?? 0
+				totalEmbeddedVariantCount += batchTelemetry.embeddedVariantCount ?? batchTelemetry.embeddingCount
+				incrementVariantCountMap(totalStoredVariantCountsByType, batchTelemetry.storedVariantCountsByType)
+				incrementVariantCountMap(totalEmbeddedVariantCountsByType, batchTelemetry.embeddedVariantCountsByType)
+				incrementReasonCountMap(totalSkippedVectorizationReasons, batchTelemetry.skippedVectorizationReasons)
 				peakBatchLatencyMs = Math.max(peakBatchLatencyMs, batchTelemetry.totalLatencyMs)
 				peakIdleGapMs = Math.max(peakIdleGapMs, batchTelemetry.idleGapMs ?? 0)
 				peakBatchSize = Math.max(peakBatchSize, batchTelemetry.batchSize)
@@ -673,6 +762,7 @@ export class EmbedUpsertWorker {
 				IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-pressure-state-changed", {
 					component: "EmbedUpsertWorker",
 					runId,
+					workspacePath: this.workspacePath,
 					provider: this.embeddingAdapter.provider,
 					modelId: this.embeddingAdapter.modelId,
 					previousPressureState: previousState,
@@ -702,6 +792,7 @@ export class EmbedUpsertWorker {
 					IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-throughput-drop", {
 						component: "EmbedUpsertWorker",
 						runId,
+						workspacePath: this.workspacePath,
 						provider: this.embeddingAdapter.provider,
 						modelId: this.embeddingAdapter.modelId,
 						chunksPerSecond,
@@ -761,6 +852,11 @@ export class EmbedUpsertWorker {
 				waitingForPressureMs: totalWaitingForPressureMs,
 				providerBatchUtilization,
 				embeddingsPerChunk: utilizationMetrics.embeddingsPerChunk,
+				storedVariantsPerChunk: utilizationMetrics.storedVariantsPerChunk,
+				embeddedVariantsPerChunk: utilizationMetrics.embeddedVariantsPerChunk,
+				storedVariantCountsByType: utilizationMetrics.storedVariantCountsByType,
+				embeddedVariantCountsByType: utilizationMetrics.embeddedVariantCountsByType,
+				skippedVectorizationReasons: utilizationMetrics.skippedVectorizationReasons,
 				laneOccupancyPercent: utilizationMetrics.laneOccupancyPercent,
 				embedActivePercent: utilizationMetrics.embedActivePercent,
 				averageGpuUtilizationPercent: utilizationMetrics.averageGpuUtilizationPercent,
@@ -775,6 +871,7 @@ export class EmbedUpsertWorker {
 				IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-batch", {
 					component: "EmbedUpsertWorker",
 					runId,
+					workspacePath: this.workspacePath,
 					provider: this.embeddingAdapter.provider,
 					modelId: this.embeddingAdapter.modelId,
 					batchKind: batchTelemetry.batchKind,
@@ -796,6 +893,11 @@ export class EmbedUpsertWorker {
 					idleGapMs: batchTelemetry.idleGapMs,
 					providerBatchUtilization,
 					embeddingsPerChunk: utilizationMetrics.embeddingsPerChunk,
+					storedVariantsPerChunk: utilizationMetrics.storedVariantsPerChunk,
+					embeddedVariantsPerChunk: utilizationMetrics.embeddedVariantsPerChunk,
+					storedVariantCountsByType: batchTelemetry.storedVariantCountsByType,
+					embeddedVariantCountsByType: batchTelemetry.embeddedVariantCountsByType,
+					skippedVectorizationReasons: batchTelemetry.skippedVectorizationReasons,
 					laneOccupancyPercent: utilizationMetrics.laneOccupancyPercent,
 					embedActivePercent: utilizationMetrics.embedActivePercent,
 					batchesCompleted,
@@ -846,6 +948,7 @@ export class EmbedUpsertWorker {
 			IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-lane-clamped", {
 				component: "EmbedUpsertWorker",
 				runId,
+				workspacePath: this.workspacePath,
 				provider: this.embeddingAdapter.provider,
 				modelId: this.embeddingAdapter.modelId,
 				laneConcurrency: effectiveLaneConcurrency,
@@ -876,6 +979,7 @@ export class EmbedUpsertWorker {
 			onConcurrencyPressure: clampConcurrency,
 			getLaneConcurrency: () => effectiveLaneConcurrency,
 			getBatchSize: () => effectiveBatchSize,
+			getEmbeddingBudget: () => this.getEmbeddingBudget(effectiveBatchSize),
 			getPressureState: () => pressureState,
 			recordWaitForJobs: (ms) => {
 				totalWaitingForJobsMs += ms
@@ -1004,6 +1108,7 @@ export class EmbedUpsertWorker {
 		IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-complete", {
 			component: "EmbedUpsertWorker",
 			runId,
+			workspacePath: this.workspacePath,
 			provider: this.embeddingAdapter.provider,
 			modelId: this.embeddingAdapter.modelId,
 			jobId: `${upsertedChunks}:${deletedChunks}:${committedRevisions}:${degradedRevisions}:${terminalFailedRevisions}:${terminallyFailedChunks}:${batchesCompleted}`,
@@ -1045,6 +1150,11 @@ export class EmbedUpsertWorker {
 			waitingForInFlightCapacityMs: totalWaitingForInFlightCapacityMs,
 			waitingForPressureMs: totalWaitingForPressureMs,
 			embeddingsPerChunk: finalUtilizationMetrics.embeddingsPerChunk,
+			storedVariantsPerChunk: finalUtilizationMetrics.storedVariantsPerChunk,
+			embeddedVariantsPerChunk: finalUtilizationMetrics.embeddedVariantsPerChunk,
+			storedVariantCountsByType: finalUtilizationMetrics.storedVariantCountsByType,
+			embeddedVariantCountsByType: finalUtilizationMetrics.embeddedVariantCountsByType,
+			skippedVectorizationReasons: finalUtilizationMetrics.skippedVectorizationReasons,
 			laneOccupancyPercent: finalUtilizationMetrics.laneOccupancyPercent,
 			embedActivePercent: finalUtilizationMetrics.embedActivePercent,
 			averageGpuUtilizationPercent: finalUtilizationMetrics.averageGpuUtilizationPercent,
@@ -1095,6 +1205,11 @@ export class EmbedUpsertWorker {
 			waitingForInFlightCapacityMs: totalWaitingForInFlightCapacityMs,
 			waitingForPressureMs: totalWaitingForPressureMs,
 			embeddingsPerChunk: finalUtilizationMetrics.embeddingsPerChunk,
+			storedVariantsPerChunk: finalUtilizationMetrics.storedVariantsPerChunk,
+			embeddedVariantsPerChunk: finalUtilizationMetrics.embeddedVariantsPerChunk,
+			storedVariantCountsByType: finalUtilizationMetrics.storedVariantCountsByType,
+			embeddedVariantCountsByType: finalUtilizationMetrics.embeddedVariantCountsByType,
+			skippedVectorizationReasons: finalUtilizationMetrics.skippedVectorizationReasons,
 			laneOccupancyPercent: finalUtilizationMetrics.laneOccupancyPercent,
 			embedActivePercent: finalUtilizationMetrics.embedActivePercent,
 			averageGpuUtilizationPercent: finalUtilizationMetrics.averageGpuUtilizationPercent,
@@ -1118,6 +1233,7 @@ export class EmbedUpsertWorker {
 			onConcurrencyPressure: (error: unknown) => void
 			getLaneConcurrency: () => number
 			getBatchSize: () => number
+			getEmbeddingBudget: () => number
 			getPressureState: () => EmbedPressureState
 			recordWaitForJobs: (ms: number) => void
 			recordWaitForInFlightCapacity: (ms: number) => void
@@ -1179,13 +1295,27 @@ export class EmbedUpsertWorker {
 			this.activeLaneCount++
 			this.inFlightChunkCount += upsertJobs.length
 			this.peakInFlightChunkCount = Math.max(this.peakInFlightChunkCount, this.inFlightChunkCount)
+			let trackedClaimCount = upsertJobs.length
 
 			const task = (async () => {
 				try {
-					await this.processUpsertJobs(upsertJobs, signal, laneId, emitBatchProgress, callbacks)
+					await this.processUpsertJobs(upsertJobs, signal, laneId, emitBatchProgress, {
+						onRetryScheduled: callbacks.onRetryScheduled,
+						onChunkTerminalFailure: callbacks.onChunkTerminalFailure,
+						onChunksUpserted: callbacks.onChunksUpserted,
+						onConcurrencyPressure: callbacks.onConcurrencyPressure,
+						getEmbeddingBudget: callbacks.getEmbeddingBudget,
+						onJobsReleased: (count) => {
+							if (count <= 0) {
+								return
+							}
+							trackedClaimCount = Math.max(0, trackedClaimCount - count)
+							this.inFlightChunkCount = Math.max(0, this.inFlightChunkCount - count)
+						},
+					})
 				} finally {
 					this.activeLaneCount = Math.max(0, this.activeLaneCount - 1)
-					this.inFlightChunkCount = Math.max(0, this.inFlightChunkCount - upsertJobs.length)
+					this.inFlightChunkCount = Math.max(0, this.inFlightChunkCount - trackedClaimCount)
 				}
 			})()
 
@@ -1245,6 +1375,8 @@ export class EmbedUpsertWorker {
 			onChunkTerminalFailure: () => void
 			onChunksUpserted: (count: number) => void
 			onConcurrencyPressure: (error: unknown) => void
+			onJobsReleased: (count: number) => void
+			getEmbeddingBudget: () => number
 		},
 	): Promise<void> {
 		await (
@@ -1283,6 +1415,7 @@ export class EmbedUpsertWorker {
 		IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-recycle-pending", {
 			component: "EmbedUpsertWorker",
 			runId,
+			workspacePath: this.workspacePath,
 			provider: this.embeddingAdapter.provider,
 			modelId: this.embeddingAdapter.modelId,
 			laneConcurrency: this.laneConcurrency,
@@ -1299,6 +1432,7 @@ export class EmbedUpsertWorker {
 			IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-recycle-skipped", {
 				component: "EmbedUpsertWorker",
 				runId,
+				workspacePath: this.workspacePath,
 				provider: this.embeddingAdapter.provider,
 				modelId: this.embeddingAdapter.modelId,
 				laneConcurrency: this.laneConcurrency,
@@ -1326,6 +1460,7 @@ export class EmbedUpsertWorker {
 		IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-recycled-clients", {
 			component: "EmbedUpsertWorker",
 			runId,
+			workspacePath: this.workspacePath,
 			provider: this.embeddingAdapter.provider,
 			modelId: this.embeddingAdapter.modelId,
 			laneConcurrency: this.laneConcurrency,
@@ -1395,6 +1530,8 @@ export class EmbedUpsertWorker {
 			onChunkTerminalFailure: () => void
 			onChunksUpserted: (count: number) => void
 			onConcurrencyPressure: (error: unknown) => void
+			onJobsReleased: (count: number) => void
+			getEmbeddingBudget: () => number
 		},
 	): Promise<void> {
 		if (jobPairs.length === 0) {
@@ -1405,6 +1542,7 @@ export class EmbedUpsertWorker {
 			throw new Error("Embed/upsert worker aborted")
 		}
 
+		let activeJobPairs = jobPairs
 		try {
 			const variants = await this.metadataStore.getChunkVariantsByChunkIds(
 				jobPairs.map(({ chunk }) => chunk.chunkId),
@@ -1415,73 +1553,54 @@ export class EmbedUpsertWorker {
 				group.push(variant)
 				variantsByChunkId.set(variant.chunkId, group)
 			}
-			const items: EmbedUpsertBatchItem[] = jobPairs.map(({ chunk }) => ({
-				chunk: {
-					chunkId: chunk.chunkId,
-					revisionId: chunk.revisionId,
-					chunkFingerprint: chunk.chunkFingerprint,
-					startLine: chunk.startLine,
-					endLine: chunk.endLine,
-					content: chunk.content,
-					fileId: chunk.fileId,
-					workspaceId: chunk.workspaceId,
-					relativePath: chunk.relativePath,
-					parserVersion: chunk.parserVersion,
-					chunkerVersion: chunk.chunkerVersion,
-					language: chunk.language ?? null,
-					chunkKind: chunk.chunkKind ?? null,
-					symbolName: chunk.symbolName ?? null,
-					symbolQualifiedName: chunk.symbolQualifiedName ?? null,
-					parentSymbolName: chunk.parentSymbolName ?? null,
-					parentChunkFingerprint: chunk.parentChunkFingerprint ?? null,
-					summary: chunk.summary ?? null,
-					searchText: chunk.searchText ?? null,
-				},
-				variants: getChunkVariantsForEmbedding(
-					{
-						chunkId: chunk.chunkId,
-						revisionId: chunk.revisionId,
-						chunkFingerprint: chunk.chunkFingerprint,
-						startLine: chunk.startLine,
-						endLine: chunk.endLine,
-						content: chunk.content,
-						fileId: chunk.fileId,
-						workspaceId: chunk.workspaceId,
-						relativePath: chunk.relativePath,
-						parserVersion: chunk.parserVersion,
-						chunkerVersion: chunk.chunkerVersion,
-						language: chunk.language ?? null,
-						chunkKind: chunk.chunkKind ?? null,
-						symbolName: chunk.symbolName ?? null,
-						symbolQualifiedName: chunk.symbolQualifiedName ?? null,
-						parentSymbolName: chunk.parentSymbolName ?? null,
-						parentChunkFingerprint: chunk.parentChunkFingerprint ?? null,
-						summary: chunk.summary ?? null,
-						searchText: chunk.searchText ?? null,
-					},
-					(variantsByChunkId.get(chunk.chunkId) ?? []).map((variant) => ({
-						variantId: variant.variantId,
-						chunkId: variant.chunkId,
-						variantType: variant.variantType,
-						content: variant.content,
-					})),
-				),
-			}))
+			const embeddingBudget = callbacks.getEmbeddingBudget()
+			const selectedJobPairs = this.selectJobPairsWithinEmbeddingBudget(
+				jobPairs,
+				variantsByChunkId,
+				embeddingBudget,
+			)
+			activeJobPairs = selectedJobPairs
+			const releasedJobPairs = jobPairs.slice(selectedJobPairs.length)
+			if (releasedJobPairs.length > 0) {
+				await this.metadataStore.releaseJobs(
+					releasedJobPairs.map(({ job }) => job.jobId),
+					this.leaseOwner,
+				)
+				callbacks.onJobsReleased(releasedJobPairs.length)
+				IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-batch-trimmed", {
+					component: "EmbedUpsertWorker",
+					runId: jobPairs[0]?.job.runId,
+					workspacePath: this.workspacePath,
+					provider: this.embeddingAdapter.provider,
+					modelId: this.embeddingAdapter.modelId,
+					laneId,
+					claimedChunkCount: jobPairs.length,
+					selectedChunkCount: selectedJobPairs.length,
+					releasedChunkCount: releasedJobPairs.length,
+					embeddingBudget,
+				})
+			}
+			const items = selectedJobPairs.map(({ chunk }) => this.buildUpsertBatchItem(chunk, variantsByChunkId))
 			const embeddingCount = items.reduce((sum, item) => sum + item.variants.length, 0)
 			if (embeddingCount === 0) {
-				await this.metadataStore.completeJobs(jobPairs.map(({ job }) => job.jobId))
+				await this.metadataStore.completeJobs(selectedJobPairs.map(({ job }) => job.jobId))
 				return
 			}
 
 			const batchStartedAt = Date.now()
 			const idleGapMs = Math.max(batchStartedAt - this.lastBatchCompletedAt, 0)
 			const execution = this.upsertExecutor
-				? await this.upsertExecutor.executeUpsertBatch(jobPairs[0]?.job.runId ?? "run", laneId, items, signal)
+				? await this.upsertExecutor.executeUpsertBatch(
+						selectedJobPairs[0]?.job.runId ?? "run",
+						laneId,
+						items,
+						signal,
+					)
 				: await executeUpsertBatch(items, this.embeddingAdapter, this.vectorStore, {
 						signal,
 						debugContext: {
-							runId: jobPairs[0]?.job.runId,
-							batchId: `${jobPairs[0]?.job.runId ?? "run"}:${jobPairs[0]?.job.jobId ?? "job"}:${embeddingCount}`,
+							runId: selectedJobPairs[0]?.job.runId,
+							batchId: `${selectedJobPairs[0]?.job.runId ?? "run"}:${selectedJobPairs[0]?.job.jobId ?? "job"}:${embeddingCount}`,
 							outerBatchSize: embeddingCount,
 						},
 					})
@@ -1499,7 +1618,7 @@ export class EmbedUpsertWorker {
 				),
 			)
 			await this.metadataStore.markChunkStates(
-				jobPairs.map(({ chunk }) => ({
+				selectedJobPairs.map(({ chunk }) => ({
 					chunkId: chunk.chunkId,
 					state: "upserted" as const,
 					embeddingModel: this.embeddingAdapter.modelId,
@@ -1530,16 +1649,21 @@ export class EmbedUpsertWorker {
 					clearContent: true,
 				})),
 			)
-			await this.metadataStore.completeJobs(jobPairs.map(({ job }) => job.jobId))
+			await this.metadataStore.completeJobs(selectedJobPairs.map(({ job }) => job.jobId))
 			const metadataCommitLatencyMs = Date.now() - metadataCommitStartedAt
 			this.lastBatchCompletedAt = Date.now()
 			this.completedBatchCount++
 
-			callbacks.onChunksUpserted(jobPairs.length)
+			callbacks.onChunksUpserted(selectedJobPairs.length)
 			await emitBatchProgress({
 				batchKind: "upsert",
-				batchSize: jobPairs.length,
+				batchSize: selectedJobPairs.length,
 				embeddingCount: execution.embeddingCount,
+				storedVariantCount: execution.variantTelemetry.storedVariantCount,
+				embeddedVariantCount: execution.variantTelemetry.embeddedVariantCount,
+				storedVariantCountsByType: execution.variantTelemetry.storedVariantCountsByType,
+				embeddedVariantCountsByType: execution.variantTelemetry.embeddedVariantCountsByType,
+				skippedVectorizationReasons: execution.variantTelemetry.skippedVectorizationReasons,
 				laneId,
 				idleGapMs,
 				embedLatencyMs: execution.embedLatencyMs,
@@ -1552,15 +1676,96 @@ export class EmbedUpsertWorker {
 				callbacks.onConcurrencyPressure(error)
 			}
 
-			if (jobPairs.length === 1) {
-				await this.handleSingleUpsertFailure(jobPairs[0], error, callbacks)
+			if (activeJobPairs.length === 1) {
+				await this.handleSingleUpsertFailure(activeJobPairs[0], error, callbacks)
 				return
 			}
 
-			const midpoint = Math.ceil(jobPairs.length / 2)
-			await this.processUpsertJobPairs(jobPairs.slice(0, midpoint), signal, laneId, emitBatchProgress, callbacks)
-			await this.processUpsertJobPairs(jobPairs.slice(midpoint), signal, laneId, emitBatchProgress, callbacks)
+			const midpoint = Math.ceil(activeJobPairs.length / 2)
+			await this.processUpsertJobPairs(
+				activeJobPairs.slice(0, midpoint),
+				signal,
+				laneId,
+				emitBatchProgress,
+				callbacks,
+			)
+			await this.processUpsertJobPairs(
+				activeJobPairs.slice(midpoint),
+				signal,
+				laneId,
+				emitBatchProgress,
+				callbacks,
+			)
 		}
+	}
+
+	private buildUpsertBatchItem(
+		chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number],
+		variantsByChunkId: Map<string, Awaited<ReturnType<MetadataStore["getChunkVariantsByChunkIds"]>>>,
+	): EmbedUpsertBatchItem {
+		const chunkInput = {
+			chunkId: chunk.chunkId,
+			revisionId: chunk.revisionId,
+			chunkFingerprint: chunk.chunkFingerprint,
+			startLine: chunk.startLine,
+			endLine: chunk.endLine,
+			content: chunk.content,
+			fileId: chunk.fileId,
+			workspaceId: chunk.workspaceId,
+			relativePath: chunk.relativePath,
+			parserVersion: chunk.parserVersion,
+			chunkerVersion: chunk.chunkerVersion,
+			language: chunk.language ?? null,
+			chunkKind: chunk.chunkKind ?? null,
+			symbolName: chunk.symbolName ?? null,
+			symbolQualifiedName: chunk.symbolQualifiedName ?? null,
+			parentSymbolName: chunk.parentSymbolName ?? null,
+			parentChunkFingerprint: chunk.parentChunkFingerprint ?? null,
+			summary: chunk.summary ?? null,
+			searchText: chunk.searchText ?? null,
+		}
+		const variants = getChunkVariantsForEmbedding(
+			chunkInput,
+			(variantsByChunkId.get(chunk.chunkId) ?? []).map((variant) => ({
+				variantId: variant.variantId,
+				chunkId: variant.chunkId,
+				variantType: variant.variantType,
+				content: variant.content,
+				vectorEligible: variant.vectorEligible,
+				vectorPriority: variant.vectorPriority,
+				vectorEligibilityReason: variant.vectorEligibilityReason,
+				noveltyScore: variant.noveltyScore,
+			})),
+		)
+		return {
+			chunk: chunkInput,
+			variants,
+		}
+	}
+
+	private selectJobPairsWithinEmbeddingBudget(
+		jobPairs: Array<{
+			job: Awaited<ReturnType<MetadataStore["claimJobs"]>>[number]
+			chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number]
+		}>,
+		variantsByChunkId: Map<string, Awaited<ReturnType<MetadataStore["getChunkVariantsByChunkIds"]>>>,
+		embeddingBudget: number,
+	): typeof jobPairs {
+		const clampedBudget = Math.max(1, embeddingBudget)
+		const selected: typeof jobPairs = []
+		let predictedEmbeddingCount = 0
+
+		for (const pair of jobPairs) {
+			const predictedVariants = this.buildUpsertBatchItem(pair.chunk, variantsByChunkId).variants.length
+			const nextPredictedEmbeddingCount = predictedEmbeddingCount + Math.max(predictedVariants, 1)
+			if (selected.length > 0 && nextPredictedEmbeddingCount > clampedBudget) {
+				break
+			}
+			selected.push(pair)
+			predictedEmbeddingCount = nextPredictedEmbeddingCount
+		}
+
+		return selected.length > 0 ? selected : jobPairs.slice(0, 1)
 	}
 
 	private async handleSingleUpsertFailure(
@@ -1717,6 +1922,15 @@ export class EmbedUpsertWorker {
 			await this.processDeleteJobPairs(jobPairs.slice(0, midpoint), signal, laneId, emitBatchProgress, callbacks)
 			await this.processDeleteJobPairs(jobPairs.slice(midpoint), signal, laneId, emitBatchProgress, callbacks)
 		}
+	}
+
+	private getEmbeddingBudget(effectiveBatchSize: number): number {
+		const recommendedBatchSize = this.embeddingAdapter.getRecommendedDocumentBatchSize?.()
+		if (recommendedBatchSize == null) {
+			return Math.max(1, effectiveBatchSize)
+		}
+
+		return Math.max(1, Math.min(effectiveBatchSize, recommendedBatchSize))
 	}
 
 	private shouldTerminalFail(attemptCount: number): boolean {

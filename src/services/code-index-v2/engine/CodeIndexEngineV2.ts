@@ -30,8 +30,15 @@ import {
 	type OversizedFileDetail,
 } from "../pipeline"
 import { ReconciliationService } from "../reconciliation/ReconciliationService"
+import { EmbeddingRuntimeProfileStore } from "../store/EmbeddingRuntimeProfileStore"
 import { MetadataStore } from "../store/MetadataStore"
 import { CODE_INDEX_V2_ENGINE_ID } from "../shared/constants"
+import {
+	AdaptiveEmbeddingControllerState,
+	AdaptiveProviderObservation,
+	buildEmbeddingRuntimeProfileKey,
+	normalizeEmbeddingEndpointFingerprint,
+} from "../shared/adaptiveEmbeddingController"
 import { WatcherCoordinator } from "../watcher"
 import {
 	CodeIndexDebugLexicalMode,
@@ -122,6 +129,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		state: "idle",
 	}
 	private readonly metadataStore: MetadataStore
+	private readonly embeddingRuntimeProfileStore: EmbeddingRuntimeProfileStore
 	private _indexEmbeddingAdapter: ExistingEmbedderAdapter | undefined
 	private _indexVectorStore: QdrantRestVectorStoreAdapter | undefined
 	private _searchEmbeddingAdapter: ExistingEmbedderAdapter | undefined
@@ -153,6 +161,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		private readonly stateManager: CodeIndexStateManager,
 	) {
 		this.metadataStore = new MetadataStore(context, workspacePath)
+		this.embeddingRuntimeProfileStore = new EmbeddingRuntimeProfileStore(context)
 	}
 
 	async start(): Promise<void> {
@@ -312,6 +321,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this._searchVectorStore = undefined
 		this._indexEmbeddingAdapter = undefined
 		this._indexVectorStore = undefined
+		await this.embeddingRuntimeProfileStore.flush()
 		await this.metadataStore.dispose()
 		this._started = false
 		this._activeAbortController = undefined
@@ -439,6 +449,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		await vectorStore.initialize()
 		const embeddingStartedAt = Date.now()
 		const embeddingResponse = await embeddingAdapter.createEmbeddings([query], { isQuery: true })
+		this.maybePersistAdaptiveRuntimeState(embeddingResponse.adaptiveControllerState)
 		const queryEmbeddingMs = Date.now() - embeddingStartedAt
 		const vector = embeddingResponse.embeddings[0]
 		const normalizedDirectoryPrefix = this.normalizeDirectoryPrefix(options?.directoryPrefix)
@@ -2144,7 +2155,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				runtimeKind: runtimeMetadata.runtimeKind,
 				runtimeLabel: runtimeMetadata.runtimeLabel,
 				deviceHint: runtimeMetadata.deviceHint,
+				workspacePath: this.workspacePath,
 			})
+			this.seedAdaptiveRuntimeProfile(this._indexEmbeddingAdapter)
 		}
 
 		if (!this._indexVectorStore) {
@@ -2185,6 +2198,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				deviceHint: embeddingAdapter.deviceHint,
 			},
 			this.configManager.currentEmbeddingLaneConcurrency,
+			{
+				profile: this.getAdaptiveRuntimeProfile(),
+				onRuntimeObservations: (observations, reportedProfile) =>
+					this.handleAdaptiveRuntimeObservations(observations, reportedProfile),
+			},
 		)
 	}
 
@@ -2205,7 +2223,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				runtimeKind: runtimeMetadata.runtimeKind,
 				runtimeLabel: runtimeMetadata.runtimeLabel,
 				deviceHint: runtimeMetadata.deviceHint,
+				workspacePath: this.workspacePath,
 			})
+			this.seedAdaptiveRuntimeProfile(this._searchEmbeddingAdapter)
 		}
 
 		if (!this._searchVectorStore) {
@@ -2682,6 +2702,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			dependencies.embeddingAdapter,
 			dependencies.vectorStore,
 			sidecarExecutor,
+			this.workspacePath,
 		)
 		let drainPromise: Promise<void> | undefined
 		try {
@@ -3281,6 +3302,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			dependencies.embeddingAdapter,
 			dependencies.vectorStore,
 			sidecarExecutor,
+			this.workspacePath,
 		)
 		this._activeEmbedUpsertWorker = embedUpsertWorker
 		let drainPromise: Promise<void> | undefined
@@ -5131,10 +5153,15 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			},
 			signal,
 			action: (stepSignal) =>
-				embeddingAdapter.createEmbeddings(["preflight"], {
-					isQuery: true,
-					signal: stepSignal,
-				}),
+				embeddingAdapter
+					.createEmbeddings(["preflight"], {
+						isQuery: true,
+						signal: stepSignal,
+					})
+					.then((response) => {
+						this.maybePersistAdaptiveRuntimeState(response.adaptiveControllerState)
+						return response
+					}),
 		})
 	}
 
@@ -5350,5 +5377,85 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		} catch {
 			return false
 		}
+	}
+
+	private getEmbeddingRuntimeProfileKey(): string | undefined {
+		const runtimeMetadata = this.getEmbeddingRuntimeMetadata()
+		const config = this.configManager.getConfig()
+		let endpointFingerprint: string | undefined
+
+		switch (this.configManager.currentEmbedderProvider) {
+			case "openai-compatible":
+				endpointFingerprint = normalizeEmbeddingEndpointFingerprint(config.openAiCompatibleOptions?.baseUrl)
+				break
+			case "ollama":
+				endpointFingerprint = normalizeEmbeddingEndpointFingerprint(config.ollamaOptions?.ollamaBaseUrl)
+				break
+			case "bedrock":
+				endpointFingerprint = normalizeEmbeddingEndpointFingerprint(
+					`bedrock:${config.bedrockOptions?.region ?? ""}:${config.bedrockOptions?.profile ?? ""}`,
+				)
+				break
+			default:
+				endpointFingerprint = normalizeEmbeddingEndpointFingerprint(this.configManager.currentEmbedderProvider)
+				break
+		}
+
+		return buildEmbeddingRuntimeProfileKey({
+			provider: this.configManager.currentEmbedderProvider,
+			modelId: this.configManager.currentModelId ?? "unknown-configured-model",
+			runtimeKind: runtimeMetadata.runtimeKind,
+			deviceHint: runtimeMetadata.deviceHint,
+			endpointFingerprint,
+		})
+	}
+
+	private getAdaptiveRuntimeProfile(): AdaptiveEmbeddingControllerState | undefined {
+		const profileKey = this.getEmbeddingRuntimeProfileKey()
+		return profileKey ? this.embeddingRuntimeProfileStore.getProfile(profileKey) : undefined
+	}
+
+	private seedAdaptiveRuntimeProfile(adapter: ExistingEmbedderAdapter | undefined) {
+		if (!adapter) {
+			return
+		}
+
+		adapter.seedAdaptiveControllerState?.(this.getAdaptiveRuntimeProfile())
+	}
+
+	private maybePersistAdaptiveRuntimeState(state: AdaptiveEmbeddingControllerState | undefined) {
+		if (!state) {
+			return
+		}
+
+		const profileKey = this.getEmbeddingRuntimeProfileKey()
+		if (!profileKey) {
+			return
+		}
+
+		this.embeddingRuntimeProfileStore.setProfile(profileKey, state)
+	}
+
+	private handleAdaptiveRuntimeObservations(
+		observations: AdaptiveProviderObservation[],
+		reportedProfile?: AdaptiveEmbeddingControllerState,
+	): AdaptiveEmbeddingControllerState | undefined {
+		const profileKey = this.getEmbeddingRuntimeProfileKey()
+		if (!profileKey) {
+			return reportedProfile
+		}
+
+		let nextProfile = this.embeddingRuntimeProfileStore.getProfile(profileKey)
+		if (observations.length === 0 && reportedProfile) {
+			nextProfile = this.embeddingRuntimeProfileStore.setProfile(profileKey, reportedProfile)
+		} else {
+			for (const observation of observations) {
+				nextProfile = this.embeddingRuntimeProfileStore.applyObservation(profileKey, observation)
+			}
+		}
+
+		this.seedAdaptiveRuntimeProfile(this._indexEmbeddingAdapter)
+		this.seedAdaptiveRuntimeProfile(this._searchEmbeddingAdapter)
+		return nextProfile
 	}
 }

@@ -92,7 +92,9 @@ export function createSidecarDependencies(payload: SidecarInitPayload) {
 		runtimeKind: payload.runtime.runtimeKind,
 		runtimeLabel: payload.runtime.runtimeLabel,
 		deviceHint: payload.runtime.deviceHint,
+		workspacePath: payload.workspacePath,
 	})
+	embeddingAdapter.seedAdaptiveControllerState?.(payload.runtimeProfile)
 	const qdrantUrl = payload.config.qdrantUrl
 	if (!qdrantUrl) {
 		throw new Error("Code index sidecar requires a Qdrant URL")

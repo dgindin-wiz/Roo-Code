@@ -2,6 +2,10 @@ import { ChildProcess, fork } from "child_process"
 import { existsSync } from "fs"
 import * as path from "path"
 import { CodeIndexConfig } from "../../code-index/interfaces/config"
+import type {
+	AdaptiveEmbeddingControllerState,
+	AdaptiveProviderObservation,
+} from "../../code-index/interfaces/embedder"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { EmbedUpsertBatchItem, EmbedUpsertExecutionResult } from "./EmbedUpsertExecution"
 import {
@@ -35,6 +39,13 @@ export class SidecarEmbedUpsertExecutor {
 		private readonly vectorSize: number,
 		private readonly runtime: SidecarRuntimeMetadata,
 		laneConcurrency: number,
+		private readonly runtimeController?: {
+			profile?: AdaptiveEmbeddingControllerState
+			onRuntimeObservations?: (
+				observations: AdaptiveProviderObservation[],
+				reportedProfile?: AdaptiveEmbeddingControllerState,
+			) => Promise<AdaptiveEmbeddingControllerState | undefined> | AdaptiveEmbeddingControllerState | undefined
+		},
 	) {
 		const laneCount = Math.max(1, laneConcurrency)
 		this.lanes = Array.from({ length: laneCount }, (_, index) => ({
@@ -222,6 +233,7 @@ export class SidecarEmbedUpsertExecutor {
 					config: this.config,
 					vectorSize: this.vectorSize,
 					runtime: this.runtime,
+					runtimeProfile: this.runtimeController?.profile,
 				},
 			} satisfies SidecarHostToChildMessage)
 		})
@@ -319,11 +331,13 @@ export class SidecarEmbedUpsertExecutor {
 					cpu: message.cpu,
 					workspacePath: this.workspacePath,
 				})
+				void this.handleRuntimeFeedback(message.runtimeObservations, message.runtimeProfile)
 				pending.resolve({
 					embeddingCount: message.embeddingCount,
 					embedLatencyMs: message.embedLatencyMs,
 					upsertLatencyMs: message.upsertLatencyMs,
 					pointIds: message.pointIds,
+					variantTelemetry: message.variantTelemetry,
 				})
 				return
 			}
@@ -374,6 +388,30 @@ export class SidecarEmbedUpsertExecutor {
 	private nextRequestId(prefix: string) {
 		this.requestCounter += 1
 		return `${prefix}:${this.requestCounter}`
+	}
+
+	private async handleRuntimeFeedback(
+		observations?: AdaptiveProviderObservation[],
+		reportedProfile?: AdaptiveEmbeddingControllerState,
+	): Promise<void> {
+		const nextProfile = await this.runtimeController?.onRuntimeObservations?.(observations ?? [], reportedProfile)
+		if (!nextProfile) {
+			return
+		}
+
+		if (this.runtimeController) {
+			this.runtimeController.profile = nextProfile
+		}
+
+		for (const lane of this.lanes) {
+			if (!lane.child) {
+				continue
+			}
+			this.sendFireAndForget(lane, {
+				type: "controller-update",
+				runtimeProfile: nextProfile,
+			})
+		}
 	}
 
 	private getTrackedProcessKey(lane: SidecarLane): string {

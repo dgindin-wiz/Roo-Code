@@ -111,6 +111,9 @@ async function handleMessage(message: SidecarHostToChildMessage) {
 						embedLatencyMs: result.embedLatencyMs,
 						upsertLatencyMs: result.upsertLatencyMs,
 						pointIds: result.pointIds,
+						runtimeProfile: result.adaptiveControllerState,
+						runtimeObservations: result.adaptiveControllerObservations,
+						variantTelemetry: result.variantTelemetry,
 						memory: getMemorySnapshot(),
 						cpu: getCpuSnapshot(),
 					})
@@ -141,6 +144,10 @@ async function handleMessage(message: SidecarHostToChildMessage) {
 					memoryAfter: getMemorySnapshot(),
 					cpu: getCpuSnapshot(),
 				})
+				return
+			}
+			case "controller-update": {
+				dependencies?.embeddingAdapter.seedAdaptiveControllerState?.(message.runtimeProfile)
 				return
 			}
 			case "shutdown": {

@@ -2,6 +2,10 @@ import { createHash } from "crypto"
 import { EmbeddingAdapter } from "../adapters/EmbeddingAdapter"
 import { VectorPoint, VectorStoreAdapter } from "../adapters/VectorStoreAdapter"
 import { buildRawCodeVariantContent } from "../shared/chunkSurfaces"
+import type {
+	AdaptiveEmbeddingControllerState,
+	AdaptiveProviderObservation,
+} from "../../code-index/interfaces/embedder"
 
 export interface EmbedUpsertChunkInput {
 	chunkId: string
@@ -30,6 +34,10 @@ export interface EmbedUpsertVariantInput {
 	chunkId: string
 	variantType: "raw_code" | "summary" | "symbol_signature"
 	content: string
+	vectorEligible?: boolean
+	vectorPriority?: number
+	vectorEligibilityReason?: string | null
+	noveltyScore?: number | null
 }
 
 export interface EmbedUpsertBatchItem {
@@ -42,6 +50,15 @@ export interface EmbedUpsertExecutionResult {
 	embedLatencyMs: number
 	upsertLatencyMs: number
 	pointIds: string[]
+	variantTelemetry: {
+		storedVariantCount: number
+		embeddedVariantCount: number
+		storedVariantCountsByType: Partial<Record<EmbedUpsertVariantInput["variantType"], number>>
+		embeddedVariantCountsByType: Partial<Record<EmbedUpsertVariantInput["variantType"], number>>
+		skippedVectorizationReasons: Record<string, number>
+	}
+	adaptiveControllerState?: AdaptiveEmbeddingControllerState
+	adaptiveControllerObservations?: AdaptiveProviderObservation[]
 }
 
 export function getChunkVariantsForEmbedding(
@@ -49,7 +66,12 @@ export function getChunkVariantsForEmbedding(
 	variants: EmbedUpsertVariantInput[],
 ): EmbedUpsertVariantInput[] {
 	if (variants.length > 0) {
-		return variants
+		const vectorEligible = variants
+			.filter((variant) => variant.vectorEligible !== false)
+			.sort((left, right) => (right.vectorPriority ?? 0) - (left.vectorPriority ?? 0))
+		if (vectorEligible.length > 0) {
+			return vectorEligible
+		}
 	}
 
 	const rawCode = buildRawCodeVariantContent({
@@ -70,8 +92,32 @@ export function getChunkVariantsForEmbedding(
 			chunkId: chunk.chunkId,
 			variantType: "raw_code",
 			content: rawCode,
+			vectorEligible: true,
+			vectorPriority: 1000,
+			vectorEligibilityReason: "legacy_fallback_raw_code",
+			noveltyScore: 1,
 		},
 	]
+}
+
+function countVariantTypes(
+	variants: EmbedUpsertVariantInput[],
+): Partial<Record<EmbedUpsertVariantInput["variantType"], number>> {
+	return variants.reduce<Partial<Record<EmbedUpsertVariantInput["variantType"], number>>>((acc, variant) => {
+		acc[variant.variantType] = (acc[variant.variantType] ?? 0) + 1
+		return acc
+	}, {})
+}
+
+function countSkippedVectorizationReasons(variants: EmbedUpsertVariantInput[]): Record<string, number> {
+	return variants.reduce<Record<string, number>>((acc, variant) => {
+		if (variant.vectorEligible !== false) {
+			return acc
+		}
+		const reason = variant.vectorEligibilityReason ?? "lexical_only:unspecified"
+		acc[reason] = (acc[reason] ?? 0) + 1
+		return acc
+	}, {})
 }
 
 export function createPointId(
@@ -145,6 +191,7 @@ export async function executeUpsertBatch(
 			runId?: string
 			batchId?: string
 			outerBatchSize?: number
+			workspacePath?: string
 		}
 	},
 ): Promise<EmbedUpsertExecutionResult> {
@@ -154,6 +201,15 @@ export async function executeUpsertBatch(
 			variant,
 		})),
 	)
+	const storedVariants = items.flatMap(({ variants }) => variants)
+	const embeddedVariants = variantPairs.map(({ variant }) => variant)
+	const variantTelemetry = {
+		storedVariantCount: storedVariants.length,
+		embeddedVariantCount: embeddedVariants.length,
+		storedVariantCountsByType: countVariantTypes(storedVariants),
+		embeddedVariantCountsByType: countVariantTypes(embeddedVariants),
+		skippedVectorizationReasons: countSkippedVectorizationReasons(storedVariants),
+	}
 
 	if (variantPairs.length === 0) {
 		return {
@@ -161,6 +217,7 @@ export async function executeUpsertBatch(
 			embedLatencyMs: 0,
 			upsertLatencyMs: 0,
 			pointIds: [],
+			variantTelemetry,
 		}
 	}
 
@@ -186,5 +243,8 @@ export async function executeUpsertBatch(
 		embedLatencyMs,
 		upsertLatencyMs,
 		pointIds: points.map((point) => point.id),
+		variantTelemetry,
+		adaptiveControllerState: embeddingResponse.adaptiveControllerState,
+		adaptiveControllerObservations: embeddingResponse.adaptiveControllerObservations,
 	}
 }
