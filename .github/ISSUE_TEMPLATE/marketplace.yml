@@ -5,7 +5,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Thanks for your feedback!** Please check existing issues first: https://github.com/RooCodeInc/Roo-Code/issues
+        **Thanks for your feedback!**
+        Please check existing issues in this repository first.
+        
+        Maintainers may convert this intake issue into an operational work item, or create a linked follow-on issue, if engineering investigation or implementation begins.
 
   - type: dropdown
     id: feedback-type
