@@ -36,6 +36,8 @@ import {
 	OversizedTrackedFileRecord,
 	PaginatedOversizedTrackedFiles,
 	PaginatedRevisionWarningDetails,
+	PersistParsedRevisionInput,
+	PersistParsedRevisionResult,
 	PlannedRevisionResolution,
 	RevisionQueryOptions,
 	RevisionJobResolution,
@@ -1319,6 +1321,45 @@ export class MetadataStore {
 		return this.getFileRecordByWorkspacePath(input.workspaceId, input.relativePath)
 	}
 
+	async upsertFileRecords(inputs: FileRecordInput[]): Promise<void> {
+		if (inputs.length === 0) {
+			return
+		}
+
+		const now = Date.now()
+		const statement = this.db().prepare(
+			`INSERT INTO files (
+				file_id, workspace_id, relative_path, normalized_path, last_seen_mtime_ms,
+				last_seen_size, ignore_state, active_revision_id, tombstoned, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+			ON CONFLICT(workspace_id, relative_path)
+			DO UPDATE SET
+				normalized_path = excluded.normalized_path,
+				last_seen_mtime_ms = excluded.last_seen_mtime_ms,
+				last_seen_size = excluded.last_seen_size,
+				ignore_state = excluded.ignore_state,
+				tombstoned = excluded.tombstoned,
+				updated_at = excluded.updated_at`,
+		)
+
+		this.withTransaction(() => {
+			for (const input of inputs) {
+				statement.run(
+					uuidv4(),
+					input.workspaceId,
+					input.relativePath,
+					input.normalizedPath,
+					input.lastSeenMtimeMs ?? null,
+					input.lastSeenSize ?? null,
+					input.ignoreState,
+					input.tombstoned ? 1 : 0,
+					now,
+					now,
+				)
+			}
+		})
+	}
+
 	async getFileRecordByWorkspacePath(workspaceId: string, relativePath: string): Promise<FileRecord> {
 		const row = this.db()
 			.prepare(
@@ -2215,6 +2256,162 @@ export class MetadataStore {
 		})
 
 		return insertedVariants
+	}
+
+	async persistParsedRevision(input: PersistParsedRevisionInput): Promise<PersistParsedRevisionResult> {
+		const now = Date.now()
+		const insertedChunks = input.chunks.map((chunk) => ({
+			chunkId: chunk.chunkId,
+			revisionId: input.revisionId,
+			chunkFingerprint: chunk.chunkFingerprint,
+			startLine: chunk.startLine,
+			endLine: chunk.endLine,
+			language: chunk.language ?? null,
+			chunkKind: chunk.chunkKind ?? null,
+			symbolName: chunk.symbolName ?? null,
+			symbolQualifiedName: chunk.symbolQualifiedName ?? null,
+			parentSymbolName: chunk.parentSymbolName ?? null,
+			parentChunkFingerprint: chunk.parentChunkFingerprint ?? null,
+			summary: chunk.summary ?? null,
+			searchText: chunk.searchText ?? null,
+			content: chunk.content,
+			contentHash: chunk.contentHash,
+			tokenEstimate: chunk.tokenEstimate ?? null,
+			embeddingModel: chunk.embeddingModel ?? null,
+			vectorPointId: chunk.vectorPointId ?? null,
+			state: chunk.state ?? "parsed",
+			createdAt: now,
+			updatedAt: now,
+		}))
+		const variantRows = input.chunks.flatMap((chunk) =>
+			chunk.variants.map((variant) => ({
+				variantId: uuidv4(),
+				chunkId: chunk.chunkId,
+				variantType: variant.variantType,
+				content: variant.content,
+				contentHash: variant.contentHash,
+				tokenEstimate: variant.tokenEstimate ?? null,
+				embeddingModel: variant.embeddingModel ?? null,
+				vectorPointId: variant.vectorPointId ?? null,
+				vectorEligible: variant.vectorEligible === false ? 0 : 1,
+				vectorPriority: variant.vectorPriority ?? 0,
+				vectorEligibilityReason: variant.vectorEligibilityReason ?? null,
+				noveltyScore: variant.noveltyScore ?? null,
+				state: variant.state ?? "parsed",
+				createdAt: now,
+				updatedAt: now,
+			})),
+		)
+
+		const chunkInsertStatement = this.db().prepare(
+			`INSERT INTO chunks (
+				chunk_id, revision_id, chunk_fingerprint, start_line, end_line,
+				language, chunk_kind, symbol_name, symbol_qualified_name, parent_symbol_name, parent_chunk_fingerprint, summary, search_text,
+				content, content_hash, token_estimate, embedding_model, vector_point_id,
+				state, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		const chunkVariantStatement = this.db().prepare(
+			`INSERT INTO chunk_variants (
+				variant_id, chunk_id, variant_type, content, content_hash, token_estimate,
+				embedding_model, vector_point_id, vector_eligible, vector_priority,
+				vector_eligibility_reason, novelty_score, state, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		const revisionStateStatement = this.db().prepare(
+			`UPDATE file_revisions
+			SET state = ?, failure_reason = NULL, committed_at = CASE WHEN ? = 'committed' THEN ? ELSE committed_at END
+			WHERE revision_id = ?`,
+		)
+
+		let chunkInsertLatencyMs = 0
+		let lexicalFtsLatencyMs = 0
+		let chunkVariantInsertLatencyMs = 0
+		let revisionStateUpdateLatencyMs = 0
+		const transactionStartedAt = Date.now()
+		this.withTransaction(() => {
+			const chunkInsertStartedAt = Date.now()
+			for (const chunk of insertedChunks) {
+				chunkInsertStatement.run(
+					chunk.chunkId,
+					chunk.revisionId,
+					chunk.chunkFingerprint,
+					chunk.startLine,
+					chunk.endLine,
+					chunk.language,
+					chunk.chunkKind,
+					chunk.symbolName,
+					chunk.symbolQualifiedName,
+					chunk.parentSymbolName,
+					chunk.parentChunkFingerprint,
+					chunk.summary,
+					chunk.searchText,
+					chunk.content,
+					chunk.contentHash,
+					chunk.tokenEstimate,
+					chunk.embeddingModel,
+					chunk.vectorPointId,
+					chunk.state,
+					chunk.createdAt,
+					chunk.updatedAt,
+				)
+			}
+			chunkInsertLatencyMs = Date.now() - chunkInsertStartedAt
+
+			const lexicalFtsStartedAt = Date.now()
+			this.upsertChunkLexicalFtsRows(
+				insertedChunks.map((chunk) => ({
+					chunkId: chunk.chunkId,
+					revisionId: chunk.revisionId,
+					relativePath: input.relativePath,
+					symbolQualifiedName: chunk.symbolQualifiedName,
+					symbolName: chunk.symbolName,
+					parentSymbolName: chunk.parentSymbolName,
+					summary: chunk.summary,
+					searchText: chunk.searchText,
+				})),
+			)
+			lexicalFtsLatencyMs = Date.now() - lexicalFtsStartedAt
+
+			const chunkVariantInsertStartedAt = Date.now()
+			for (const variant of variantRows) {
+				chunkVariantStatement.run(
+					variant.variantId,
+					variant.chunkId,
+					variant.variantType,
+					variant.content,
+					variant.contentHash,
+					variant.tokenEstimate,
+					variant.embeddingModel,
+					variant.vectorPointId,
+					variant.vectorEligible,
+					variant.vectorPriority,
+					variant.vectorEligibilityReason,
+					variant.noveltyScore,
+					variant.state,
+					variant.createdAt,
+					variant.updatedAt,
+				)
+			}
+			chunkVariantInsertLatencyMs = Date.now() - chunkVariantInsertStartedAt
+
+			const revisionStateUpdateStartedAt = Date.now()
+			revisionStateStatement.run("parsed", "parsed", now, input.revisionId)
+			revisionStateUpdateLatencyMs = Date.now() - revisionStateUpdateStartedAt
+		})
+
+		const transactionLatencyMs = Date.now() - transactionStartedAt
+		return {
+			insertedChunks,
+			insertedVariantCount: variantRows.length,
+			chunkInsertLatencyMs,
+			lexicalFtsLatencyMs,
+			chunkVariantInsertLatencyMs,
+			revisionStateUpdateLatencyMs,
+			transactionLatencyMs,
+			metadataWriteLatencyMs:
+				chunkInsertLatencyMs + lexicalFtsLatencyMs + chunkVariantInsertLatencyMs + revisionStateUpdateLatencyMs,
+		}
 	}
 
 	async getChunksForRevision(revisionId: string): Promise<ChunkRecord[]> {

@@ -3334,6 +3334,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			let peakQueuedJobs = 0
 			let blockedOnParsedRevisionsMs = 0
 			let blockedOnStagedChunksMs = 0
+			let latestPlannerRefillPasses: number | undefined
 			let latestSyncTelemetry:
 				| {
 						chunksPerSecond?: number
@@ -3873,7 +3874,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						stage: latestTelemetryStage,
 						metrics: latestBacklogMetrics,
 						parseSchedulingThrottled,
-						embedQueueDepth: this.getEmbedQueueDepth(latestBacklogMetrics),
+						plannerRefillPasses: latestPlannerRefillPasses,
 						latestSyncTelemetry,
 					}),
 				)
@@ -4099,7 +4100,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					parseThrottled: parseSchedulingThrottled,
 				})
 				const throttleSuffix = parseSchedulingThrottled
-					? ` • ${blockingReasonText ?? `Parse throttled while ${this.getEmbedQueueDepth(latestBacklogMetrics).toLocaleString()} staged vector items drain`}`
+					? ` • ${blockingReasonText ?? `Parse throttled while ${latestBacklogMetrics.stagedChunks.toLocaleString()} parsed chunks and ${this.getRunnableEmbedQueueDepth(latestBacklogMetrics).toLocaleString()} runnable vector jobs drain`}`
 					: ""
 				this.stateManager.setActivityDetail(
 					[
@@ -4285,31 +4286,64 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						ensureEmbedPhaseStarted(false, "planning_vectors")
 						updateEmbeddingDetail()
 
+						let plannerRefillPasses = 0
 						for (;;) {
+							const refillPriorityBeforePass = shouldPrioritizePlannerRefill({
+								embedPhaseStarted,
+								metrics: latestBacklogMetrics,
+								stagedChunkLowWatermark: schedulerProfile.stagedChunkLowWatermark,
+							})
 							const diffPlanningStartedAt = Date.now()
-							const plannerSummary = await diffPlanner.run(runId, signal, {
+							const plannerSummary = (await diffPlanner.run(runId, signal, {
 								limit: schedulerProfile.plannerRevisionSlice,
 								maxJobs: schedulerProfile.plannerJobBudget,
-							})
+							})) ?? {
+								runId,
+								plannedRevisions: 0,
+								upsertJobs: 0,
+								deleteJobs: 0,
+								reusedFingerprintUpserts: 0,
+								deletedMissingFingerprintChunks: 0,
+								safetyFallbackRevisions: 0,
+								plannerSliceLatencyMs: 0,
+							}
 							diffPlanningMs += Date.now() - diffPlanningStartedAt
 							await refreshBacklogMetrics(true)
 							await persistRunSnapshot()
+							if (refillPriorityBeforePass) {
+								plannerRefillPasses++
+							}
 
 							const plannerMadeProgress =
 								plannerSummary.plannedRevisions > 0 ||
 								plannerSummary.upsertJobs > 0 ||
 								plannerSummary.deleteJobs > 0
+							const runnableEmbedQueueDepth = this.getRunnableEmbedQueueDepth(latestBacklogMetrics)
 							if (
-								!shouldPrioritizePlannerRefill({
-									embedPhaseStarted,
-									metrics: latestBacklogMetrics,
-									stagedChunkHighWatermark: schedulerProfile.stagedChunkHighWatermark,
-								}) ||
-								!plannerMadeProgress
+								!plannerMadeProgress ||
+								latestBacklogMetrics.parsedRevisions === 0 ||
+								runnableEmbedQueueDepth >= schedulerProfile.stagedChunkLowWatermark ||
+								!refillPriorityBeforePass ||
+								plannerRefillPasses >= 8
 							) {
 								break
 							}
 						}
+						latestPlannerRefillPasses = plannerRefillPasses > 0 ? plannerRefillPasses : undefined
+						if (plannerRefillPasses > 0) {
+							IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "planner-refill-burst-complete", {
+								component: "CodeIndexEngineV2",
+								workspacePath: this.workspacePath,
+								runId,
+								plannerRefillPasses,
+								parsedChunkBacklog: latestBacklogMetrics.stagedChunks,
+								runnableEmbedQueueDepth: this.getRunnableEmbedQueueDepth(latestBacklogMetrics),
+								totalVectorBacklog: this.getTotalVectorBacklog(latestBacklogMetrics),
+								parsedRevisions: latestBacklogMetrics.parsedRevisions,
+							})
+						}
+					} else {
+						latestPlannerRefillPasses = undefined
 					}
 
 					if (
@@ -4797,8 +4831,12 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		})
 	}
 
-	private getEmbedQueueDepth(metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>): number {
-		return metrics.stagedChunks + metrics.queuedUpsertJobs + metrics.runningUpsertJobs
+	private getRunnableEmbedQueueDepth(metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>): number {
+		return metrics.queuedUpsertJobs + metrics.runningUpsertJobs
+	}
+
+	private getTotalVectorBacklog(metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>): number {
+		return metrics.stagedChunks + this.getRunnableEmbedQueueDepth(metrics)
 	}
 
 	private getSchedulerProfile(checkedFiles: number) {
@@ -4841,8 +4879,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return (
 			metrics.parsedRevisions >= profile.parsedRevisionHighWatermark ||
 			metrics.stagedChunks >= profile.stagedChunkHighWatermark ||
-			metrics.stagedChunkBytes >= profile.stagedBytesHighWatermark ||
-			this.getEmbedQueueDepth(metrics) >= profile.stagedChunkHighWatermark
+			metrics.stagedChunkBytes >= profile.stagedBytesHighWatermark
 		)
 	}
 
@@ -4853,8 +4890,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return (
 			metrics.parsedRevisions <= profile.parsedRevisionLowWatermark &&
 			metrics.stagedChunks <= profile.stagedChunkLowWatermark &&
-			metrics.stagedChunkBytes <= profile.stagedBytesLowWatermark &&
-			this.getEmbedQueueDepth(metrics) <= profile.stagedChunkLowWatermark
+			metrics.stagedChunkBytes <= profile.stagedBytesLowWatermark
 		)
 	}
 

@@ -1,6 +1,7 @@
 import * as fs from "fs/promises"
 import * as os from "os"
 import * as path from "path"
+import { createHash } from "crypto"
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest"
 
 vi.mock("vscode", () => {
@@ -1394,6 +1395,188 @@ describe("MetadataStore integration", () => {
 		expect(refreshed.total).toBe(1)
 		expect(refreshed.actionable).toBe(0)
 		expect(refreshed.items[0]?.status).toBe("eligible")
+
+		await store.dispose()
+	})
+
+	it("batch-upserts discovered file records in one helper", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-7") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-7")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		await store.upsertFileRecords([
+			{
+				workspaceId,
+				relativePath: "src/a.ts",
+				normalizedPath: path.join(workspacePath, "src/a.ts"),
+				lastSeenMtimeMs: 10,
+				lastSeenSize: 100,
+				ignoreState: "included",
+				tombstoned: false,
+			},
+			{
+				workspaceId,
+				relativePath: "src/b.ts",
+				normalizedPath: path.join(workspacePath, "src/b.ts"),
+				lastSeenMtimeMs: 20,
+				lastSeenSize: 200,
+				ignoreState: "included",
+				tombstoned: false,
+			},
+		])
+
+		await store.upsertFileRecords([
+			{
+				workspaceId,
+				relativePath: "src/a.ts",
+				normalizedPath: path.join(workspacePath, "src/renamed-a.ts"),
+				lastSeenMtimeMs: 30,
+				lastSeenSize: 300,
+				ignoreState: "included",
+				tombstoned: true,
+			},
+		])
+
+		const recordA = await store.getFileRecordByWorkspacePath(workspaceId, "src/a.ts")
+		const recordB = await store.getFileRecordByWorkspacePath(workspaceId, "src/b.ts")
+
+		expect(recordA).toEqual(
+			expect.objectContaining({
+				normalizedPath: path.join(workspacePath, "src/renamed-a.ts"),
+				lastSeenMtimeMs: 30,
+				lastSeenSize: 300,
+				tombstoned: true,
+			}),
+		)
+		expect(recordB).toEqual(
+			expect.objectContaining({
+				normalizedPath: path.join(workspacePath, "src/b.ts"),
+				lastSeenMtimeMs: 20,
+				lastSeenSize: 200,
+				tombstoned: false,
+			}),
+		)
+
+		await store.dispose()
+	})
+
+	it("persists parsed revisions with chunk rows, lexical rows, variants, and parsed state in one helper", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-8") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-8")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const file = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/example.ts",
+			normalizedPath: path.join(workspacePath, "src/example.ts"),
+			lastSeenMtimeMs: 123,
+			lastSeenSize: 456,
+			ignoreState: "included",
+		})
+		const runId = await store.beginRun("initial-discovery")
+		const revision = await store.createFileRevision({
+			fileId: file.fileId,
+			runId,
+			contentHash: "revision-content-hash",
+			fastFingerprint: "456:123",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+			state: "hashed",
+		})
+		const rawCode = "Path: src/example.ts\nSymbol: example\n\nexport const example = true"
+		const summary = "ts const example in src/example.ts:1-1"
+
+		const result = await store.persistParsedRevision({
+			revisionId: revision.revisionId,
+			relativePath: "src/example.ts",
+			chunks: [
+				{
+					chunkId: "chunk-1",
+					chunkFingerprint: "fp-1",
+					startLine: 1,
+					endLine: 1,
+					language: "ts",
+					chunkKind: "const",
+					symbolName: "example",
+					symbolQualifiedName: "Example.example",
+					parentSymbolName: "Example",
+					parentChunkFingerprint: null,
+					summary,
+					searchText: rawCode,
+					content: "export const example = true",
+					contentHash: createHash("sha256").update("export const example = true").digest("hex"),
+					state: "parsed",
+					variants: [
+						{
+							variantType: "raw_code",
+							content: rawCode,
+							contentHash: createHash("sha256").update(rawCode).digest("hex"),
+							vectorEligible: true,
+							vectorPriority: 1000,
+							vectorEligibilityReason: "canonical_grounding_surface",
+							noveltyScore: 1,
+							state: "parsed",
+						},
+						{
+							variantType: "summary",
+							content: summary,
+							contentHash: createHash("sha256").update(summary).digest("hex"),
+							vectorEligible: false,
+							vectorPriority: 0,
+							vectorEligibilityReason: "lexical_only:boilerplate",
+							noveltyScore: 0.1,
+							state: "parsed",
+						},
+					],
+				},
+			],
+		})
+
+		expect(result.insertedChunks).toHaveLength(1)
+		expect(result.insertedVariantCount).toBe(2)
+		expect(result.chunkInsertLatencyMs).toEqual(expect.any(Number))
+		expect(result.lexicalFtsLatencyMs).toEqual(expect.any(Number))
+		expect(result.transactionLatencyMs).toEqual(expect.any(Number))
+
+		const storedRevision = await store.getFileRevision(revision.revisionId)
+		expect(storedRevision.state).toBe("parsed")
+
+		const storedChunks = await store.getChunksForRevision(revision.revisionId)
+		expect(storedChunks).toEqual([
+			expect.objectContaining({
+				chunkId: "chunk-1",
+				symbolQualifiedName: "Example.example",
+				searchText: rawCode,
+			}),
+		])
+
+		const variants = await store.getChunkVariantsByChunkIds(["chunk-1"])
+		expect(variants.map((variant) => variant.variantType)).toEqual(["raw_code", "summary"])
+
+		const db = (store as any).db() as {
+			prepare(sql: string): { get(...params: unknown[]): Record<string, unknown> | undefined }
+		}
+		const lexicalRow = db
+			.prepare(
+				`SELECT relative_path AS relativePath, search_text AS searchText
+				FROM chunk_lexical_fts
+				WHERE chunk_id = ?`,
+			)
+			.get("chunk-1")
+		expect(lexicalRow).toEqual(
+			expect.objectContaining({
+				relativePath: "src/example.ts",
+				searchText: rawCode,
+			}),
+		)
 
 		await store.dispose()
 	})

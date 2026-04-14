@@ -24,17 +24,14 @@ export interface PipelineEmbedTelemetryLike {
 
 export function shouldPrioritizePlannerRefill(input: {
 	embedPhaseStarted: boolean
-	metrics: Pick<
-		PipelineBacklogMetricsLike,
-		"parsedRevisions" | "queuedUpsertJobs" | "runningUpsertJobs" | "stagedChunks"
-	>
-	stagedChunkHighWatermark: number
+	metrics: Pick<PipelineBacklogMetricsLike, "parsedRevisions" | "queuedUpsertJobs" | "runningUpsertJobs">
+	stagedChunkLowWatermark: number
 }): boolean {
+	const runnableEmbedQueueDepth = input.metrics.queuedUpsertJobs + input.metrics.runningUpsertJobs
 	return (
 		input.embedPhaseStarted &&
 		input.metrics.parsedRevisions > 0 &&
-		input.metrics.queuedUpsertJobs + input.metrics.runningUpsertJobs === 0 &&
-		input.metrics.stagedChunks < input.stagedChunkHighWatermark
+		runnableEmbedQueueDepth < input.stagedChunkLowWatermark
 	)
 }
 
@@ -45,9 +42,12 @@ export function buildPipelineBacklogSample(input: {
 	stage: string
 	metrics: PipelineBacklogMetricsLike
 	parseSchedulingThrottled: boolean
-	embedQueueDepth: number
+	plannerRefillPasses?: number
 	latestSyncTelemetry?: PipelineEmbedTelemetryLike
 }) {
+	const parsedChunkBacklog = input.metrics.stagedChunks
+	const runnableEmbedQueueDepth = input.metrics.queuedUpsertJobs + input.metrics.runningUpsertJobs
+	const totalVectorBacklog = parsedChunkBacklog + runnableEmbedQueueDepth
 	return {
 		component: "CodeIndexEngineV2" as const,
 		engine: input.engine,
@@ -63,7 +63,10 @@ export function buildPipelineBacklogSample(input: {
 		runningDeleteJobs: input.metrics.runningDeleteJobs,
 		blockingReason: input.metrics.blockingReason,
 		parseSchedulingThrottled: input.parseSchedulingThrottled,
-		embedQueueDepth: input.embedQueueDepth,
+		parsedChunkBacklog,
+		runnableEmbedQueueDepth,
+		totalVectorBacklog,
+		plannerRefillPasses: input.plannerRefillPasses,
 		activeLaneCount: input.latestSyncTelemetry?.activeLaneCount,
 		inFlightChunkCount: input.latestSyncTelemetry?.inFlightChunkCount,
 		laneOccupancyPercent: input.latestSyncTelemetry?.laneOccupancyPercent,

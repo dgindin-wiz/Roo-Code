@@ -181,6 +181,30 @@ export interface ChunkVariantInput {
 	state?: ChunkVariantState
 }
 
+export type PersistParsedRevisionVariantInput = Omit<ChunkVariantInput, "chunkId">
+
+export interface PersistParsedRevisionChunkInput extends Omit<ChunkInput, "revisionId"> {
+	chunkId: string
+	variants: PersistParsedRevisionVariantInput[]
+}
+
+export interface PersistParsedRevisionInput {
+	revisionId: string
+	relativePath: string
+	chunks: PersistParsedRevisionChunkInput[]
+}
+
+export interface PersistParsedRevisionResult {
+	insertedChunks: ChunkRecord[]
+	insertedVariantCount: number
+	chunkInsertLatencyMs: number
+	lexicalFtsLatencyMs: number
+	chunkVariantInsertLatencyMs: number
+	revisionStateUpdateLatencyMs: number
+	transactionLatencyMs: number
+	metadataWriteLatencyMs: number
+}
+
 export interface JobRecord {
 	jobId: string
 	workspaceId: string

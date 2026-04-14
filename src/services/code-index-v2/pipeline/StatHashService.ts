@@ -1,4 +1,5 @@
 import { createHash } from "crypto"
+import pLimit from "p-limit"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { MetadataStore } from "../store/MetadataStore"
 import { WorkspaceAdapter } from "../adapters/WorkspaceAdapter"
@@ -62,6 +63,7 @@ export function describeOversizedFile(
 export class StatHashService {
 	private static readonly PARSER_VERSION = CODE_INDEX_V2_PARSER_VERSION
 	private static readonly CHUNKER_VERSION = CODE_INDEX_V2_CHUNKER_VERSION
+	private static readonly STAT_HASH_CONCURRENCY = 8
 
 	constructor(
 		private readonly metadataStore: MetadataStore,
@@ -100,159 +102,7 @@ export class StatHashService {
 		const oversizedDetails: OversizedFileDetail[] = []
 		let missingFiles = 0
 		const reusedParsedRevisionIds: string[] = []
-
-		for (const file of files) {
-			if (signal?.aborted) {
-				throw new Error("Stat/hash stage aborted")
-			}
-
-			const fastFingerprint = `${file.lastSeenSize ?? 0}:${file.lastSeenMtimeMs ?? 0}`
-			checkedFiles++
-
-			const approvedMaxBytes = options?.resolveApprovedMaxBytes?.(file.relativePath)
-			const effectiveMaxFileSizeBytes = Math.max(defaultMaxFileSizeBytes, approvedMaxBytes ?? 0)
-			if ((file.lastSeenSize ?? 0) > effectiveMaxFileSizeBytes) {
-				skippedFiles++
-				oversizedFiles++
-				this.insertOversizedDetail(
-					oversizedDetails,
-					this.buildOversizedDetail(file.relativePath, file.lastSeenSize ?? 0, approvedMaxBytes),
-				)
-				IndexDebugLoggerV2.log("basic", "StatHashService", "stat-hash-oversized-file-skipped", {
-					component: "StatHashService",
-					workspacePath: this.workspaceAdapter.getWorkspacePath(),
-					runId,
-					jobId: file.relativePath,
-				})
-				if (checkedFiles === 1 || checkedFiles % 250 === 0) {
-					options?.onProgress?.({
-						checkedFiles,
-						changedFiles,
-						skippedFiles,
-						unchangedFiles,
-						oversizedFiles,
-						missingFiles,
-					})
-				}
-				continue
-			}
-
-			if (
-				!options?.forceReindex &&
-				file.latestRevisionState === "committed" &&
-				this.hasCurrentRetrievalSurfaceVersion(
-					file.latestRevisionParserVersion,
-					file.latestRevisionChunkerVersion,
-				) &&
-				file.latestRevisionFastFingerprint === fastFingerprint &&
-				file.latestRevisionContentHash
-			) {
-				skippedFiles++
-				unchangedFiles++
-				if (checkedFiles === 1 || checkedFiles % 500 === 0) {
-					options?.onProgress?.({
-						checkedFiles,
-						changedFiles,
-						skippedFiles,
-						unchangedFiles,
-						oversizedFiles,
-						missingFiles,
-					})
-				}
-				continue
-			}
-
-			let content: string
-			try {
-				content = await this.workspaceAdapter.readFile(file.normalizedPath)
-			} catch (error) {
-				if (this.isMissingFileError(error)) {
-					skippedFiles++
-					missingFiles++
-					IndexDebugLoggerV2.log("basic", "StatHashService", "stat-hash-missing-file", {
-						component: "StatHashService",
-						workspacePath: this.workspaceAdapter.getWorkspacePath(),
-						runId,
-						jobId: file.relativePath,
-					})
-					if (checkedFiles === 1 || checkedFiles % 250 === 0) {
-						options?.onProgress?.({
-							checkedFiles,
-							changedFiles,
-							skippedFiles,
-							unchangedFiles,
-							oversizedFiles,
-							missingFiles,
-						})
-					}
-					continue
-				}
-				throw error
-			}
-			const contentHash = createHash("sha256").update(content).digest("hex")
-
-			if (
-				!options?.forceReindex &&
-				file.latestRevisionState === "committed" &&
-				this.hasCurrentRetrievalSurfaceVersion(
-					file.latestRevisionParserVersion,
-					file.latestRevisionChunkerVersion,
-				) &&
-				file.latestRevisionContentHash === contentHash
-			) {
-				skippedFiles++
-				unchangedFiles++
-				if (checkedFiles === 1 || checkedFiles % 500 === 0) {
-					options?.onProgress?.({
-						checkedFiles,
-						changedFiles,
-						skippedFiles,
-						unchangedFiles,
-						oversizedFiles,
-						missingFiles,
-					})
-				}
-				continue
-			}
-
-			if (!options?.forceReindex) {
-				const reusableRevision = await this.metadataStore.findReusableRevision(
-					file.fileId,
-					contentHash,
-					fastFingerprint,
-					StatHashService.PARSER_VERSION,
-					StatHashService.CHUNKER_VERSION,
-				)
-				if (reusableRevision) {
-					await this.metadataStore.adoptRevisionToRun(reusableRevision.revisionId, runId)
-					if (reusableRevision.state === "parsed") {
-						reusedParsedRevisionIds.push(reusableRevision.revisionId)
-					}
-					changedFiles++
-					if (checkedFiles === 1 || checkedFiles % 250 === 0) {
-						options?.onProgress?.({
-							checkedFiles,
-							changedFiles,
-							skippedFiles,
-							unchangedFiles,
-							oversizedFiles,
-							missingFiles,
-						})
-					}
-					continue
-				}
-			}
-
-			await this.metadataStore.createFileRevision({
-				fileId: file.fileId,
-				runId,
-				contentHash,
-				fastFingerprint,
-				parserVersion: StatHashService.PARSER_VERSION,
-				chunkerVersion: StatHashService.CHUNKER_VERSION,
-				state: "hashed",
-			})
-			changedFiles++
+		const maybeReportProgress = () => {
 			if (checkedFiles === 1 || checkedFiles % 250 === 0) {
 				options?.onProgress?.({
 					checkedFiles,
@@ -264,6 +114,121 @@ export class StatHashService {
 				})
 			}
 		}
+		const limiter = pLimit(StatHashService.STAT_HASH_CONCURRENCY)
+
+		await Promise.all(
+			files.map((file) =>
+				limiter(async () => {
+					if (signal?.aborted) {
+						throw new Error("Stat/hash stage aborted")
+					}
+
+					const fastFingerprint = `${file.lastSeenSize ?? 0}:${file.lastSeenMtimeMs ?? 0}`
+					checkedFiles++
+
+					const approvedMaxBytes = options?.resolveApprovedMaxBytes?.(file.relativePath)
+					const effectiveMaxFileSizeBytes = Math.max(defaultMaxFileSizeBytes, approvedMaxBytes ?? 0)
+					if ((file.lastSeenSize ?? 0) > effectiveMaxFileSizeBytes) {
+						skippedFiles++
+						oversizedFiles++
+						this.insertOversizedDetail(
+							oversizedDetails,
+							this.buildOversizedDetail(file.relativePath, file.lastSeenSize ?? 0, approvedMaxBytes),
+						)
+						IndexDebugLoggerV2.log("basic", "StatHashService", "stat-hash-oversized-file-skipped", {
+							component: "StatHashService",
+							workspacePath: this.workspaceAdapter.getWorkspacePath(),
+							runId,
+							jobId: file.relativePath,
+						})
+						maybeReportProgress()
+						return
+					}
+
+					if (
+						!options?.forceReindex &&
+						file.latestRevisionState === "committed" &&
+						this.hasCurrentRetrievalSurfaceVersion(
+							file.latestRevisionParserVersion,
+							file.latestRevisionChunkerVersion,
+						) &&
+						file.latestRevisionFastFingerprint === fastFingerprint &&
+						file.latestRevisionContentHash
+					) {
+						skippedFiles++
+						unchangedFiles++
+						maybeReportProgress()
+						return
+					}
+
+					let content: string
+					try {
+						content = await this.workspaceAdapter.readFile(file.normalizedPath)
+					} catch (error) {
+						if (this.isMissingFileError(error)) {
+							skippedFiles++
+							missingFiles++
+							IndexDebugLoggerV2.log("basic", "StatHashService", "stat-hash-missing-file", {
+								component: "StatHashService",
+								workspacePath: this.workspaceAdapter.getWorkspacePath(),
+								runId,
+								jobId: file.relativePath,
+							})
+							maybeReportProgress()
+							return
+						}
+						throw error
+					}
+					const contentHash = createHash("sha256").update(content).digest("hex")
+
+					if (
+						!options?.forceReindex &&
+						file.latestRevisionState === "committed" &&
+						this.hasCurrentRetrievalSurfaceVersion(
+							file.latestRevisionParserVersion,
+							file.latestRevisionChunkerVersion,
+						) &&
+						file.latestRevisionContentHash === contentHash
+					) {
+						skippedFiles++
+						unchangedFiles++
+						maybeReportProgress()
+						return
+					}
+
+					if (!options?.forceReindex) {
+						const reusableRevision = await this.metadataStore.findReusableRevision(
+							file.fileId,
+							contentHash,
+							fastFingerprint,
+							StatHashService.PARSER_VERSION,
+							StatHashService.CHUNKER_VERSION,
+						)
+						if (reusableRevision) {
+							await this.metadataStore.adoptRevisionToRun(reusableRevision.revisionId, runId)
+							if (reusableRevision.state === "parsed") {
+								reusedParsedRevisionIds.push(reusableRevision.revisionId)
+							}
+							changedFiles++
+							maybeReportProgress()
+							return
+						}
+					}
+
+					await this.metadataStore.createFileRevision({
+						fileId: file.fileId,
+						runId,
+						contentHash,
+						fastFingerprint,
+						parserVersion: StatHashService.PARSER_VERSION,
+						chunkerVersion: StatHashService.CHUNKER_VERSION,
+						state: "hashed",
+					})
+					changedFiles++
+					maybeReportProgress()
+				}),
+			),
+		)
 
 		IndexDebugLoggerV2.log("basic", "StatHashService", "stat-hash-complete", {
 			component: "StatHashService",
@@ -281,7 +246,7 @@ export class StatHashService {
 			oversizedFiles,
 			oversizedDetails,
 			missingFiles,
-			reusedParsedRevisionIds,
+			reusedParsedRevisionIds: reusedParsedRevisionIds.slice().sort((left, right) => left.localeCompare(right)),
 		}
 	}
 

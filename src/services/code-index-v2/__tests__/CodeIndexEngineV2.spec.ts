@@ -2730,6 +2730,130 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.embedUpsertWorker.run).toHaveBeenCalled()
 	})
 
+	it("keeps refilling the planner until runnable upsert work exists when embed lanes are underfed", async () => {
+		const backlog = {
+			...zeroBacklog(),
+			parsedRevisions: 3,
+			stagedChunks: 900,
+		}
+
+		mocks.statHashService.run.mockReset()
+		mocks.statHashService.run.mockResolvedValueOnce({
+			runId: "run-1",
+			checkedFiles: 65_000,
+			skippedFiles: 0,
+			changedFiles: 1,
+			unchangedFiles: 0,
+			oversizedFiles: 0,
+			missingFiles: 0,
+			reusedParsedRevisionIds: [],
+		})
+		mocks.parseChunkService.run.mockReset()
+		mocks.parseChunkService.run
+			.mockResolvedValueOnce({
+				runId: "run-1",
+				attemptedRevisions: 0,
+				parsedRevisions: 0,
+				parsedChunks: 0,
+				parsedRevisionIds: [],
+				retryingRevisions: 0,
+				terminalFailedRevisions: 0,
+			})
+			.mockResolvedValueOnce({
+				runId: "run-1",
+				attemptedRevisions: 0,
+				parsedRevisions: 0,
+				parsedChunks: 0,
+				parsedRevisionIds: [],
+				retryingRevisions: 0,
+				terminalFailedRevisions: 0,
+			})
+		mocks.metadataStore.getRunBacklogMetrics.mockImplementation(async () => ({ ...backlog }))
+		mocks.diffPlanner.run.mockReset()
+		mocks.diffPlanner.run
+			.mockImplementationOnce(async () => {
+				backlog.parsedRevisions = 2
+				backlog.stagedChunks = 850
+				backlog.queuedUpsertJobs = 0
+				backlog.runningUpsertJobs = 0
+				return {
+					runId: "run-1",
+					plannedRevisions: 1,
+					upsertJobs: 0,
+					deleteJobs: 0,
+				}
+			})
+			.mockImplementationOnce(async () => {
+				backlog.parsedRevisions = 1
+				backlog.stagedChunks = 600
+				backlog.queuedUpsertJobs = 350
+				return {
+					runId: "run-1",
+					plannedRevisions: 1,
+					upsertJobs: 350,
+					deleteJobs: 0,
+				}
+			})
+		mocks.embedUpsertWorker.run.mockReset()
+		mocks.embedUpsertWorker.run.mockImplementation(async () => {
+			backlog.parsedRevisions = 0
+			backlog.plannedRevisions = 0
+			backlog.queuedUpsertJobs = 0
+			backlog.runningUpsertJobs = 0
+			backlog.stagedChunks = 0
+			return {
+				runId: "run-1",
+				upsertedChunks: 350,
+				deletedChunks: 0,
+				committedRevisions: 1,
+			}
+		})
+
+		const logSpy = vi.spyOn(IndexDebugLoggerV2, "log").mockImplementation(() => {})
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		await engine.start()
+
+		expect(mocks.diffPlanner.run).toHaveBeenCalledTimes(2)
+		const refillLog = logSpy.mock.calls.find(([, , message]) => message === "planner-refill-burst-complete")
+		expect(refillLog?.[3]).toEqual(
+			expect.objectContaining({
+				runId: "run-1",
+				plannerRefillPasses: 2,
+				runnableEmbedQueueDepth: 350,
+				parsedChunkBacklog: 600,
+				totalVectorBacklog: 950,
+			}),
+		)
+	})
+
+	it("does not throttle parse solely because queued upsert jobs are high", () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+		const profile = (engine as any).getSchedulerProfile(65_000)
+
+		expect(
+			(engine as any).shouldThrottleParse(
+				{
+					...zeroBacklog(),
+					stagedChunkBytes: 0,
+					queuedUpsertJobs: 1_200,
+					runningUpsertJobs: 0,
+				},
+				profile,
+			),
+		).toBe(false)
+		expect(
+			(engine as any).shouldResumeParse(
+				{
+					...zeroBacklog(),
+					stagedChunkBytes: 0,
+					queuedUpsertJobs: 1_200,
+					runningUpsertJobs: 0,
+				},
+				profile,
+			),
+		).toBe(true)
+	})
+
 	it("reports raw parsed chunk totals to the state manager so embedding estimates are not double-extrapolated", async () => {
 		mocks.statHashService.run.mockReset()
 		mocks.statHashService.run.mockResolvedValueOnce({

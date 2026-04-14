@@ -277,4 +277,42 @@ describe("StatHashService", () => {
 			false,
 		)
 	})
+
+	it("processes stat/hash work with bounded concurrency while preserving revision creation", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue(
+			Array.from({ length: 12 }, (_, index) => ({
+				fileId: `file-${index + 1}`,
+				relativePath: `src/file-${index + 1}.ts`,
+				normalizedPath: `/workspace/src/file-${index + 1}.ts`,
+				lastSeenSize: 10,
+				lastSeenMtimeMs: 20 + index,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+				latestRevisionParserVersion: null,
+				latestRevisionChunkerVersion: null,
+			})),
+		)
+
+		let inFlightReads = 0
+		let peakInFlightReads = 0
+		workspaceAdapter.readFile.mockImplementation(async (filePath: string) => {
+			inFlightReads++
+			peakInFlightReads = Math.max(peakInFlightReads, inFlightReads)
+			await new Promise((resolve) => setTimeout(resolve, 5))
+			inFlightReads--
+			return `content for ${filePath}`
+		})
+		metadataStore.findReusableRevision.mockResolvedValue(undefined)
+
+		const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+		const summary = await service.run("run-1")
+
+		expect(summary.checkedFiles).toBe(12)
+		expect(summary.changedFiles).toBe(12)
+		expect(metadataStore.createFileRevision).toHaveBeenCalledTimes(12)
+		expect(peakInFlightReads).toBeGreaterThan(1)
+		expect(peakInFlightReads).toBeLessThanOrEqual(8)
+	})
 })

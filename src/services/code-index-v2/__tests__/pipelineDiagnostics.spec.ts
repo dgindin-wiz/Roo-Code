@@ -10,9 +10,8 @@ describe("pipelineDiagnostics", () => {
 					parsedRevisions: 2,
 					queuedUpsertJobs: 0,
 					runningUpsertJobs: 0,
-					stagedChunks: 12,
 				},
-				stagedChunkHighWatermark: 1200,
+				stagedChunkLowWatermark: 300,
 			}),
 		).toBe(true)
 
@@ -23,9 +22,8 @@ describe("pipelineDiagnostics", () => {
 					parsedRevisions: 2,
 					queuedUpsertJobs: 3,
 					runningUpsertJobs: 0,
-					stagedChunks: 12,
 				},
-				stagedChunkHighWatermark: 1200,
+				stagedChunkLowWatermark: 3,
 			}),
 		).toBe(false)
 
@@ -34,16 +32,15 @@ describe("pipelineDiagnostics", () => {
 				embedPhaseStarted: true,
 				metrics: {
 					parsedRevisions: 2,
-					queuedUpsertJobs: 0,
-					runningUpsertJobs: 0,
-					stagedChunks: 1_200,
+					queuedUpsertJobs: 200,
+					runningUpsertJobs: 100,
 				},
-				stagedChunkHighWatermark: 1200,
+				stagedChunkLowWatermark: 300,
 			}),
 		).toBe(false)
 	})
 
-	it("builds backlog samples with backlog and embed-correlation fields for workspace logs", () => {
+	it("builds backlog samples with parsed and runnable backlog fields for workspace logs", () => {
 		const sample = buildPipelineBacklogSample({
 			engine: "code-index-v2",
 			runId: "run-1",
@@ -60,7 +57,7 @@ describe("pipelineDiagnostics", () => {
 				blockingReason: "parsed_revisions_waiting_for_planning",
 			},
 			parseSchedulingThrottled: false,
-			embedQueueDepth: 10,
+			plannerRefillPasses: 4,
 			latestSyncTelemetry: {
 				activeLaneCount: 1,
 				inFlightChunkCount: 4,
@@ -89,7 +86,10 @@ describe("pipelineDiagnostics", () => {
 				runningUpsertJobs: 1,
 				blockingReason: "parsed_revisions_waiting_for_planning",
 				parseSchedulingThrottled: false,
-				embedQueueDepth: 10,
+				parsedChunkBacklog: 5,
+				runnableEmbedQueueDepth: 5,
+				totalVectorBacklog: 10,
+				plannerRefillPasses: 4,
 				activeLaneCount: 1,
 				inFlightChunkCount: 4,
 				laneOccupancyPercent: 47,
