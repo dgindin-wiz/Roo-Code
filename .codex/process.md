@@ -184,6 +184,10 @@ That plan should contain:
 
 This can live in the Issue body or be linked from it, but the Issue must reflect the current plan state.
 
+Local issue-body draft files may be used as temporary authoring helpers when needed, but they are optional and non-canonical.
+Do not create `.codex/work-items/...` or similar local mirror files by default.
+The GitHub Issue body remains the canonical current truth.
+
 When creating or converting an operational work item, use:
 
 - `.codex/templates/operational-issue-body.md`
