@@ -1,6 +1,6 @@
 ## Draft PR opened
 
-**PR** #<number> <link if useful>
+**PR** #<number>
 
 **Canonical repo**
 <owner/name>
