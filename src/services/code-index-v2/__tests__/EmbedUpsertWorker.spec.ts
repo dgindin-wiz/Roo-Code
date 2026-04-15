@@ -813,9 +813,14 @@ describe("EmbedUpsertWorker", () => {
 		})
 		embeddingAdapter.createEmbeddings.mockResolvedValue({ embeddings: [[0.1, 0.2, 0.3]] })
 		const logSpy = vi.spyOn(IndexDebugLoggerV2, "log").mockImplementation(() => {})
+		const progressPhases: string[] = []
 
 		const worker = new EmbedUpsertWorker(metadataStore as any, embeddingAdapter as any, vectorStore as any)
-		const summary = await worker.run("run-1")
+		const summary = await worker.run("run-1", undefined, (progress) => {
+			if (progress.workerPhase) {
+				progressPhases.push(progress.workerPhase)
+			}
+		})
 
 		expect(sequence).toEqual(["finalize:32", "claim-after-burst", "finalize:8"])
 		expect(metadataStore.finalizeReadyRevisionsBatch).toHaveBeenCalledTimes(2)
@@ -833,6 +838,8 @@ describe("EmbedUpsertWorker", () => {
 		expect(summary.committedRevisions).toBe(40)
 		expect(summary.readyRevisionCount).toBe(8)
 		expect(summary.activationBurstLatencyMs).toBe(40)
+		expect(progressPhases).toContain("activation")
+		expect(progressPhases.some((phase) => phase === "claiming" || phase === "embedding")).toBe(true)
 	})
 
 	it("processes upsert batches with bounded concurrency and tracks in-flight counts", async () => {

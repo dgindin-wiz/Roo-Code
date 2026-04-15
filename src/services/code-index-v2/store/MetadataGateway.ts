@@ -77,6 +77,7 @@ type MetadataGatewayMethods = Pick<
 	| "upsertFileRecords"
 	| "appendRunSample"
 	| "checkpointWal"
+	| "performMaintenance"
 	| "writeRunSummary"
 >
 

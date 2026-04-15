@@ -13,6 +13,7 @@ export type ChunkVariantType = "raw_code" | "summary" | "symbol_signature"
 export type ChunkVariantState = ChunkState
 
 export type JobState = "queued" | "running" | "done" | "abandoned" | "terminal_failed"
+export type EmbedWorkerPhase = "embedding" | "activation" | "claiming" | "delete" | "waiting_retry" | "idle"
 
 export type IndexRunState = "started" | "discovery_complete" | "complete" | "failed" | "stopped"
 export type OversizedTrackingStatus = "skipped" | "needs_reapproval" | "approved" | "eligible" | "missing"
@@ -380,6 +381,13 @@ export interface IndexRunSummaryInput extends IndexRunTelemetryIdentity {
 	embedSidecarRssMB?: number | null
 	metadataSidecarRssMB?: number | null
 	metadataSidecarCpuPercent?: number | null
+	metadataSidecarHeapUsedMB?: number | null
+	metadataSidecarExternalMB?: number | null
+	metadataSidecarArrayBuffersMB?: number | null
+	metadataDbBytes?: number | null
+	metadataWalBytes?: number | null
+	telemetryDbBytes?: number | null
+	telemetryWalBytes?: number | null
 	gpuSampler?: string | null
 	gpuUtilizationPercent?: number | null
 	gpuMemoryPressurePercent?: number | null
@@ -413,6 +421,7 @@ export interface IndexRunSampleInput {
 	pressureReasons?: string[] | null
 	laneConcurrency?: number | null
 	effectiveBatchSize?: number | null
+	workerPhase?: EmbedWorkerPhase | null
 	activeLaneCount?: number | null
 	inFlightChunkCount?: number | null
 	peakInFlightChunkCount?: number | null
@@ -449,6 +458,13 @@ export interface IndexRunSampleInput {
 	embedSidecarRssMB?: number | null
 	metadataSidecarRssMB?: number | null
 	metadataSidecarCpuPercent?: number | null
+	metadataSidecarHeapUsedMB?: number | null
+	metadataSidecarExternalMB?: number | null
+	metadataSidecarArrayBuffersMB?: number | null
+	metadataDbBytes?: number | null
+	metadataWalBytes?: number | null
+	telemetryDbBytes?: number | null
+	telemetryWalBytes?: number | null
 	gpuSampler?: string | null
 	gpuUtilizationPercent?: number | null
 	gpuMemoryPressurePercent?: number | null
@@ -460,6 +476,27 @@ export interface IndexRunSampleInput {
 
 export interface IndexRunSampleRecord extends IndexRunSampleInput {
 	sampleId: string
+}
+
+export interface MetadataMaintenanceSummary {
+	checkpointMode: "PASSIVE" | "RESTART" | "TRUNCATE"
+	shrinkMemory: boolean
+	operationalDbBytes: number
+	operationalWalBytes: number
+	telemetryDbBytes: number
+	telemetryWalBytes: number
+	memoryBefore: {
+		rssMB: number
+		heapUsedMB: number
+		externalMB: number
+		arrayBuffersMB: number
+	}
+	memoryAfter: {
+		rssMB: number
+		heapUsedMB: number
+		externalMB: number
+		arrayBuffersMB: number
+	}
 }
 
 export interface PlannedRevisionResolution {

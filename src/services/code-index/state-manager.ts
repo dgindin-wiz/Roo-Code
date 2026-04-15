@@ -1234,6 +1234,15 @@ export class CodeIndexStateManager {
 					state: service.state,
 					health: service.health,
 					issueCount: service.issueCount ?? 0,
+					detail: service.detail ?? null,
+					progressCurrent: service.progressCurrent ?? null,
+					progressTotal: service.progressTotal ?? null,
+					progressPercent: service.progressPercent ?? null,
+					metrics: (service.metrics ?? []).map((metric) => ({
+						key: metric.key,
+						value: metric.value,
+						tone: metric.tone ?? null,
+					})),
 				})),
 			},
 		})

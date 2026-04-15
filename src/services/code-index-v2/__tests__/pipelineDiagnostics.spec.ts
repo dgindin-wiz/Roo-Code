@@ -61,10 +61,10 @@ describe("pipelineDiagnostics", () => {
 				runningDeleteJobs: 0,
 				blockingReason: "parsed_revisions_waiting_for_planning",
 			},
-			parseSchedulingThrottled: false,
-			parseThrottleReason: null,
+			parseThrottleState: null,
 			plannerRefillPasses: 4,
 			latestSyncTelemetry: {
+				workerPhase: "activation",
 				activeLaneCount: 1,
 				inFlightChunkCount: 4,
 				laneOccupancyPercent: 47,
@@ -101,6 +101,7 @@ describe("pipelineDiagnostics", () => {
 				runnableEmbedQueueDepth: 5,
 				totalVectorBacklog: 10,
 				plannerRefillPasses: 4,
+				workerPhase: "activation",
 				activeLaneCount: 1,
 				inFlightChunkCount: 4,
 				laneOccupancyPercent: 47,
@@ -117,6 +118,29 @@ describe("pipelineDiagnostics", () => {
 				lastHostFinalizeLatencyMs: 3_000,
 			}),
 		)
+	})
+
+	it("derives throttled state solely from parseThrottleState", () => {
+		const sample = buildPipelineBacklogSample({
+			engine: "code-index-v2",
+			runId: "run-2",
+			workspacePath: "/workspace",
+			stage: "planner",
+			metrics: {
+				parsedRevisions: 4,
+				plannedRevisions: 0,
+				stagedChunks: 320,
+				queuedUpsertJobs: 0,
+				runningUpsertJobs: 0,
+				queuedDeleteJobs: 0,
+				runningDeleteJobs: 0,
+				blockingReason: "parsed_revisions_waiting_for_planning",
+			},
+			parseThrottleState: { reason: "planner_starvation_guard" },
+		})
+
+		expect(sample.parseSchedulingThrottled).toBe(true)
+		expect(sample.parseThrottleReason).toBe("planner_starvation_guard")
 	})
 
 	it("returns a planner starvation throttle reason when runnable embed work is empty but parsed backlog is ready", () => {

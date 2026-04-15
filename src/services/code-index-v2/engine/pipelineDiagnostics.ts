@@ -11,8 +11,12 @@ export interface PipelineBacklogMetricsLike {
 }
 
 export type ParseThrottleReason = "high_watermark" | "planner_starvation_guard"
+export interface ParseThrottleState {
+	reason: ParseThrottleReason
+}
 
 export interface PipelineEmbedTelemetryLike {
+	workerPhase?: string
 	activeLaneCount?: number
 	inFlightChunkCount?: number
 	laneOccupancyPercent?: number
@@ -102,8 +106,7 @@ export function buildPipelineBacklogSample(input: {
 	workspacePath: string
 	stage: string
 	metrics: PipelineBacklogMetricsLike
-	parseSchedulingThrottled: boolean
-	parseThrottleReason?: "high_watermark" | "planner_starvation_guard" | null
+	parseThrottleState?: ParseThrottleState | null
 	plannerRefillPasses?: number
 	latestSyncTelemetry?: PipelineEmbedTelemetryLike
 }) {
@@ -124,12 +127,13 @@ export function buildPipelineBacklogSample(input: {
 		queuedDeleteJobs: input.metrics.queuedDeleteJobs,
 		runningDeleteJobs: input.metrics.runningDeleteJobs,
 		blockingReason: input.metrics.blockingReason,
-		parseSchedulingThrottled: input.parseSchedulingThrottled,
-		parseThrottleReason: input.parseThrottleReason ?? null,
+		parseSchedulingThrottled: Boolean(input.parseThrottleState),
+		parseThrottleReason: input.parseThrottleState?.reason ?? null,
 		parsedChunkBacklog,
 		runnableEmbedQueueDepth,
 		totalVectorBacklog,
 		plannerRefillPasses: input.plannerRefillPasses,
+		workerPhase: input.latestSyncTelemetry?.workerPhase,
 		activeLaneCount: input.latestSyncTelemetry?.activeLaneCount,
 		inFlightChunkCount: input.latestSyncTelemetry?.inFlightChunkCount,
 		laneOccupancyPercent: input.latestSyncTelemetry?.laneOccupancyPercent,

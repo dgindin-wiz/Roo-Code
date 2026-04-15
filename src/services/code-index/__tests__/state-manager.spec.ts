@@ -370,6 +370,48 @@ describe("CodeIndexStateManager", () => {
 			stateManager.resetIndexingState()
 			expect(stateManager.getCurrentStatus().pipeline).toBeUndefined()
 		})
+
+		it("treats V2 service-card progress and metric changes as semantic updates", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "vector_sync",
+						title: "Vector sync",
+						state: "running",
+						health: "healthy",
+						summary: "Syncing vectors to Qdrant",
+						detail: "10 chunks synced",
+						progressCurrent: 10,
+						progressTotal: 100,
+						progressUnit: "chunks",
+						progressPercent: 10,
+						metrics: [{ key: "throughput", label: "Synced/sec", value: "10 chunks/sec" }],
+					},
+				],
+			})
+
+			const fireSpy = vi.spyOn((stateManager as any)._progressEmitter, "fire")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "vector_sync",
+						title: "Vector sync",
+						state: "running",
+						health: "healthy",
+						summary: "Syncing vectors to Qdrant",
+						detail: "11 chunks synced",
+						progressCurrent: 11,
+						progressTotal: 100,
+						progressUnit: "chunks",
+						progressPercent: 11,
+						metrics: [{ key: "throughput", label: "Synced/sec", value: "11 chunks/sec" }],
+					},
+				],
+			})
+
+			expect(fireSpy).toHaveBeenCalled()
+		})
 	})
 
 	describe("reportScanProgress", () => {

@@ -10,7 +10,7 @@ import {
 	type EmbedUpsertExecutionResult,
 } from "./EmbedUpsertExecution"
 import type { MetadataGateway } from "../store/MetadataGateway"
-import type { PlannedRevisionResolution, ReadyRevisionResolution } from "../store/types"
+import type { EmbedWorkerPhase, PlannedRevisionResolution, ReadyRevisionResolution } from "../store/types"
 import {
 	getConfiguredEmbeddingBatchSize,
 	getConfiguredEmbeddingLaneConcurrency,
@@ -53,6 +53,7 @@ export interface EmbedUpsertSummary {
 	peakEmbeddingCount?: number
 	pressureState?: EmbedPressureState
 	effectiveBatchSize?: number
+	workerPhase?: EmbedWorkerPhase
 	pressureReasons?: EmbedPressureReason[]
 	pressureSoftTransitions?: number
 	pressureHardTransitions?: number
@@ -123,6 +124,7 @@ export interface EmbedUpsertProgress {
 	peakEmbeddingCount?: number
 	pressureState?: EmbedPressureState
 	effectiveBatchSize?: number
+	workerPhase?: EmbedWorkerPhase
 	pressureReasons?: EmbedPressureReason[]
 	pressureSoftTransitions?: number
 	pressureHardTransitions?: number
@@ -254,6 +256,7 @@ export class EmbedUpsertWorker {
 	private inFlightChunkCount = 0
 	private peakInFlightChunkCount = 0
 	private completedBatchCount = 0
+	private workerPhase: EmbedWorkerPhase = "idle"
 	private readonly leaseOwner = `embed-worker:${process.pid}:${Math.random().toString(16).slice(2)}`
 	private readonly workspacePath: string | undefined
 
@@ -299,6 +302,10 @@ export class EmbedUpsertWorker {
 
 	async dispose(): Promise<void> {
 		await this.upsertExecutor?.dispose?.()
+	}
+
+	private setWorkerPhase(nextPhase: EmbedWorkerPhase) {
+		this.workerPhase = nextPhase
 	}
 
 	private static getMaxInFlightChunks(
@@ -403,6 +410,7 @@ export class EmbedUpsertWorker {
 		this.inFlightChunkCount = 0
 		this.peakInFlightChunkCount = 0
 		this.completedBatchCount = 0
+		this.workerPhase = "idle"
 
 		const updatePressureDurations = (now = Date.now()) => {
 			const elapsed = Math.max(now - lastPressureDurationAt, 0)
@@ -632,6 +640,7 @@ export class EmbedUpsertWorker {
 				workspacePath: this.workspacePath,
 				provider: this.embeddingAdapter.provider,
 				modelId: this.embeddingAdapter.modelId,
+				workerPhase: this.workerPhase,
 				laneConcurrency: effectiveLaneConcurrency,
 				activeLaneCount: this.activeLaneCount,
 				inFlightChunkCount: this.inFlightChunkCount,
@@ -868,6 +877,7 @@ export class EmbedUpsertWorker {
 				batchesCompleted,
 				laneConcurrency: effectiveLaneConcurrency,
 				effectiveBatchSize,
+				workerPhase: this.workerPhase,
 				pressureState,
 				pressureReasons: reasons,
 				pressureSoftTransitions,
@@ -935,6 +945,7 @@ export class EmbedUpsertWorker {
 					workspacePath: this.workspacePath,
 					provider: this.embeddingAdapter.provider,
 					modelId: this.embeddingAdapter.modelId,
+					workerPhase: this.workerPhase,
 					batchKind: batchTelemetry.batchKind,
 					laneId: batchTelemetry.laneId,
 					laneConcurrency: effectiveLaneConcurrency,
@@ -1149,6 +1160,7 @@ export class EmbedUpsertWorker {
 				return false
 			}
 
+			this.setWorkerPhase("activation")
 			const finalizeBatch = (
 				this.metadataStore as MetadataGateway & {
 					finalizeReadyRevisionsBatch?: (input: {
@@ -1249,10 +1261,13 @@ export class EmbedUpsertWorker {
 				throw new Error("Embed/upsert worker aborted")
 			}
 
+			this.setWorkerPhase("delete")
 			const deleteJobs = await claimJobs("delete", this.batchSize)
 			if (deleteJobs.length === 0) {
+				this.setWorkerPhase("waiting_retry")
 				const nextRetryAt = await this.metadataStore.getNextRetryAt("delete", runId)
 				if (nextRetryAt === undefined) {
+					this.setWorkerPhase("idle")
 					break
 				}
 				await this.waitForNextRetry(nextRetryAt, signal)
@@ -1274,12 +1289,14 @@ export class EmbedUpsertWorker {
 			} finally {
 				this.activeLaneCount = 0
 				this.inFlightChunkCount = 0
+				this.setWorkerPhase("idle")
 			}
 		}
 
 		while (await finalizeReadyRevisionBurst()) {
 			// Keep draining any remaining activation backlog before final summary logging.
 		}
+		this.setWorkerPhase("idle")
 		updatePressureDurations()
 		const finalUtilizationMetrics = computeWorkerUtilizationMetrics()
 
@@ -1300,6 +1317,7 @@ export class EmbedUpsertWorker {
 			batchesCompleted,
 			laneConcurrency: effectiveLaneConcurrency,
 			effectiveBatchSize,
+			workerPhase: this.workerPhase,
 			pressureState,
 			pressureReasons: latestPressureReasons,
 			pressureSoftTransitions,
@@ -1366,6 +1384,7 @@ export class EmbedUpsertWorker {
 			batchesCompleted,
 			laneConcurrency: effectiveLaneConcurrency,
 			effectiveBatchSize,
+			workerPhase: this.workerPhase,
 			pressureState,
 			pressureReasons: latestPressureReasons,
 			pressureSoftTransitions,
@@ -1497,6 +1516,7 @@ export class EmbedUpsertWorker {
 			this.inFlightChunkCount += upsertJobs.length
 			this.peakInFlightChunkCount = Math.max(this.peakInFlightChunkCount, this.inFlightChunkCount)
 			let trackedClaimCount = upsertJobs.length
+			this.setWorkerPhase("embedding")
 
 			const task = (async () => {
 				try {
@@ -1517,6 +1537,9 @@ export class EmbedUpsertWorker {
 				} finally {
 					this.activeLaneCount = Math.max(0, this.activeLaneCount - 1)
 					this.inFlightChunkCount = Math.max(0, this.inFlightChunkCount - trackedClaimCount)
+					if (this.activeLaneCount === 0 && this.inFlightChunkCount === 0) {
+						this.setWorkerPhase("idle")
+					}
 				}
 			})()
 
@@ -1529,6 +1552,7 @@ export class EmbedUpsertWorker {
 			const recyclePending = callbacks.shouldRecycleClients() || this.completedBatchCount >= nextRecycleAtBatch
 
 			while (!recyclePending && activeTasks.size < callbacks.getLaneConcurrency()) {
+				this.setWorkerPhase("claiming")
 				const launched = await launchNextBatch()
 				if (launched === "capacity") {
 					callbacks.recordWaitForInFlightCapacity(EmbedUpsertWorker.WAIT_ACCUMULATION_MS)
@@ -1539,6 +1563,7 @@ export class EmbedUpsertWorker {
 			}
 
 			if (recyclePending) {
+				this.setWorkerPhase("waiting_retry")
 				const recycleStartedAt = Date.now()
 				const recycleReason =
 					this.completedBatchCount >= nextRecycleAtBatch ? "interval" : callbacks.consumeRecycleRequest()
@@ -1554,17 +1579,21 @@ export class EmbedUpsertWorker {
 			}
 
 			if (activeTasks.size === 0) {
+				this.setWorkerPhase("activation")
 				if (await callbacks.finalizeReadyRevisionBurst()) {
 					continue
 				}
+				this.setWorkerPhase("waiting_retry")
 				const nextRetryAt = await this.metadataStore.getNextRetryAt("upsert", runId)
 				if (nextRetryAt === undefined) {
+					this.setWorkerPhase("idle")
 					break
 				}
 				await this.waitForNextRetry(nextRetryAt, signal)
 				continue
 			}
 
+			this.setWorkerPhase("embedding")
 			await Promise.race(Array.from(activeTasks))
 		}
 	}
