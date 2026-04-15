@@ -3389,6 +3389,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						averageGpuInUseBytes?: number
 						peakGpuInUseBytes?: number
 						gpuSampleCount?: number
+						activationBurstLatencyMs?: number
+						readyRevisionCount?: number
+						activatedChunkCount?: number
+						supersededChunkCount?: number
 						activeLaneCount?: number
 						inFlightChunkCount?: number
 						gpu?: CodeIndexV2GpuSnapshot | null
@@ -3612,6 +3616,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 									? this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
 											parseThrottled: parseSchedulingThrottled,
 											parseThrottleReason,
+											activationCatchUp:
+												latestBacklogMetrics.plannedRevisions > 0 &&
+												this.getRunnableEmbedQueueDepth(latestBacklogMetrics) === 0 &&
+												(latestSyncTelemetry?.readyRevisionCount ?? 0) > 0,
 										})
 									: `${latestBacklogMetrics.stagedChunks.toLocaleString()} staged chunks`,
 								progressCurrent: Math.max(
@@ -3755,6 +3763,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 									? this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
 											parseThrottled: parseSchedulingThrottled,
 											parseThrottleReason,
+											activationCatchUp:
+												latestBacklogMetrics.plannedRevisions > 0 &&
+												this.getRunnableEmbedQueueDepth(latestBacklogMetrics) === 0 &&
+												(latestSyncTelemetry?.readyRevisionCount ?? 0) > 0,
 										})
 									: `${syncedChunksCompleted.toLocaleString()} chunks synced`,
 								progressCurrent: Math.max(syncedChunksCompleted, 0),
@@ -4108,6 +4120,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				const blockingReasonText = this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
 					parseThrottled: parseSchedulingThrottled,
 					parseThrottleReason,
+					activationCatchUp:
+						latestBacklogMetrics.plannedRevisions > 0 &&
+						this.getRunnableEmbedQueueDepth(latestBacklogMetrics) === 0 &&
+						(latestSyncTelemetry?.readyRevisionCount ?? 0) > 0,
 				})
 				const throttleSuffix = parseSchedulingThrottled
 					? ` • ${blockingReasonText ?? `Parse throttled while ${latestBacklogMetrics.stagedChunks.toLocaleString()} parsed chunks and ${this.getRunnableEmbedQueueDepth(latestBacklogMetrics).toLocaleString()} runnable vector jobs drain`}`
@@ -4195,6 +4211,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						averageGpuInUseBytes,
 						peakGpuInUseBytes,
 						gpuSampleCount,
+						activationBurstLatencyMs,
+						readyRevisionCount,
+						activatedChunkCount,
+						supersededChunkCount,
 						activeLaneCount,
 						inFlightChunkCount,
 						gpu,
@@ -4247,6 +4267,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 							averageGpuInUseBytes,
 							peakGpuInUseBytes,
 							gpuSampleCount,
+							activationBurstLatencyMs,
+							readyRevisionCount,
+							activatedChunkCount,
+							supersededChunkCount,
 							activeLaneCount,
 							inFlightChunkCount,
 							gpu,
@@ -4815,6 +4839,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		options?: {
 			parseThrottled?: boolean
 			parseThrottleReason?: "high_watermark" | "planner_starvation_guard" | null
+			activationCatchUp?: boolean
 		},
 	): string | undefined {
 		if (!blockingReason || blockingReason === "idle") {
@@ -4838,6 +4863,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 		if (normalized === "parse_throttled:parsed_revisions_waiting_for_planning") {
 			return "Parsing is temporarily throttled while the planner catches up."
+		}
+		if (options?.activationCatchUp && normalized === "parsed_revisions_waiting_for_planning") {
+			return "Revision activation is catching up before more vector sync work starts."
 		}
 
 		switch (normalized) {

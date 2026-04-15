@@ -19,6 +19,10 @@ export interface PipelineEmbedTelemetryLike {
 	embedActivePercent?: number
 	chunksPerSecond?: number
 	pressureState?: string
+	activationBurstLatencyMs?: number
+	readyRevisionCount?: number
+	activatedChunkCount?: number
+	supersededChunkCount?: number
 	averagePressureLatencyMs?: number
 	averageHostFinalizeLatencyMs?: number
 	lastPressureLatencyMs?: number
@@ -132,6 +136,10 @@ export function buildPipelineBacklogSample(input: {
 		embedActivePercent: input.latestSyncTelemetry?.embedActivePercent,
 		chunksPerSecond: input.latestSyncTelemetry?.chunksPerSecond,
 		pressureState: input.latestSyncTelemetry?.pressureState,
+		activationBurstLatencyMs: input.latestSyncTelemetry?.activationBurstLatencyMs,
+		readyRevisionCount: input.latestSyncTelemetry?.readyRevisionCount,
+		activatedChunkCount: input.latestSyncTelemetry?.activatedChunkCount,
+		supersededChunkCount: input.latestSyncTelemetry?.supersededChunkCount,
 		averagePressureLatencyMs: input.latestSyncTelemetry?.averagePressureLatencyMs,
 		averageHostFinalizeLatencyMs: input.latestSyncTelemetry?.averageHostFinalizeLatencyMs,
 		lastPressureLatencyMs: input.latestSyncTelemetry?.lastPressureLatencyMs,

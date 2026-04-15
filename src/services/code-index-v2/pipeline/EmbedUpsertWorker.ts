@@ -10,6 +10,7 @@ import {
 	type EmbedUpsertExecutionResult,
 } from "./EmbedUpsertExecution"
 import { MetadataStore } from "../store/MetadataStore"
+import type { PlannedRevisionResolution, ReadyRevisionResolution } from "../store/types"
 import {
 	getConfiguredEmbeddingBatchSize,
 	getConfiguredEmbeddingLaneConcurrency,
@@ -74,6 +75,10 @@ export interface EmbedUpsertSummary {
 	averageGpuInUseBytes?: number
 	peakGpuInUseBytes?: number
 	gpuSampleCount?: number
+	activationBurstLatencyMs?: number
+	readyRevisionCount?: number
+	activatedChunkCount?: number
+	supersededChunkCount?: number
 	gpu?: CodeIndexV2GpuSnapshot | null
 }
 
@@ -140,6 +145,10 @@ export interface EmbedUpsertProgress {
 	averageGpuInUseBytes?: number
 	peakGpuInUseBytes?: number
 	gpuSampleCount?: number
+	activationBurstLatencyMs?: number
+	readyRevisionCount?: number
+	activatedChunkCount?: number
+	supersededChunkCount?: number
 	gpu?: CodeIndexV2GpuSnapshot | null
 }
 
@@ -225,6 +234,7 @@ export class EmbedUpsertWorker {
 	private static readonly SOFT_PRESSURE_MAX_IN_FLIGHT_CHUNKS = 200
 	private static readonly HARD_PRESSURE_MAX_IN_FLIGHT_CHUNKS = 40
 	private static readonly WAIT_ACCUMULATION_MS = 250
+	private static readonly ACTIVATION_BURST_LIMIT = 32
 	private static readonly LOCAL_LANE_RAMP_GPU_TARGET_PERCENT = 82
 	private static readonly LOCAL_LANE_RAMP_REQUIRED_WINDOWS = 3
 	private static readonly LOCAL_LANE_RAMP_COOLDOWN_WINDOWS = 2
@@ -372,6 +382,10 @@ export class EmbedUpsertWorker {
 		let peakGpuUtilizationPercent = 0
 		let totalGpuInUseBytes = 0
 		let peakGpuInUseBytes = 0
+		let activationBurstLatencyMs: number | undefined
+		let readyRevisionCount: number | undefined
+		let activatedChunkCount: number | undefined
+		let supersededChunkCount: number | undefined
 		let localLaneRampHeadroomWindows = 0
 		let localLaneRampCooldownWindows = 0
 		let lastLaneRampExternalMB: number | undefined
@@ -902,6 +916,10 @@ export class EmbedUpsertWorker {
 				averageGpuInUseBytes: utilizationMetrics.averageGpuInUseBytes,
 				peakGpuInUseBytes: utilizationMetrics.peakGpuInUseBytes,
 				gpuSampleCount: utilizationMetrics.gpuSampleCount,
+				activationBurstLatencyMs,
+				readyRevisionCount,
+				activatedChunkCount,
+				supersededChunkCount,
 				gpu: latestGpuSample,
 			})
 
@@ -1002,6 +1020,183 @@ export class EmbedUpsertWorker {
 			void emitProgress()
 		}
 
+		const listPlannedRevisionResolutions = async (): Promise<PlannedRevisionResolution[]> => {
+			const listViaStore = await (
+				this.metadataStore as MetadataStore & {
+					listPlannedRevisionResolutions?: (runId: string) => Promise<PlannedRevisionResolution[]>
+				}
+			).listPlannedRevisionResolutions?.(runId)
+			if (listViaStore) {
+				return listViaStore
+			}
+
+			const revisions = await this.metadataStore.getRevisionsByState(
+				this.metadataStore.getWorkspaceId(),
+				"planned",
+			)
+			return Promise.all(
+				revisions
+					.filter((revision) => revision.runId === runId)
+					.map(async (revision) => ({
+						revisionId: revision.revisionId,
+						fileId: revision.fileId,
+						previousRevisionId:
+							(await this.metadataStore.getDiffBaselineRevision(revision.fileId, revision.revisionId))
+								?.revisionId ?? null,
+						...(await this.metadataStore.getRevisionJobResolution(revision.revisionId, runId, "upsert")),
+					})),
+			)
+		}
+
+		const buildReadyRevisionResolution = (
+			resolution: PlannedRevisionResolution,
+		): ReadyRevisionResolution | undefined => {
+			if (resolution.queuedJobs > 0 || resolution.runningJobs > 0) {
+				return undefined
+			}
+
+			if (resolution.terminalFailedJobs === 0) {
+				return {
+					revisionId: resolution.revisionId,
+					fileId: resolution.fileId,
+					previousRevisionId: resolution.previousRevisionId,
+					disposition: "committed",
+					failureReason: null,
+				}
+			}
+
+			if (resolution.doneJobs > 0 || resolution.totalJobs === 0) {
+				return {
+					revisionId: resolution.revisionId,
+					fileId: resolution.fileId,
+					previousRevisionId: resolution.previousRevisionId,
+					disposition: "degraded",
+					failureReason: `${resolution.terminalFailedJobs} chunk jobs failed permanently during embedding.`,
+				}
+			}
+
+			return {
+				revisionId: resolution.revisionId,
+				fileId: resolution.fileId,
+				previousRevisionId: resolution.previousRevisionId,
+				disposition: "terminal_failed",
+				failureReason: `${resolution.terminalFailedJobs} chunk jobs failed permanently before any vectors were stored.`,
+			}
+		}
+
+		const finalizeReadyRevisionBurstFallback = async (resolutions: ReadyRevisionResolution[]) => {
+			const startedAt = Date.now()
+			let fallbackCommittedRevisions = 0
+			let fallbackDegradedRevisions = 0
+			let fallbackTerminalFailedRevisions = 0
+			const fallbackSupersededRevisions = new Set<string>()
+
+			for (const resolution of resolutions) {
+				if (resolution.disposition === "committed") {
+					await this.metadataStore.markRevisionCommitted(resolution.revisionId)
+					if (resolution.previousRevisionId) {
+						await this.metadataStore.markRevisionSuperseded(resolution.previousRevisionId)
+						fallbackSupersededRevisions.add(resolution.previousRevisionId)
+					}
+					fallbackCommittedRevisions++
+					continue
+				}
+
+				if (resolution.disposition === "degraded") {
+					await this.metadataStore.markRevisionDegraded(
+						resolution.revisionId,
+						resolution.failureReason ?? "Embedding completed with degraded results.",
+					)
+					if (resolution.previousRevisionId) {
+						await this.metadataStore.markRevisionSuperseded(resolution.previousRevisionId)
+						fallbackSupersededRevisions.add(resolution.previousRevisionId)
+					}
+					fallbackDegradedRevisions++
+					continue
+				}
+
+				await this.metadataStore.markRevisionTerminalFailure(
+					resolution.revisionId,
+					resolution.failureReason ?? "Embedding failed permanently before vectors were stored.",
+				)
+				fallbackTerminalFailedRevisions++
+			}
+
+			return {
+				committedRevisions: fallbackCommittedRevisions,
+				degradedRevisions: fallbackDegradedRevisions,
+				terminalFailedRevisions: fallbackTerminalFailedRevisions,
+				supersededRevisions: fallbackSupersededRevisions.size,
+				activatedChunkCount: 0,
+				supersededChunkCount: 0,
+				lexicalFtsSyncLatencyMs: 0,
+				activationBurstLatencyMs: Date.now() - startedAt,
+			}
+		}
+
+		const finalizeReadyRevisionBurst = async (): Promise<boolean> => {
+			const readyResolutions = (await listPlannedRevisionResolutions())
+				.map((resolution) => buildReadyRevisionResolution(resolution))
+				.filter((resolution): resolution is ReadyRevisionResolution => Boolean(resolution))
+				.slice(0, EmbedUpsertWorker.ACTIVATION_BURST_LIMIT)
+
+			if (readyResolutions.length === 0) {
+				return false
+			}
+
+			const finalizeBatch = (
+				this.metadataStore as MetadataStore & {
+					finalizeReadyRevisionsBatch?: (input: {
+						runId: string
+						resolutions: ReadyRevisionResolution[]
+					}) => Promise<{
+						committedRevisions: number
+						degradedRevisions: number
+						terminalFailedRevisions: number
+						supersededRevisions: number
+						activatedChunkCount: number
+						supersededChunkCount: number
+						lexicalFtsSyncLatencyMs: number
+						activationBurstLatencyMs: number
+					}>
+				}
+			).finalizeReadyRevisionsBatch
+
+			const summary = finalizeBatch
+				? await finalizeBatch.call(this.metadataStore, {
+						runId,
+						resolutions: readyResolutions,
+					})
+				: await finalizeReadyRevisionBurstFallback(readyResolutions)
+
+			committedRevisions += summary.committedRevisions
+			degradedRevisions += summary.degradedRevisions
+			terminalFailedRevisions += summary.terminalFailedRevisions
+			activationBurstLatencyMs = summary.activationBurstLatencyMs
+			readyRevisionCount = readyResolutions.length
+			activatedChunkCount = summary.activatedChunkCount
+			supersededChunkCount = summary.supersededChunkCount
+
+			IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "revision-activation-burst-complete", {
+				component: "EmbedUpsertWorker",
+				runId,
+				workspacePath: this.workspacePath,
+				provider: this.embeddingAdapter.provider,
+				modelId: this.embeddingAdapter.modelId,
+				readyRevisionCount: readyResolutions.length,
+				committedRevisions: summary.committedRevisions,
+				degradedRevisions: summary.degradedRevisions,
+				terminalFailedRevisions: summary.terminalFailedRevisions,
+				supersededRevisions: summary.supersededRevisions,
+				activatedChunkCount: summary.activatedChunkCount,
+				supersededChunkCount: summary.supersededChunkCount,
+				lexicalFtsSyncLatencyMs: summary.lexicalFtsSyncLatencyMs,
+				activationBurstLatencyMs: summary.activationBurstLatencyMs,
+			})
+			await emitProgress()
+			return true
+		}
+
 		await this.processUpsertStage(runId, signal, emitProgress, {
 			onRetryScheduled: () => {
 				retryingChunks++
@@ -1041,6 +1236,7 @@ export class EmbedUpsertWorker {
 				pressureTriggeredRecyclePending = false
 				return recycleReason
 			},
+			finalizeReadyRevisionBurst,
 		})
 
 		for (;;) {
@@ -1076,76 +1272,8 @@ export class EmbedUpsertWorker {
 			}
 		}
 
-		const plannedRevisionResolutions =
-			(await (
-				this.metadataStore as MetadataStore & {
-					listPlannedRevisionResolutions?: (runId: string) => Promise<
-						Array<{
-							revisionId: string
-							fileId: string
-							previousRevisionId: string | null
-							doneJobs: number
-							queuedJobs: number
-							runningJobs: number
-							terminalFailedJobs: number
-							totalJobs: number
-						}>
-					>
-				}
-			).listPlannedRevisionResolutions?.(runId)) ??
-			(await this.metadataStore
-				.getRevisionsByState(this.metadataStore.getWorkspaceId(), "planned")
-				.then(async (revisions) =>
-					Promise.all(
-						revisions
-							.filter((revision) => revision.runId === runId)
-							.map(async (revision) => ({
-								revisionId: revision.revisionId,
-								fileId: revision.fileId,
-								previousRevisionId:
-									(
-										await this.metadataStore.getDiffBaselineRevision(
-											revision.fileId,
-											revision.revisionId,
-										)
-									)?.revisionId ?? null,
-								...(await this.metadataStore.getRevisionJobResolution(
-									revision.revisionId,
-									runId,
-									"upsert",
-								)),
-							})),
-					),
-				))
-
-		for (const resolution of plannedRevisionResolutions) {
-			if (resolution.queuedJobs > 0 || resolution.runningJobs > 0) {
-				continue
-			}
-
-			if (resolution.terminalFailedJobs === 0) {
-				await this.metadataStore.markRevisionCommitted(resolution.revisionId)
-				if (resolution.previousRevisionId) {
-					await this.metadataStore.markRevisionSuperseded(resolution.previousRevisionId)
-				}
-				committedRevisions++
-			} else if (resolution.doneJobs > 0 || resolution.totalJobs === 0) {
-				await this.metadataStore.markRevisionDegraded(
-					resolution.revisionId,
-					`${resolution.terminalFailedJobs} chunk jobs failed permanently during embedding.`,
-				)
-				if (resolution.previousRevisionId) {
-					await this.metadataStore.markRevisionSuperseded(resolution.previousRevisionId)
-				}
-				degradedRevisions++
-			} else {
-				await this.metadataStore.markRevisionTerminalFailure(
-					resolution.revisionId,
-					`${resolution.terminalFailedJobs} chunk jobs failed permanently before any vectors were stored.`,
-				)
-				terminalFailedRevisions++
-			}
-			await emitProgress()
+		while (await finalizeReadyRevisionBurst()) {
+			// Keep draining any remaining activation backlog before final summary logging.
 		}
 		updatePressureDurations()
 		const finalUtilizationMetrics = computeWorkerUtilizationMetrics()
@@ -1214,6 +1342,10 @@ export class EmbedUpsertWorker {
 			averageGpuInUseBytes: finalUtilizationMetrics.averageGpuInUseBytes,
 			peakGpuInUseBytes: finalUtilizationMetrics.peakGpuInUseBytes,
 			gpuSampleCount: finalUtilizationMetrics.gpuSampleCount,
+			activationBurstLatencyMs,
+			readyRevisionCount,
+			activatedChunkCount,
+			supersededChunkCount,
 			gpu: latestGpuSample,
 		})
 
@@ -1276,6 +1408,10 @@ export class EmbedUpsertWorker {
 			averageGpuInUseBytes: finalUtilizationMetrics.averageGpuInUseBytes,
 			peakGpuInUseBytes: finalUtilizationMetrics.peakGpuInUseBytes,
 			gpuSampleCount: finalUtilizationMetrics.gpuSampleCount,
+			activationBurstLatencyMs,
+			readyRevisionCount,
+			activatedChunkCount,
+			supersededChunkCount,
 			gpu: latestGpuSample,
 		}
 	}
@@ -1299,6 +1435,7 @@ export class EmbedUpsertWorker {
 			recordWaitForPressure: (ms: number) => void
 			shouldRecycleClients: () => boolean
 			consumeRecycleRequest: () => "pressure" | "interval"
+			finalizeReadyRevisionBurst: () => Promise<boolean>
 		},
 	): Promise<void> {
 		const activeTasks = new Set<Promise<void>>()
@@ -1412,6 +1549,9 @@ export class EmbedUpsertWorker {
 			}
 
 			if (activeTasks.size === 0) {
+				if (await callbacks.finalizeReadyRevisionBurst()) {
+					continue
+				}
 				const nextRetryAt = await this.metadataStore.getNextRetryAt("upsert", runId)
 				if (nextRetryAt === undefined) {
 					break

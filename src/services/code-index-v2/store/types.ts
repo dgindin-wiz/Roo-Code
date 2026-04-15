@@ -469,6 +469,27 @@ export interface PlannedRevisionResolution {
 	totalJobs: number
 }
 
+export type ReadyRevisionDisposition = "committed" | "degraded" | "terminal_failed"
+
+export interface ReadyRevisionResolution {
+	revisionId: string
+	fileId: string
+	previousRevisionId: string | null
+	disposition: ReadyRevisionDisposition
+	failureReason: string | null
+}
+
+export interface ReadyRevisionFinalizeSummary {
+	committedRevisions: number
+	degradedRevisions: number
+	terminalFailedRevisions: number
+	supersededRevisions: number
+	activatedChunkCount: number
+	supersededChunkCount: number
+	lexicalFtsSyncLatencyMs: number
+	activationBurstLatencyMs: number
+}
+
 export interface RevisionJobResolution {
 	doneJobs: number
 	queuedJobs: number

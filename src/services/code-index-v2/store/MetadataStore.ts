@@ -39,6 +39,8 @@ import {
 	PersistParsedRevisionInput,
 	PersistParsedRevisionResult,
 	PlannedRevisionResolution,
+	ReadyRevisionFinalizeSummary,
+	ReadyRevisionResolution,
 	RevisionQueryOptions,
 	RevisionJobResolution,
 	RevisionWarningDetail,
@@ -1751,6 +1753,179 @@ export class MetadataStore {
 		this.db().prepare(`UPDATE file_revisions SET state = ? WHERE revision_id = ?`).run(state, revisionId)
 	}
 
+	async finalizeReadyRevisionsBatch(input: {
+		runId: string
+		resolutions: ReadyRevisionResolution[]
+	}): Promise<ReadyRevisionFinalizeSummary> {
+		if (input.resolutions.length === 0) {
+			return {
+				committedRevisions: 0,
+				degradedRevisions: 0,
+				terminalFailedRevisions: 0,
+				supersededRevisions: 0,
+				activatedChunkCount: 0,
+				supersededChunkCount: 0,
+				lexicalFtsSyncLatencyMs: 0,
+				activationBurstLatencyMs: 0,
+			}
+		}
+
+		const startedAt = Date.now()
+		const committedResolutions = input.resolutions.filter((resolution) => resolution.disposition === "committed")
+		const degradedResolutions = input.resolutions.filter((resolution) => resolution.disposition === "degraded")
+		const terminalFailedResolutions = input.resolutions.filter(
+			(resolution) => resolution.disposition === "terminal_failed",
+		)
+		const activationTargetsByFile = new Map<string, ReadyRevisionResolution>()
+		for (const resolution of [...committedResolutions, ...degradedResolutions]) {
+			activationTargetsByFile.set(resolution.fileId, resolution)
+		}
+		const activationTargets = Array.from(activationTargetsByFile.values())
+		const activatedRevisionIds = activationTargets.map((resolution) => resolution.revisionId)
+		const activatedChunkCounts = this.getChunkCountsByRevisionIds(activatedRevisionIds)
+		const activatedChunkCount = Array.from(activatedChunkCounts.values()).reduce((sum, count) => sum + count, 0)
+		const activatedRevisionIdSet = new Set(activatedRevisionIds)
+		const supersededRevisionIds = Array.from(
+			new Set(
+				activationTargets
+					.map((resolution) => resolution.previousRevisionId)
+					.filter(
+						(revisionId): revisionId is string =>
+							revisionId != null && !activatedRevisionIdSet.has(revisionId),
+					),
+			),
+		)
+		const supersededChunkCounts = this.getChunkCountsByRevisionIds(supersededRevisionIds)
+		const supersededChunkCount = Array.from(supersededChunkCounts.values()).reduce((sum, count) => sum + count, 0)
+		const now = Date.now()
+		let lexicalFtsSyncLatencyMs = 0
+		let removedLexicalRows = 0
+
+		this.withTransaction(() => {
+			if (committedResolutions.length > 0) {
+				const placeholders = committedResolutions.map(() => "?").join(", ")
+				this.db()
+					.prepare(
+						`UPDATE file_revisions
+						 SET state = 'committed', committed_at = ?, failure_reason = NULL
+						 WHERE revision_id IN (${placeholders})`,
+					)
+					.run(now, ...committedResolutions.map((resolution) => resolution.revisionId))
+			}
+
+			if (degradedResolutions.length > 0) {
+				const failureCase = degradedResolutions.map(() => `WHEN ? THEN ?`).join(" ")
+				const placeholders = degradedResolutions.map(() => "?").join(", ")
+				this.db()
+					.prepare(
+						`UPDATE file_revisions
+						 SET state = 'degraded',
+						 	 committed_at = ?,
+						 	 failure_reason = CASE revision_id ${failureCase} ELSE failure_reason END
+						 WHERE revision_id IN (${placeholders})`,
+					)
+					.run(
+						now,
+						...degradedResolutions.flatMap((resolution) => [
+							resolution.revisionId,
+							resolution.failureReason ?? "Embedding completed with degraded results.",
+						]),
+						...degradedResolutions.map((resolution) => resolution.revisionId),
+					)
+			}
+
+			if (terminalFailedResolutions.length > 0) {
+				const failureCase = terminalFailedResolutions.map(() => `WHEN ? THEN ?`).join(" ")
+				const placeholders = terminalFailedResolutions.map(() => "?").join(", ")
+				this.db()
+					.prepare(
+						`UPDATE file_revisions
+						 SET state = 'terminal_failed',
+						 	 failure_reason = CASE revision_id ${failureCase} ELSE failure_reason END
+						 WHERE revision_id IN (${placeholders})`,
+					)
+					.run(
+						...terminalFailedResolutions.flatMap((resolution) => [
+							resolution.revisionId,
+							resolution.failureReason ?? "Embedding failed permanently before vectors were stored.",
+						]),
+						...terminalFailedResolutions.map((resolution) => resolution.revisionId),
+					)
+			}
+
+			if (activationTargets.length > 0) {
+				const fileCase = activationTargets.map(() => `WHEN ? THEN ?`).join(" ")
+				const filePlaceholders = activationTargets.map(() => "?").join(", ")
+				this.db()
+					.prepare(
+						`UPDATE files
+						 SET active_revision_id = CASE file_id ${fileCase} ELSE active_revision_id END,
+						 	 tombstoned = 0,
+						 	 updated_at = ?
+						 WHERE file_id IN (${filePlaceholders})`,
+					)
+					.run(
+						...activationTargets.flatMap((resolution) => [resolution.fileId, resolution.revisionId]),
+						now,
+						...activationTargets.map((resolution) => resolution.fileId),
+					)
+
+				const lexicalFtsStartedAt = Date.now()
+				this.deleteLexicalFtsForRevisionsInTransaction(activatedRevisionIds)
+				this.insertLexicalFtsForRevisionsInTransaction(activatedRevisionIds)
+				lexicalFtsSyncLatencyMs = Date.now() - lexicalFtsStartedAt
+			}
+
+			if (supersededRevisionIds.length > 0) {
+				const placeholders = supersededRevisionIds.map(() => "?").join(", ")
+				this.db()
+					.prepare(
+						`UPDATE file_revisions
+						 SET state = 'superseded', superseded_at = ?
+						 WHERE revision_id IN (${placeholders})`,
+					)
+					.run(now, ...supersededRevisionIds)
+				removedLexicalRows = this.deleteLexicalFtsForRevisionsInTransaction(supersededRevisionIds)
+			}
+		})
+
+		for (const resolution of activationTargets) {
+			IndexDebugLoggerV2.log("basic", "MetadataStore", "revision-lexical-fts-synced", {
+				component: "MetadataStore",
+				workspacePath: this.workspacePath,
+				runId: input.runId,
+				revisionId: resolution.revisionId,
+				chunkCount: activatedChunkCounts.get(resolution.revisionId) ?? 0,
+				lexicalFtsSyncLatencyMs,
+				revisionState: resolution.disposition,
+			})
+		}
+
+		if (removedLexicalRows > 0) {
+			for (const revisionId of supersededRevisionIds) {
+				IndexDebugLoggerV2.log("basic", "MetadataStore", "revision-lexical-fts-removed", {
+					component: "MetadataStore",
+					workspacePath: this.workspacePath,
+					runId: input.runId,
+					revisionId,
+					removedLexicalRowCount: supersededChunkCounts.get(revisionId) ?? 0,
+					reason: "superseded",
+				})
+			}
+		}
+
+		return {
+			committedRevisions: committedResolutions.length,
+			degradedRevisions: degradedResolutions.length,
+			terminalFailedRevisions: terminalFailedResolutions.length,
+			supersededRevisions: supersededRevisionIds.length,
+			activatedChunkCount,
+			supersededChunkCount,
+			lexicalFtsSyncLatencyMs,
+			activationBurstLatencyMs: Date.now() - startedAt,
+		}
+	}
+
 	async getRevisionsByState(
 		workspaceId: string,
 		state: string,
@@ -3203,41 +3378,12 @@ export class MetadataStore {
 		chunkCount: number
 		lexicalFtsSyncLatencyMs: number
 	} {
-		const chunkCountRow = this.db()
-			.prepare(`SELECT COUNT(*) AS count FROM chunks WHERE revision_id = ?`)
-			.get(revisionId) as { count?: number } | undefined
-		const chunkCount = Number(chunkCountRow?.count ?? 0)
 		const startedAt = Date.now()
+		const chunkCounts = this.getChunkCountsByRevisionIds([revisionId])
+		const chunkCount = chunkCounts.get(revisionId) ?? 0
 
-		this.deleteLexicalFtsForRevisionInTransaction(revisionId)
-
-		if (chunkCount > 0) {
-			this.db()
-				.prepare(
-					`INSERT INTO chunk_lexical_fts (
-						chunk_id,
-						relative_path,
-						symbol_qualified_name,
-						symbol_name,
-						parent_symbol_name,
-						summary,
-						search_text
-					)
-					SELECT
-						c.chunk_id,
-						COALESCE(f.relative_path, ''),
-						COALESCE(c.symbol_qualified_name, ''),
-						COALESCE(c.symbol_name, ''),
-						COALESCE(c.parent_symbol_name, ''),
-						COALESCE(c.summary, ''),
-						COALESCE(c.search_text, '')
-					FROM chunks c
-					INNER JOIN file_revisions fr ON fr.revision_id = c.revision_id
-					INNER JOIN files f ON f.file_id = fr.file_id
-					WHERE c.revision_id = ?`,
-				)
-				.run(revisionId)
-		}
+		this.deleteLexicalFtsForRevisionsInTransaction([revisionId])
+		this.insertLexicalFtsForRevisionsInTransaction([revisionId])
 
 		return {
 			chunkCount,
@@ -3246,18 +3392,74 @@ export class MetadataStore {
 	}
 
 	private deleteLexicalFtsForRevisionInTransaction(revisionId: string): number {
+		return this.deleteLexicalFtsForRevisionsInTransaction([revisionId])
+	}
+
+	private insertLexicalFtsForRevisionsInTransaction(revisionIds: string[]): void {
+		if (revisionIds.length === 0) {
+			return
+		}
+		const placeholders = revisionIds.map(() => "?").join(", ")
+		this.db()
+			.prepare(
+				`INSERT INTO chunk_lexical_fts (
+					chunk_id,
+					relative_path,
+					symbol_qualified_name,
+					symbol_name,
+					parent_symbol_name,
+					summary,
+					search_text
+				)
+				SELECT
+					c.chunk_id,
+					COALESCE(f.relative_path, ''),
+					COALESCE(c.symbol_qualified_name, ''),
+					COALESCE(c.symbol_name, ''),
+					COALESCE(c.parent_symbol_name, ''),
+					COALESCE(c.summary, ''),
+					COALESCE(c.search_text, '')
+				FROM chunks c
+				INNER JOIN file_revisions fr ON fr.revision_id = c.revision_id
+				INNER JOIN files f ON f.file_id = fr.file_id
+				WHERE c.revision_id IN (${placeholders})`,
+			)
+			.run(...revisionIds)
+	}
+
+	private deleteLexicalFtsForRevisionsInTransaction(revisionIds: string[]): number {
+		if (revisionIds.length === 0) {
+			return 0
+		}
+		const placeholders = revisionIds.map(() => "?").join(", ")
 		const result = this.db()
 			.prepare(
 				`DELETE FROM chunk_lexical_fts
 				WHERE chunk_id IN (
 					SELECT chunk_id
 					FROM chunks
-					WHERE revision_id = ?
+					WHERE revision_id IN (${placeholders})
 				)`,
 			)
-			.run(revisionId) as { changes?: number }
+			.run(...revisionIds) as { changes?: number }
 
 		return Number(result.changes ?? 0)
+	}
+
+	private getChunkCountsByRevisionIds(revisionIds: string[]): Map<string, number> {
+		if (revisionIds.length === 0) {
+			return new Map()
+		}
+		const placeholders = revisionIds.map(() => "?").join(", ")
+		const rows = this.db()
+			.prepare(
+				`SELECT revision_id AS revisionId, COUNT(*) AS chunkCount
+				FROM chunks
+				WHERE revision_id IN (${placeholders})
+				GROUP BY revision_id`,
+			)
+			.all(...revisionIds) as Array<{ revisionId: string; chunkCount: number }>
+		return new Map(rows.map((row) => [row.revisionId, Number(row.chunkCount ?? 0)] as const))
 	}
 
 	private getRevisionPathMap(revisionIds: string[]): Map<string, string> {

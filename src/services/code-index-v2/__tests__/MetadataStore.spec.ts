@@ -1668,4 +1668,233 @@ describe("MetadataStore integration", () => {
 
 		await store.dispose()
 	})
+
+	it("finalizes ready revisions in one batch while syncing new lexical rows and removing superseded ones", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-batch-finalize-ready") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-batch-finalize-ready")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const runId = await store.beginRun("batch-finalize-ready")
+		const db = (store as any).db() as {
+			prepare(sql: string): {
+				get(...params: unknown[]): Record<string, unknown> | undefined
+			}
+		}
+
+		const fileA = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/file-a.ts",
+			normalizedPath: path.join(workspacePath, "src/file-a.ts"),
+			lastSeenMtimeMs: 1,
+			lastSeenSize: 10,
+			ignoreState: "included",
+		})
+		const fileB = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/file-b.ts",
+			normalizedPath: path.join(workspacePath, "src/file-b.ts"),
+			lastSeenMtimeMs: 2,
+			lastSeenSize: 20,
+			ignoreState: "included",
+		})
+		const fileC = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/file-c.ts",
+			normalizedPath: path.join(workspacePath, "src/file-c.ts"),
+			lastSeenMtimeMs: 3,
+			lastSeenSize: 30,
+			ignoreState: "included",
+		})
+
+		const previousRevisionA = await store.createFileRevision({
+			fileId: fileA.fileId,
+			runId,
+			contentHash: "previous-a-hash",
+			fastFingerprint: "10:1",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+			state: "parsed",
+		})
+		await store.upsertChunks([
+			{
+				revisionId: previousRevisionA.revisionId,
+				chunkFingerprint: "previous-a-fp",
+				startLine: 1,
+				endLine: 1,
+				content: "export const previousA = true",
+				searchText: "export const previousA = true",
+				contentHash: createHash("sha256").update("export const previousA = true").digest("hex"),
+				state: "parsed",
+			},
+		])
+		await store.markRevisionCommitted(previousRevisionA.revisionId)
+
+		const previousRevisionB = await store.createFileRevision({
+			fileId: fileB.fileId,
+			runId,
+			contentHash: "previous-b-hash",
+			fastFingerprint: "20:2",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+			state: "parsed",
+		})
+		await store.upsertChunks([
+			{
+				revisionId: previousRevisionB.revisionId,
+				chunkFingerprint: "previous-b-fp",
+				startLine: 1,
+				endLine: 1,
+				content: "export const previousB = true",
+				searchText: "export const previousB = true",
+				contentHash: createHash("sha256").update("export const previousB = true").digest("hex"),
+				state: "parsed",
+			},
+		])
+		await store.markRevisionCommitted(previousRevisionB.revisionId)
+
+		const committedRevision = await store.createFileRevision({
+			fileId: fileA.fileId,
+			runId,
+			contentHash: "next-a-hash",
+			fastFingerprint: "11:1",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+			state: "planned",
+		})
+		await store.upsertChunks([
+			{
+				revisionId: committedRevision.revisionId,
+				chunkFingerprint: "next-a-fp",
+				startLine: 1,
+				endLine: 1,
+				content: "export const nextA = true",
+				searchText: "export const nextA = true",
+				contentHash: createHash("sha256").update("export const nextA = true").digest("hex"),
+				state: "parsed",
+			},
+		])
+
+		const degradedRevision = await store.createFileRevision({
+			fileId: fileB.fileId,
+			runId,
+			contentHash: "next-b-hash",
+			fastFingerprint: "21:2",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+			state: "planned",
+		})
+		await store.upsertChunks([
+			{
+				revisionId: degradedRevision.revisionId,
+				chunkFingerprint: "next-b-fp",
+				startLine: 1,
+				endLine: 1,
+				content: "export const nextB = true",
+				searchText: "export const nextB = true",
+				contentHash: createHash("sha256").update("export const nextB = true").digest("hex"),
+				state: "parsed",
+			},
+		])
+
+		const terminalFailedRevision = await store.createFileRevision({
+			fileId: fileC.fileId,
+			runId,
+			contentHash: "next-c-hash",
+			fastFingerprint: "30:3",
+			parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+			chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+			state: "planned",
+		})
+		await store.upsertChunks([
+			{
+				revisionId: terminalFailedRevision.revisionId,
+				chunkFingerprint: "next-c-fp",
+				startLine: 1,
+				endLine: 1,
+				content: "export const nextC = true",
+				searchText: "export const nextC = true",
+				contentHash: createHash("sha256").update("export const nextC = true").digest("hex"),
+				state: "parsed",
+			},
+		])
+
+		const summary = await store.finalizeReadyRevisionsBatch({
+			runId,
+			resolutions: [
+				{
+					revisionId: committedRevision.revisionId,
+					fileId: fileA.fileId,
+					previousRevisionId: previousRevisionA.revisionId,
+					disposition: "committed",
+					failureReason: null,
+				},
+				{
+					revisionId: degradedRevision.revisionId,
+					fileId: fileB.fileId,
+					previousRevisionId: previousRevisionB.revisionId,
+					disposition: "degraded",
+					failureReason: "partial vector sync",
+				},
+				{
+					revisionId: terminalFailedRevision.revisionId,
+					fileId: fileC.fileId,
+					previousRevisionId: null,
+					disposition: "terminal_failed",
+					failureReason: "all vectors failed permanently",
+				},
+			],
+		})
+
+		expect(summary).toEqual(
+			expect.objectContaining({
+				committedRevisions: 1,
+				degradedRevisions: 1,
+				terminalFailedRevisions: 1,
+				supersededRevisions: 2,
+				activatedChunkCount: 2,
+				supersededChunkCount: 2,
+			}),
+		)
+
+		expect((await store.getFileRevision(committedRevision.revisionId)).state).toBe("committed")
+		expect((await store.getFileRevision(degradedRevision.revisionId)).state).toBe("degraded")
+		expect((await store.getFileRevision(terminalFailedRevision.revisionId)).state).toBe("terminal_failed")
+		expect((await store.getFileRevision(previousRevisionA.revisionId)).state).toBe("superseded")
+		expect((await store.getFileRevision(previousRevisionB.revisionId)).state).toBe("superseded")
+
+		const activeRevisionA = db
+			.prepare(`SELECT active_revision_id AS activeRevisionId FROM files WHERE file_id = ?`)
+			.get(fileA.fileId) as { activeRevisionId?: string } | undefined
+		const activeRevisionB = db
+			.prepare(`SELECT active_revision_id AS activeRevisionId FROM files WHERE file_id = ?`)
+			.get(fileB.fileId) as { activeRevisionId?: string } | undefined
+		expect(activeRevisionA?.activeRevisionId).toBe(committedRevision.revisionId)
+		expect(activeRevisionB?.activeRevisionId).toBe(degradedRevision.revisionId)
+
+		const committedLexicalRows = db
+			.prepare(
+				`SELECT COUNT(*) AS count FROM chunk_lexical_fts WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE revision_id = ?)`,
+			)
+			.get(committedRevision.revisionId) as { count?: number } | undefined
+		const degradedLexicalRows = db
+			.prepare(
+				`SELECT COUNT(*) AS count FROM chunk_lexical_fts WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE revision_id = ?)`,
+			)
+			.get(degradedRevision.revisionId) as { count?: number } | undefined
+		const supersededLexicalRows = db
+			.prepare(
+				`SELECT COUNT(*) AS count FROM chunk_lexical_fts WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE revision_id IN (?, ?))`,
+			)
+			.get(previousRevisionA.revisionId, previousRevisionB.revisionId) as { count?: number } | undefined
+
+		expect(committedLexicalRows?.count).toBe(1)
+		expect(degradedLexicalRows?.count).toBe(1)
+		expect(supersededLexicalRows?.count ?? 0).toBe(0)
+
+		await store.dispose()
+	})
 })
