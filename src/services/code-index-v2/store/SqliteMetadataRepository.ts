@@ -245,23 +245,43 @@ export class SqliteMetadataRepository {
 	}
 
 	async clearStorage(options?: { includeTelemetry?: boolean }): Promise<void> {
+		const includeTelemetry = options?.includeTelemetry ?? false
 		await this.disposeOperationalDatabase()
-		await fs.rm(this.rootDir, { recursive: true, force: true })
-		if (options?.includeTelemetry) {
+		const persistentOperationalStoreRemoved = await this.removeSqliteArtifacts(this.dbPath)
+		const legacyOperationalStoreRemoved = await this.removeSqliteArtifacts(this.getLegacyDatabasePath())
+		const legacyBootstrapRemoved = await this.removeFileIfExists(this.bootstrapPath)
+
+		let telemetryStoreRemoved = false
+		let diagnosticsRootRemoved = false
+		let persistentRootRemoved = false
+		let legacyRootRemoved = false
+
+		if (includeTelemetry) {
 			await this.disposeTelemetryDatabase()
-			await fs.rm(this.persistentRootDir, { recursive: true, force: true })
+			telemetryStoreRemoved = await this.removeSqliteArtifacts(this.telemetryDbPath)
+			diagnosticsRootRemoved = await this.removeDirectoryIfExists(this.diagnosticsRootDir)
+			persistentRootRemoved = await this.removeDirectoryIfExists(this.persistentRootDir)
+			legacyRootRemoved = await this.removeDirectoryIfExists(this.rootDir)
 		}
 
-		IndexDebugLoggerV2.log(
-			"basic",
-			"MetadataStore",
-			options?.includeTelemetry ? "database-cleared" : "storage-cleared",
-			{
-				component: "MetadataStore",
-				workspacePath: this.workspacePath,
-				includeTelemetry: options?.includeTelemetry ?? false,
-			},
-		)
+		IndexDebugLoggerV2.log("basic", "MetadataStore", includeTelemetry ? "database-cleared" : "storage-cleared", {
+			component: "MetadataStore",
+			workspacePath: this.workspacePath,
+			includeTelemetry,
+			persistentOperationalStoreRemoved,
+			legacyOperationalStoreRemoved,
+			legacyBootstrapRemoved,
+			telemetryStoreRemoved,
+			diagnosticsRootRemoved,
+			persistentRootRemoved,
+			legacyRootRemoved,
+		})
+
+		if (includeTelemetry) {
+			IndexDebugLoggerV2.configureDiagnosticsDirectory(undefined, this.workspacePath)
+			await this.removeDirectoryIfExists(this.diagnosticsRootDir)
+			await this.removeDirectoryIfExists(this.persistentRootDir)
+		}
 	}
 
 	async ensureWorkspaceRecord(): Promise<WorkspaceRecord> {
@@ -4159,6 +4179,43 @@ export class SqliteMetadataRepository {
 	private async disposeTelemetryDatabase(): Promise<void> {
 		this._telemetryDb?.close()
 		this._telemetryDb = undefined
+	}
+
+	private getLegacyDatabasePath(): string {
+		return path.join(this.rootDir, path.basename(this.dbPath))
+	}
+
+	private async removeSqliteArtifacts(basePath: string): Promise<boolean> {
+		let removed = false
+		for (const artifactPath of [basePath, `${basePath}-wal`, `${basePath}-shm`]) {
+			removed = (await this.removeFileIfExists(artifactPath)) || removed
+		}
+		return removed
+	}
+
+	private async removeFileIfExists(filePath: string): Promise<boolean> {
+		if (!(await this.pathExists(filePath))) {
+			return false
+		}
+		await fs.rm(filePath, { force: true })
+		return true
+	}
+
+	private async removeDirectoryIfExists(directoryPath: string): Promise<boolean> {
+		if (!(await this.pathExists(directoryPath))) {
+			return false
+		}
+		await fs.rm(directoryPath, { recursive: true, force: true })
+		return true
+	}
+
+	private async pathExists(targetPath: string): Promise<boolean> {
+		try {
+			await fs.access(targetPath)
+			return true
+		} catch {
+			return false
+		}
 	}
 
 	private async migrateLegacyTelemetryToPersistent(): Promise<void> {

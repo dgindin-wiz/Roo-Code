@@ -2632,6 +2632,7 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.vectorStore.recycleClient).toHaveBeenCalled()
 		expect(mocks.embeddingAdapter.recycleClient).toHaveBeenCalled()
 		expect(mocks.metadataStore.clearStorage).toHaveBeenCalledTimes(1)
+		expect(mocks.metadataStore.clearStorage).toHaveBeenCalledWith({ includeTelemetry: false })
 		expect(mocks.stateManager.resetIndexingState).toHaveBeenCalledWith("Index data cleared successfully.")
 		expect((engine as any)._started).toBe(false)
 		expect((engine as any)._watcherCoordinator).toBeUndefined()
@@ -2643,6 +2644,24 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect((engine as any)._resumedRetryJobsCount).toBe(0)
 		expect((engine as any)._resumedPendingJobsCount).toBe(0)
 		expect((engine as any)._lastCpuSample).toBeUndefined()
+	})
+
+	it("clears persistent and telemetry-backed V2 state on full database clears", async () => {
+		const engine = new CodeIndexEngineV2(mockContext, "/workspace", mockConfigManager, mocks.stateManager as any)
+
+		;(engine as any)._watcherCoordinator = mocks.watcherCoordinator
+		;(engine as any)._reconciliationTimer = setInterval(() => undefined, 60_000)
+		;(engine as any)._embeddingAdapter = mocks.embeddingAdapter
+		;(engine as any)._vectorStore = mocks.vectorStore
+		;(engine as any)._started = true
+
+		await engine.clearDatabase()
+
+		expect(mocks.watcherCoordinator.dispose).toHaveBeenCalled()
+		expect(mocks.vectorStore.deleteCollection).toHaveBeenCalledTimes(1)
+		expect(mocks.metadataStore.clearStorage).toHaveBeenCalledWith({ includeTelemetry: true })
+		expect(mocks.stateManager.resetIndexingState).toHaveBeenCalledWith("Index database cleared successfully.")
+		expect((engine as any)._started).toBe(false)
 	})
 
 	it("aborts an active run on stop and settles in standby instead of error", async () => {

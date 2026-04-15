@@ -300,15 +300,78 @@ describe("MetadataStore integration", () => {
 		})
 
 		const telemetryDbPath = store.getTelemetryDatabasePath()
+		const operationalDbPath = store.getDatabasePath()
+		const diagnosticsDir = store.getDiagnosticsDirectoryPath()
+		const diagnosticsLogPath = path.join(diagnosticsDir, "roo-code-index-v2.log")
+		const bootstrapPath = store.getBootstrapPath()
+		const legacyRootDir = path.dirname(bootstrapPath)
+		const legacyDbPath = path.join(legacyRootDir, path.basename(operationalDbPath))
+		const legacyLogPath = path.join(legacyRootDir, "roo-code-index-v2.log")
+		await fs.writeFile(diagnosticsLogPath, "persistent diagnostics\n")
+		await fs.writeFile(legacyDbPath, "legacy operational db\n")
+		await fs.writeFile(`${legacyDbPath}-wal`, "legacy wal\n")
+		await fs.writeFile(`${legacyDbPath}-shm`, "legacy shm\n")
+		await fs.writeFile(legacyLogPath, "legacy diagnostics\n")
 		expect(await store.getRunSummary(runId)).toBeDefined()
 
 		await store.clearStorage()
 
+		await expect(fs.stat(operationalDbPath)).rejects.toBeDefined()
+		await expect(fs.stat(legacyDbPath)).rejects.toBeDefined()
+		await expect(fs.stat(`${legacyDbPath}-wal`)).rejects.toBeDefined()
+		await expect(fs.stat(`${legacyDbPath}-shm`)).rejects.toBeDefined()
+		await expect(fs.stat(bootstrapPath)).rejects.toBeDefined()
 		await expect(fs.stat(telemetryDbPath)).resolves.toBeDefined()
+		await expect(fs.stat(diagnosticsLogPath)).resolves.toBeDefined()
+		await expect(fs.stat(legacyLogPath)).resolves.toBeDefined()
 		expect(await store.getRunSummary(runId)).toBeDefined()
 
 		await store.initialize()
 		expect(await store.getRunSummary(runId)).toBeDefined()
+
+		await store.dispose()
+	})
+
+	it("clears persistent, legacy, telemetry, and diagnostics state during full database clears", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const runId = await store.beginRun("initial-discovery")
+		await store.writeRunSummary({
+			runId,
+			workspaceId: store.getWorkspaceId(),
+			triggerType: "initial-discovery",
+			state: "complete",
+			startedAt: 1,
+			completedAt: 2,
+			totalRunMs: 100,
+			filesChanged: 2,
+		})
+
+		const telemetryDbPath = store.getTelemetryDatabasePath()
+		const operationalDbPath = store.getDatabasePath()
+		const diagnosticsDir = store.getDiagnosticsDirectoryPath()
+		const diagnosticsLogPath = path.join(diagnosticsDir, "roo-code-index-v2.log")
+		const bootstrapPath = store.getBootstrapPath()
+		const legacyRootDir = path.dirname(bootstrapPath)
+		const legacyDbPath = path.join(legacyRootDir, path.basename(operationalDbPath))
+		await fs.writeFile(diagnosticsLogPath, "persistent diagnostics\n")
+		await fs.writeFile(legacyDbPath, "legacy operational db\n")
+		await fs.writeFile(path.join(legacyRootDir, "roo-code-index-v2.log"), "legacy diagnostics\n")
+
+		await store.clearStorage({ includeTelemetry: true })
+
+		await expect(fs.stat(operationalDbPath)).rejects.toBeDefined()
+		await expect(fs.stat(telemetryDbPath)).rejects.toBeDefined()
+		await expect(fs.stat(diagnosticsDir)).rejects.toBeDefined()
+		await expect(fs.stat(legacyRootDir)).rejects.toBeDefined()
+
+		await store.initialize()
+		expect(await store.getRunSummary(runId)).toBeUndefined()
 
 		await store.dispose()
 	})

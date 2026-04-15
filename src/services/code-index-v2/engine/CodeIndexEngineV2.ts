@@ -376,10 +376,14 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			this._status = {
 				engine: this.engine,
 				state: "running",
-				message: includeTelemetry ? "Clearing Code Index V2 database" : "Clearing Code Index V2 data",
+				message: includeTelemetry
+					? "Clearing Code Index V2 database, telemetry, and diagnostics"
+					: "Clearing Code Index V2 operational data and vectors",
 			}
 			this.stateManager.reportCustomProgress(
-				includeTelemetry ? "Clearing index database" : "Clearing indexed data",
+				includeTelemetry
+					? "Clearing index database, telemetry, and diagnostics"
+					: "Clearing indexed data and vectors",
 				0,
 				1,
 				{
@@ -402,6 +406,12 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			try {
 				const { vectorStore } = this.getOrCreateIndexDependencies()
 				await vectorStore.deleteCollection()
+				IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "vector-store-cleared", {
+					engine: this.engine,
+					workspacePath: this.workspacePath,
+					includeTelemetry,
+					qdrantCollectionCleared: true,
+				})
 				await vectorStore.recycleClient()
 				await this._indexEmbeddingAdapter?.recycleClient()
 				await this._searchEmbeddingAdapter?.recycleClient()
