@@ -262,6 +262,24 @@ describe("CodeIndexEngineV2 progress and scheduling", () => {
 		expect(vectorSyncService.detail).toContain("chunks synced")
 	})
 
+	it("fails fast when a metadata-sidecar timeout interrupts backlog refresh", async () => {
+		const metadataTimeout = new Error(
+			"Metadata sidecar timed out during getRunBacklogMetrics after 5000ms (timeout 5000ms).",
+		)
+		metadataTimeout.name = "MetadataSidecarRequestTimeoutError"
+		testState.mocks.metadataStore.getRunBacklogMetrics.mockReset()
+		testState.mocks.metadataStore.getRunBacklogMetrics.mockRejectedValueOnce(metadataTimeout)
+
+		const engine = createEngine()
+
+		await expect(engine.start()).rejects.toBe(metadataTimeout)
+		expect(testState.mocks.stateManager.setSystemState).toHaveBeenCalledWith(
+			"Error",
+			expect.stringContaining("getRunBacklogMetrics"),
+		)
+		expect(testState.mocks.metadataStore.dispose).toHaveBeenCalled()
+	})
+
 	it("does not mark a run complete until pending vector work fully drains", async () => {
 		const backlog = zeroBacklog()
 		const embedDrain = createDeferred<{

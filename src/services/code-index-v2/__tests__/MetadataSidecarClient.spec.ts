@@ -1,0 +1,157 @@
+import { EventEmitter } from "events"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { createResolvedMetadataPaths } from "./CodeIndexEngineV2.testUtils"
+
+class MockChildProcess extends EventEmitter {
+	pid = 4242
+	exitCode: number | null = null
+	signalCode: NodeJS.Signals | null = null
+	readonly send = vi.fn((message: Record<string, unknown>) => {
+		if (message.type === "init") {
+			queueMicrotask(() => {
+				this.emit("message", {
+					type: "ready",
+					pid: this.pid,
+					memory: {
+						rssMB: 100,
+						heapUsedMB: 20,
+						heapTotalMB: 40,
+						externalMB: 5,
+						arrayBuffersMB: 1,
+					},
+					cpu: {
+						processPercent: 12,
+					},
+				})
+			})
+		}
+	})
+	readonly kill = vi.fn((signal?: NodeJS.Signals) => {
+		this.signalCode = signal ?? null
+		queueMicrotask(() => {
+			this.emit("exit", null, signal ?? null)
+		})
+		return true
+	})
+}
+
+const testState = vi.hoisted(() => ({
+	fork: vi.fn(),
+	existsSync: vi.fn((_filePath?: string) => true),
+	logger: {
+		log: vi.fn(),
+		getMemorySnapshot: vi.fn(() => ({
+			rssMB: 256,
+			heapUsedMB: 64,
+			heapTotalMB: 128,
+			externalMB: 16,
+			arrayBuffersMB: 4,
+		})),
+		getCpuSnapshot: vi.fn(() => ({
+			processPercent: 15,
+		})),
+		updateTrackedProcessSnapshot: vi.fn(),
+		clearTrackedProcessSnapshot: vi.fn(),
+	},
+}))
+
+vi.mock("child_process", () => ({
+	fork: (...args: unknown[]) => testState.fork(...args),
+}))
+
+vi.mock("fs", () => ({
+	existsSync: (filePath: string) => testState.existsSync(filePath),
+}))
+
+vi.mock("../logging/IndexDebugLoggerV2", () => ({
+	IndexDebugLoggerV2: testState.logger,
+}))
+
+import {
+	MetadataSidecarClient,
+	MetadataSidecarRequestTimeoutError,
+	MetadataSidecarUnavailableError,
+} from "../sidecar/MetadataSidecarClient"
+
+describe("MetadataSidecarClient", () => {
+	beforeEach(() => {
+		vi.useFakeTimers()
+		testState.fork.mockReset()
+		testState.existsSync.mockReset()
+		testState.existsSync.mockReturnValue(true)
+		Object.values(testState.logger).forEach((mock) => mock.mockReset?.())
+		testState.logger.getMemorySnapshot.mockReturnValue({
+			rssMB: 256,
+			heapUsedMB: 64,
+			heapTotalMB: 128,
+			externalMB: 16,
+			arrayBuffersMB: 4,
+		})
+		testState.logger.getCpuSnapshot.mockReturnValue({
+			processPercent: 15,
+		})
+	})
+
+	afterEach(() => {
+		vi.useRealTimers()
+	})
+
+	it("times out a hanging hot-path request, kills the sidecar, and refuses to respawn within the run", async () => {
+		const child = new MockChildProcess()
+		testState.fork.mockReturnValue(child as any)
+		const client = new MetadataSidecarClient(createResolvedMetadataPaths("/workspace"))
+
+		await client.initialize()
+
+		const requestPromise = (
+			client as unknown as { getRunBacklogMetrics: (runId: string) => Promise<unknown> }
+		).getRunBacklogMetrics("run-1")
+		const requestAssertion = expect(requestPromise).rejects.toBeInstanceOf(MetadataSidecarRequestTimeoutError)
+
+		await vi.advanceTimersByTimeAsync(5_000)
+
+		await requestAssertion
+		await expect(
+			(client as unknown as { getRunBacklogMetrics: (runId: string) => Promise<unknown> }).getRunBacklogMetrics(
+				"run-1",
+			),
+		).rejects.toBeInstanceOf(MetadataSidecarRequestTimeoutError)
+		expect(testState.fork).toHaveBeenCalledTimes(1)
+		expect(child.kill).toHaveBeenCalledWith("SIGTERM")
+		expect(testState.logger.log).toHaveBeenCalledWith(
+			"basic",
+			"MetadataSidecar",
+			"metadata-sidecar-request-timeout",
+			expect.objectContaining({
+				operation: "getRunBacklogMetrics",
+				timeoutMs: 5_000,
+			}),
+		)
+	})
+
+	it("rejects every pending request when one timeout marks the sidecar unhealthy", async () => {
+		const child = new MockChildProcess()
+		testState.fork.mockReturnValue(child as any)
+		const client = new MetadataSidecarClient(createResolvedMetadataPaths("/workspace"))
+
+		await client.initialize()
+
+		const backlogPromise = (
+			client as unknown as { getRunBacklogMetrics: (runId: string) => Promise<unknown> }
+		).getRunBacklogMetrics("run-1")
+		const progressPromise = (
+			client as unknown as { getRunProgressRecord: (runId: string) => Promise<unknown> }
+		).getRunProgressRecord("run-1")
+		const settledResults = Promise.allSettled([backlogPromise, progressPromise])
+
+		await vi.advanceTimersByTimeAsync(5_000)
+
+		const [backlogResult, progressResult] = await settledResults
+		expect(backlogResult.status).toBe("rejected")
+		expect(progressResult.status).toBe("rejected")
+		expect((backlogResult as PromiseRejectedResult).reason).toBeInstanceOf(MetadataSidecarRequestTimeoutError)
+		expect((progressResult as PromiseRejectedResult).reason).toBeInstanceOf(MetadataSidecarRequestTimeoutError)
+		expect(testState.fork).toHaveBeenCalledTimes(1)
+		expect((progressResult as PromiseRejectedResult).reason).not.toBeInstanceOf(MetadataSidecarUnavailableError)
+	})
+})

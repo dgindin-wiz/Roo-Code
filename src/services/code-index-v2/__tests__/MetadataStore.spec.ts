@@ -279,6 +279,45 @@ describe("MetadataStore integration", () => {
 		await store.dispose()
 	})
 
+	it("runs metadata maintenance and reports memory and WAL footprint", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const summary = await store.performMaintenance({
+			checkpointMode: "PASSIVE",
+			shrinkMemory: true,
+		})
+
+		expect(summary).toEqual(
+			expect.objectContaining({
+				checkpointMode: "PASSIVE",
+				shrinkMemory: true,
+				operationalDbBytes: expect.any(Number),
+				operationalWalBytes: expect.any(Number),
+				telemetryDbBytes: expect.any(Number),
+				telemetryWalBytes: expect.any(Number),
+				memoryBefore: expect.objectContaining({
+					rssMB: expect.any(Number),
+					heapUsedMB: expect.any(Number),
+					externalMB: expect.any(Number),
+					arrayBuffersMB: expect.any(Number),
+				}),
+				memoryAfter: expect.objectContaining({
+					rssMB: expect.any(Number),
+					heapUsedMB: expect.any(Number),
+					externalMB: expect.any(Number),
+					arrayBuffersMB: expect.any(Number),
+				}),
+			}),
+		)
+
+		await store.dispose()
+	})
+
 	it("preserves persistent telemetry history when clearing operational index storage", async () => {
 		const context = {
 			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
@@ -600,6 +639,124 @@ describe("MetadataStore integration", () => {
 			terminalFailedChunks: 0,
 			retryingJobs: 0,
 			blockingReason: "parsed_revisions_waiting_for_planning",
+		})
+
+		await store.dispose()
+	})
+
+	it("reuses cached run backlog metrics briefly before re-reading SQLite", async () => {
+		vi.useFakeTimers()
+		try {
+			const context = {
+				globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+			} as any
+			const workspacePath = path.join(tempRoot, "workspace")
+			const store = new MetadataStore(context, workspacePath)
+			await store.initialize()
+
+			const workspaceId = store.getWorkspaceId()
+			const runId = await store.beginRun("initial-discovery")
+			const file = await store.upsertFileRecord({
+				workspaceId,
+				relativePath: "src/cache.ts",
+				normalizedPath: path.join(workspacePath, "src/cache.ts"),
+				ignoreState: "included",
+			})
+			const revision = await store.createFileRevision({
+				fileId: file.fileId,
+				runId,
+				contentHash: "cache-content-hash",
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+				state: "parsed",
+			})
+			await store.upsertChunks([
+				{
+					revisionId: revision.revisionId,
+					chunkFingerprint: "cache-fp",
+					startLine: 1,
+					endLine: 2,
+					content: "const cached = true",
+					contentHash: "cache-chunk-hash",
+					state: "parsed",
+				},
+			])
+
+			const baseline = await store.getRunBacklogMetrics(runId)
+			const db = (store as any).db() as {
+				prepare(sql: string): { run(...params: unknown[]): unknown }
+			}
+			db.prepare(`UPDATE file_revisions SET state = 'planned' WHERE revision_id = ?`).run(revision.revisionId)
+
+			await expect(store.getRunBacklogMetrics(runId)).resolves.toEqual(baseline)
+
+			await vi.advanceTimersByTimeAsync(251)
+
+			await expect(store.getRunBacklogMetrics(runId)).resolves.toMatchObject({
+				parsedRevisions: 0,
+				plannedRevisions: 1,
+			})
+
+			await store.dispose()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it("invalidates cached backlog metrics after backlog-affecting mutations", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const runId = await store.beginRun("initial-discovery")
+		const file = await store.upsertFileRecord({
+			workspaceId,
+			relativePath: "src/invalidate.ts",
+			normalizedPath: path.join(workspacePath, "src/invalidate.ts"),
+			ignoreState: "included",
+		})
+		const revision = await store.createFileRevision({
+			fileId: file.fileId,
+			runId,
+			contentHash: "invalidate-content-hash",
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+			state: "parsed",
+		})
+		const [chunk] = await store.upsertChunks([
+			{
+				revisionId: revision.revisionId,
+				chunkFingerprint: "invalidate-fp",
+				startLine: 1,
+				endLine: 2,
+				content: "const invalidate = true",
+				contentHash: "invalidate-chunk-hash",
+				state: "parsed",
+			},
+		])
+
+		await expect(store.getRunBacklogMetrics(runId)).resolves.toMatchObject({
+			queuedUpsertJobs: 0,
+			runningUpsertJobs: 0,
+		})
+
+		await store.enqueueJobs([
+			{
+				workspaceId,
+				runId,
+				jobType: "upsert",
+				entityId: chunk.chunkId,
+				state: "queued",
+			},
+		])
+
+		await expect(store.getRunBacklogMetrics(runId)).resolves.toMatchObject({
+			queuedUpsertJobs: 1,
+			runningUpsertJobs: 0,
 		})
 
 		await store.dispose()

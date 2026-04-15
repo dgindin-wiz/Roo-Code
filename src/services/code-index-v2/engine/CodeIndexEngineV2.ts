@@ -52,6 +52,7 @@ import { CodeIndexV2GpuSnapshot } from "../logging/log-types"
 import {
 	buildPipelineBacklogSample,
 	getParseThrottleReason,
+	type ParseThrottleState,
 	shouldPrioritizePlannerRefill,
 	shouldResumeParseFromThrottle,
 } from "./pipelineDiagnostics"
@@ -132,7 +133,6 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private static readonly PLANNER_REVISION_SLICE = 50
 	private static readonly PLANNER_JOB_BUDGET = 1_500
 	private static readonly RUN_HEARTBEAT_INTERVAL_MS = 5_000
-	private static readonly SQLITE_MAINTENANCE_INTERVAL_MS = 30_000
 	private static readonly PIPELINE_POLL_INTERVAL_MS = 250
 	private static readonly HEARTBEAT_INTERVAL_MS = 2_000
 	private static readonly PREFLIGHT_QDRANT_TIMEOUT_MS = 10_000
@@ -164,6 +164,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private _started = false
 	private _stopRequested = false
 	private _operationChain: Promise<void> = Promise.resolve()
+	private _metadataMaintenancePromise: Promise<unknown> | undefined
 	private _staleRunIdsToResume: string[] = []
 	private _resumedRetryJobsCount = 0
 	private _resumedPendingJobsCount = 0
@@ -257,10 +258,20 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			this._status = {
 				engine: this.engine,
 				state: "error",
-				message: this.getStopAwareErrorMessage(error),
+				message: this.isMetadataSidecarRuntimeError(error)
+					? this.getMetadataSidecarFailureMessage(error)
+					: this.getStopAwareErrorMessage(error),
 			}
 			if (!this._stopRequested) {
-				this.stateManager.setSystemState("Error", this.getStopAwareErrorMessage(error))
+				this.stateManager.setSystemState(
+					"Error",
+					this.isMetadataSidecarRuntimeError(error)
+						? this.getMetadataSidecarFailureMessage(error)
+						: this.getStopAwareErrorMessage(error),
+				)
+			}
+			if (this.isMetadataSidecarRuntimeError(error)) {
+				await this.metadataStore.dispose().catch(() => undefined)
 			}
 			if (this.isAbortError(error) && this._stopRequested) {
 				return
@@ -338,6 +349,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		this._indexEmbeddingAdapter = undefined
 		this._indexVectorStore = undefined
 		await this.embeddingRuntimeProfileStore.flush()
+		await this.performMetadataMaintenance({
+			checkpointMode: "TRUNCATE",
+			shrinkMemory: true,
+		}).catch(() => undefined)
 		await this.metadataStore.dispose()
 		this._started = false
 		this._activeAbortController = undefined
@@ -421,6 +436,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				this._searchVectorStore = undefined
 				this._searchEmbeddingAdapter = undefined
 				try {
+					await this.performMetadataMaintenance({
+						checkpointMode: "TRUNCATE",
+						shrinkMemory: true,
+					})
 					await this.metadataStore.clearStorage({ includeTelemetry })
 				} finally {
 					await this.metadataStore.dispose()
@@ -2542,7 +2561,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			this.stateManager.setPipelineTerminalState(
 				this.isAbortError(error) && this._stopRequested ? "stopped" : "failed",
 			)
-			if (summary?.runId) {
+			if (summary?.runId && !this.isMetadataSidecarRuntimeError(error)) {
 				await this.persistRunTelemetrySummary(summary.runId, {
 					triggerType: mode,
 					state: this.isAbortError(error) && this._stopRequested ? "stopped" : "failed",
@@ -2563,6 +2582,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				message: this._status.message,
 				errorMessage: this.getStopAwareErrorMessage(error),
 			})
+			if (this.isMetadataSidecarRuntimeError(error)) {
+				await this.metadataStore.dispose().catch(() => undefined)
+			}
 			throw error
 		}
 	}
@@ -3341,23 +3363,26 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			let syncedChunksCompleted = 0
 			let upsertedChunksCompleted = 0
 			let deletedChunksCompleted = 0
+			let liveSyncedChunksCompleted = 0
+			let liveUpsertedChunksCompleted = 0
+			let liveDeletedChunksCompleted = 0
 			let embedPhaseStarted = false
 			let parseChunkMs = 0
 			let diffPlanningMs = 0
 			let embedUpsertMs = 0
-			let parseSchedulingThrottled = false
-			let parseThrottleReason: "high_watermark" | "planner_starvation_guard" | null = null
+			let parseThrottleState: ParseThrottleState | null = null
 			let parseFinished = false
 			let drainError: unknown
 			let lastBacklogRefreshAt = 0
 			let lastBacklogSampleAt = 0
 			let lastRunHeartbeatAt = 0
-			let lastMaintenanceAt = 0
 			let totalParseThrottleMs = 0
 			let peakStagedChunks = 0
 			let peakQueuedJobs = 0
 			let blockedOnParsedRevisionsMs = 0
 			let blockedOnStagedChunksMs = 0
+			let refreshBacklogMetricsPromise: Promise<RunBacklogMetricsRecord> | undefined
+			let persistRunSnapshotPromise: Promise<void> | undefined
 			let latestPlannerRefillPasses: number | undefined
 			let latestSyncTelemetry:
 				| {
@@ -3411,6 +3436,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						readyRevisionCount?: number
 						activatedChunkCount?: number
 						supersededChunkCount?: number
+						workerPhase?: string
 						activeLaneCount?: number
 						inFlightChunkCount?: number
 						gpu?: CodeIndexV2GpuSnapshot | null
@@ -3433,7 +3459,16 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				const tracked = (IndexDebugLoggerV2.getTrackedProcessSummary() ?? {}) as {
 					totalTrackedRssMB?: number
 					totalTrackedCpuPercent?: number
-					byGroup?: Record<string, { totalRssMB?: number; totalCpuPercent?: number }>
+					byGroup?: Record<
+						string,
+						{
+							totalRssMB?: number
+							totalCpuPercent?: number
+							totalHeapUsedMB?: number
+							totalExternalMB?: number
+							totalArrayBuffersMB?: number
+						}
+					>
 				}
 				return {
 					totalTrackedRssMB: tracked.totalTrackedRssMB ?? 0,
@@ -3441,6 +3476,28 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					embedSidecarRssMB: tracked.byGroup?.embedSidecars?.totalRssMB ?? 0,
 					metadataSidecarRssMB: tracked.byGroup?.metadataSidecar?.totalRssMB ?? 0,
 					metadataSidecarCpuPercent: tracked.byGroup?.metadataSidecar?.totalCpuPercent ?? 0,
+					metadataSidecarHeapUsedMB: tracked.byGroup?.metadataSidecar?.totalHeapUsedMB ?? 0,
+					metadataSidecarExternalMB: tracked.byGroup?.metadataSidecar?.totalExternalMB ?? 0,
+					metadataSidecarArrayBuffersMB: tracked.byGroup?.metadataSidecar?.totalArrayBuffersMB ?? 0,
+				}
+			}
+			const getDatabaseFootprint = async () => {
+				const statBytes = async (filePath: string) => {
+					try {
+						const stat = await fs.stat(filePath)
+						return stat.size
+					} catch {
+						return 0
+					}
+				}
+
+				const metadataDbPath = this.metadataStore.getDatabasePath()
+				const telemetryDbPath = this.metadataStore.getTelemetryDatabasePath()
+				return {
+					metadataDbBytes: await statBytes(metadataDbPath),
+					metadataWalBytes: await statBytes(`${metadataDbPath}-wal`),
+					telemetryDbBytes: await statBytes(telemetryDbPath),
+					telemetryWalBytes: await statBytes(`${telemetryDbPath}-wal`),
 				}
 			}
 			const getPipelineRunMode = (): IndexingPipelineRunMode =>
@@ -3448,6 +3505,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					? "resume"
 					: (options?.runMode ?? "unknown")
 			const syncPipelineSnapshot = (forceImmediate = false) => {
+				const runnableEmbedQueueDepth = this.getRunnableEmbedQueueDepth(latestBacklogMetrics)
+				const currentSyncedChunksCompleted = Math.max(syncedChunksCompleted, liveSyncedChunksCompleted)
+				const currentDeletedChunksCompleted = Math.max(deletedChunksCompleted, liveDeletedChunksCompleted)
 				const parseIssueCount =
 					retryingParseRevisions +
 					terminalFailedParseRevisions +
@@ -3464,25 +3524,31 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				const planBacklog = latestBacklogMetrics.parsedRevisions + latestBacklogMetrics.plannedRevisions
 				const planHasDeleteWork =
 					latestBacklogMetrics.queuedDeleteJobs > 0 || latestBacklogMetrics.runningDeleteJobs > 0
+				const activationCatchUp =
+					latestBacklogMetrics.plannedRevisions > 0 &&
+					runnableEmbedQueueDepth === 0 &&
+					(latestSyncTelemetry?.workerPhase === "activation" ||
+						(latestSyncTelemetry?.readyRevisionCount ?? 0) > 0)
 				const planHasWork =
 					planBacklog > 0 ||
 					latestBacklogMetrics.stagedChunks > 0 ||
-					latestBacklogMetrics.queuedUpsertJobs > 0 ||
-					latestBacklogMetrics.runningUpsertJobs > 0 ||
+					runnableEmbedQueueDepth > 0 ||
 					planHasDeleteWork
-				const vectorSyncOutstandingWork =
-					latestBacklogMetrics.stagedChunks > 0 ||
-					latestBacklogMetrics.queuedUpsertJobs > 0 ||
-					latestBacklogMetrics.runningUpsertJobs > 0
+				const vectorSyncOutstandingWork = latestBacklogMetrics.stagedChunks > 0 || runnableEmbedQueueDepth > 0
 				const embedObserved =
-					embedPhaseStarted || syncedChunksCompleted > 0 || (latestSyncTelemetry?.batchesCompleted ?? 0) > 0
+					embedPhaseStarted ||
+					currentSyncedChunksCompleted > 0 ||
+					(latestSyncTelemetry?.batchesCompleted ?? 0) > 0
 				const embedActivelyRunning =
 					embedPhaseStarted &&
 					(!parseFinished ||
 						vectorSyncOutstandingWork ||
+						(latestSyncTelemetry?.workerPhase != null &&
+							latestSyncTelemetry.workerPhase !== "idle" &&
+							latestSyncTelemetry.workerPhase !== "waiting_retry") ||
 						(latestSyncTelemetry?.activeLaneCount ?? 0) > 0 ||
 						(latestSyncTelemetry?.inFlightChunkCount ?? 0) > 0)
-				const cleanupHasWork = deletedChunksCompleted > 0 || planHasDeleteWork
+				const cleanupHasWork = currentDeletedChunksCompleted > 0 || planHasDeleteWork
 				const embeddingUnderfed =
 					embedActivelyRunning &&
 					(latestSyncTelemetry?.laneOccupancyPercent ?? 100) < 50 &&
@@ -3507,17 +3573,14 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 							? "healthy"
 							: "unknown"
 				const cleanupHealth: IndexingHealthState =
-					planHasDeleteWork && deletedChunksCompleted === 0 && parseFinished
+					planHasDeleteWork && currentDeletedChunksCompleted === 0 && parseFinished
 						? "watch"
 						: cleanupHasWork
 							? "healthy"
 							: "unknown"
 				const embedProgressTotal = Math.max(
 					parsedChunksCompleted,
-					syncedChunksCompleted +
-						latestBacklogMetrics.stagedChunks +
-						latestBacklogMetrics.queuedUpsertJobs +
-						latestBacklogMetrics.runningUpsertJobs,
+					currentSyncedChunksCompleted + latestBacklogMetrics.stagedChunks + runnableEmbedQueueDepth,
 					1,
 				)
 				const planProgressTotal = Math.max(parsedRevisionsCompleted, totalChangedFiles, 1)
@@ -3635,12 +3698,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 								summary: planHasWork ? "Preparing vector workload" : "No planner backlog",
 								detail: latestBacklogMetrics.blockingReason
 									? this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
-											parseThrottled: parseSchedulingThrottled,
-											parseThrottleReason,
-											activationCatchUp:
-												latestBacklogMetrics.plannedRevisions > 0 &&
-												this.getRunnableEmbedQueueDepth(latestBacklogMetrics) === 0 &&
-												(latestSyncTelemetry?.readyRevisionCount ?? 0) > 0,
+											parseThrottleState,
+											activationCatchUp,
+											runnableEmbedQueueDepth,
+											workerPhase: latestSyncTelemetry?.workerPhase,
+											vectorSyncOutstandingWork,
 										})
 									: `${latestBacklogMetrics.stagedChunks.toLocaleString()} staged chunks`,
 								progressCurrent: Math.max(
@@ -3780,23 +3842,22 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										: embedObserved
 											? "Vector sync complete"
 											: "Waiting for vector sync work",
-								detail: latestBacklogMetrics.blockingReason
-									? this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
-											parseThrottled: parseSchedulingThrottled,
-											parseThrottleReason,
-											activationCatchUp:
-												latestBacklogMetrics.plannedRevisions > 0 &&
-												this.getRunnableEmbedQueueDepth(latestBacklogMetrics) === 0 &&
-												(latestSyncTelemetry?.readyRevisionCount ?? 0) > 0,
-										})
-									: `${syncedChunksCompleted.toLocaleString()} chunks synced`,
-								progressCurrent: Math.max(syncedChunksCompleted, 0),
+								detail:
+									this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
+										parseThrottleState,
+										activationCatchUp,
+										runnableEmbedQueueDepth,
+										workerPhase: latestSyncTelemetry?.workerPhase,
+										vectorSyncOutstandingWork,
+									}) ?? `${currentSyncedChunksCompleted.toLocaleString()} chunks synced`,
+								progressCurrent: Math.max(currentSyncedChunksCompleted, 0),
 								progressTotal: embedProgressTotal,
 								progressUnit: "chunks",
 								progressPercent: Math.min(
 									100,
 									Math.round(
-										(Math.max(syncedChunksCompleted, 0) / Math.max(embedProgressTotal, 1)) * 100,
+										(Math.max(currentSyncedChunksCompleted, 0) / Math.max(embedProgressTotal, 1)) *
+											100,
 									),
 								),
 								metrics: [
@@ -3849,10 +3910,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 									: parseFinished
 										? "No cleanup required"
 										: "Waiting for delete work",
-								detail: `${deletedChunksCompleted.toLocaleString()} vectors removed`,
-								progressCurrent: deletedChunksCompleted,
+								detail: `${currentDeletedChunksCompleted.toLocaleString()} vectors removed`,
+								progressCurrent: currentDeletedChunksCompleted,
 								progressTotal: Math.max(
-									deletedChunksCompleted +
+									currentDeletedChunksCompleted +
 										latestBacklogMetrics.queuedDeleteJobs +
 										latestBacklogMetrics.runningDeleteJobs,
 									cleanupHasWork ? 1 : 0,
@@ -3862,9 +3923,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 									? Math.min(
 											100,
 											Math.round(
-												(deletedChunksCompleted /
+												(currentDeletedChunksCompleted /
 													Math.max(
-														deletedChunksCompleted +
+														currentDeletedChunksCompleted +
 															latestBacklogMetrics.queuedDeleteJobs +
 															latestBacklogMetrics.runningDeleteJobs,
 														1,
@@ -3877,7 +3938,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 									this.createServiceMetric(
 										"deleted",
 										"Deleted",
-										deletedChunksCompleted.toLocaleString(),
+										currentDeletedChunksCompleted.toLocaleString(),
 									),
 									this.createServiceMetric(
 										"queuedDeletes",
@@ -3914,36 +3975,48 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						workspacePath: this.workspacePath,
 						stage: latestTelemetryStage,
 						metrics: latestBacklogMetrics,
-						parseSchedulingThrottled,
-						parseThrottleReason,
+						parseThrottleState,
 						plannerRefillPasses: latestPlannerRefillPasses,
 						latestSyncTelemetry,
 					}),
 				)
 			}
 			const refreshBacklogMetrics = async (force = false) => {
-				const now = Date.now()
-				if (force || now - lastBacklogRefreshAt >= CodeIndexEngineV2.PIPELINE_POLL_INTERVAL_MS) {
-					const elapsed = Math.max(now - lastBlockingReasonAt, 0)
-					if (lastBlockingReason === "parsed_revisions_waiting_for_planning") {
-						blockedOnParsedRevisionsMs += elapsed
-					}
-					if (lastBlockingReason === "staged_chunks_waiting_for_upsert") {
-						blockedOnStagedChunksMs += elapsed
-					}
-					latestBacklogMetrics = await this.metadataStore.getRunBacklogMetrics(runId)
-					lastBlockingReason = latestBacklogMetrics.blockingReason
-					lastBlockingReasonAt = now
-					lastBacklogRefreshAt = now
-					peakStagedChunks = Math.max(peakStagedChunks, latestBacklogMetrics.stagedChunks)
-					peakQueuedJobs = Math.max(
-						peakQueuedJobs,
-						latestBacklogMetrics.queuedUpsertJobs + latestBacklogMetrics.queuedDeleteJobs,
-					)
+				if (refreshBacklogMetricsPromise) {
+					return refreshBacklogMetricsPromise
 				}
-				syncPipelineSnapshot(force)
-				emitBacklogSample(force)
-				return latestBacklogMetrics
+				const promise = (async () => {
+					const now = Date.now()
+					if (force || now - lastBacklogRefreshAt >= CodeIndexEngineV2.PIPELINE_POLL_INTERVAL_MS) {
+						const elapsed = Math.max(now - lastBlockingReasonAt, 0)
+						if (lastBlockingReason === "parsed_revisions_waiting_for_planning") {
+							blockedOnParsedRevisionsMs += elapsed
+						}
+						if (lastBlockingReason === "staged_chunks_waiting_for_upsert") {
+							blockedOnStagedChunksMs += elapsed
+						}
+						latestBacklogMetrics = await this.metadataStore.getRunBacklogMetrics(runId)
+						lastBlockingReason = latestBacklogMetrics.blockingReason
+						lastBlockingReasonAt = now
+						lastBacklogRefreshAt = now
+						peakStagedChunks = Math.max(peakStagedChunks, latestBacklogMetrics.stagedChunks)
+						peakQueuedJobs = Math.max(
+							peakQueuedJobs,
+							latestBacklogMetrics.queuedUpsertJobs + latestBacklogMetrics.queuedDeleteJobs,
+						)
+					}
+					syncPipelineSnapshot(force)
+					emitBacklogSample(force)
+					return latestBacklogMetrics
+				})()
+				refreshBacklogMetricsPromise = promise
+				try {
+					return await promise
+				} finally {
+					if (refreshBacklogMetricsPromise === promise) {
+						refreshBacklogMetricsPromise = undefined
+					}
+				}
 			}
 			const updateResilienceStats = () => {
 				this.stateManager.setResilienceStats({
@@ -3958,128 +4031,145 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				})
 			}
 			const persistRunSnapshot = async (force = false) => {
-				const now = Date.now()
-				if (!force && now - lastRunHeartbeatAt < CodeIndexEngineV2.RUN_HEARTBEAT_INTERVAL_MS) {
-					return
+				if (persistRunSnapshotPromise) {
+					return persistRunSnapshotPromise
 				}
-				const hostMemory = IndexDebugLoggerV2.getMemorySnapshot()
-				const hostCpu = IndexDebugLoggerV2.getCpuSnapshot()
-				const trackedSidecars = getTrackedSidecarMetrics()
-
-				await (
-					this.metadataStore as MetadataGateway & {
-						heartbeatRun?: (runId: string, owner: string, progress?: unknown) => Promise<void>
+				const promise = (async () => {
+					const now = Date.now()
+					if (!force && now - lastRunHeartbeatAt < CodeIndexEngineV2.RUN_HEARTBEAT_INTERVAL_MS) {
+						return
 					}
-				).heartbeatRun?.(runId, runHeartbeatOwner, {
-					filesDiscovered: statHashSummary.checkedFiles,
-					filesHashed: statHashSummary.checkedFiles,
-					filesParsed: parsedRevisionsCompleted,
-					filesPlanned: Math.max(parsedRevisionsCompleted - latestBacklogMetrics.parsedRevisions, 0),
-					filesCommitted:
-						(latestSyncTelemetry?.degradedRevisions ?? 0) +
-						(latestSyncTelemetry?.terminalFailedRevisions ?? 0) +
-						Math.min(
-							parsedRevisionsCompleted,
-							Math.max(parsedRevisionsCompleted - latestBacklogMetrics.plannedRevisions, 0),
-						),
-					stagedChunks: latestBacklogMetrics.stagedChunks,
-					stagedChunkBytes: latestBacklogMetrics.stagedChunkBytes,
-					queuedUpsertJobs: latestBacklogMetrics.queuedUpsertJobs,
-					runningUpsertJobs: latestBacklogMetrics.runningUpsertJobs,
-					queuedDeleteJobs: latestBacklogMetrics.queuedDeleteJobs,
-					runningDeleteJobs: latestBacklogMetrics.runningDeleteJobs,
-					retryingParseRevisions,
-					terminalFailedParseRevisions,
-					retryingChunks: latestSyncTelemetry?.retryingChunks ?? 0,
-					terminalFailedChunks: latestSyncTelemetry?.terminallyFailedChunks ?? 0,
-					degradedRevisions: latestSyncTelemetry?.degradedRevisions ?? 0,
-					terminalFailedRevisions: latestSyncTelemetry?.terminalFailedRevisions ?? 0,
-					parseThrottleMs: totalParseThrottleMs,
-					averageParseBatchMs:
-						parsedRevisionsCompleted > 0 ? parseChunkMs / Math.max(parsedRevisionsCompleted, 1) : undefined,
-					averagePlanBatchMs:
-						parsedRevisionsCompleted > 0
-							? diffPlanningMs / Math.max(parsedRevisionsCompleted, 1)
-							: undefined,
-					averageEmbedBatchMs: latestSyncTelemetry?.averageBatchLatencyMs,
-					peakStagedChunks,
-					peakQueuedJobs,
-					blockingReason: parseSchedulingThrottled
-						? `parse_throttled:${parseThrottleReason ?? latestBacklogMetrics.blockingReason ?? "unknown"}`
-						: latestBacklogMetrics.blockingReason,
-				})
-				const sampleEventType =
-					force && lastSampledPressureState !== latestSyncTelemetry?.pressureState
-						? "pressure_transition"
-						: force
-							? "stage_transition"
-							: "heartbeat"
-				await (
-					this.metadataStore as MetadataGateway & {
-						appendRunSample?: (input: Record<string, unknown>) => Promise<void>
-					}
-				).appendRunSample?.({
-					runId,
-					workspaceId: this.metadataStore.getWorkspaceId(),
-					recordedAt: now,
-					stage: latestTelemetryStage,
-					eventType: sampleEventType,
-					blockingReason: latestBacklogMetrics.blockingReason,
-					pressureState: latestSyncTelemetry?.pressureState,
-					pressureReasons: latestSyncTelemetry?.pressureReasons,
-					laneConcurrency: latestSyncTelemetry?.laneConcurrency,
-					effectiveBatchSize: latestSyncTelemetry?.effectiveBatchSize,
-					activeLaneCount: latestSyncTelemetry?.activeLaneCount,
-					inFlightChunkCount: latestSyncTelemetry?.inFlightChunkCount,
-					peakInFlightChunkCount: latestSyncTelemetry?.peakInFlightChunkCount,
-					chunksPerSecond: latestSyncTelemetry?.chunksPerSecond,
-					peakChunksPerSecond: latestSyncTelemetry?.peakChunksPerSecond,
-					averageBatchLatencyMs: latestSyncTelemetry?.averageBatchLatencyMs,
-					averageEmbedLatencyMs: latestSyncTelemetry?.averageEmbedLatencyMs,
-					averageUpsertLatencyMs: latestSyncTelemetry?.averageUpsertLatencyMs,
-					averageMetadataCommitLatencyMs: latestSyncTelemetry?.averageMetadataCommitLatencyMs,
-					averageIdleGapMs: latestSyncTelemetry?.averageIdleGapMs,
-					waitingForJobsMs: latestSyncTelemetry?.waitingForJobsMs,
-					waitingForInFlightCapacityMs: latestSyncTelemetry?.waitingForInFlightCapacityMs,
-					waitingForPressureMs: latestSyncTelemetry?.waitingForPressureMs,
-					providerBatchUtilization: latestSyncTelemetry?.providerBatchUtilization,
-					embeddingsPerChunk: latestSyncTelemetry?.embeddingsPerChunk,
-					laneOccupancyPercent: latestSyncTelemetry?.laneOccupancyPercent,
-					embedActivePercent: latestSyncTelemetry?.embedActivePercent,
-					stagedChunks: latestBacklogMetrics.stagedChunks,
-					stagedChunkBytes: latestBacklogMetrics.stagedChunkBytes,
-					queuedUpsertJobs: latestBacklogMetrics.queuedUpsertJobs,
-					runningUpsertJobs: latestBacklogMetrics.runningUpsertJobs,
-					queuedDeleteJobs: latestBacklogMetrics.queuedDeleteJobs,
-					runningDeleteJobs: latestBacklogMetrics.runningDeleteJobs,
-					parsedRevisions: latestBacklogMetrics.parsedRevisions,
-					plannedRevisions: latestBacklogMetrics.plannedRevisions,
-					hostRssMB: hostMemory.rssMB,
-					hostHeapUsedMB: hostMemory.heapUsedMB,
-					hostExternalMB: hostMemory.externalMB,
-					hostCpuPercent: hostCpu.processPercent,
-					trackedSidecarRssMB: trackedSidecars.totalTrackedRssMB,
-					parseSidecarRssMB: trackedSidecars.parseSidecarRssMB,
-					embedSidecarRssMB: trackedSidecars.embedSidecarRssMB,
-					metadataSidecarRssMB: trackedSidecars.metadataSidecarRssMB,
-					metadataSidecarCpuPercent: trackedSidecars.metadataSidecarCpuPercent,
-					gpuSampler: latestSyncTelemetry?.gpu?.sampler,
-					gpuUtilizationPercent: latestSyncTelemetry?.gpu?.utilizationPercent,
-					gpuMemoryPressurePercent: latestSyncTelemetry?.gpu?.memoryPressurePercent,
-					gpuInUseBytes: latestSyncTelemetry?.gpu?.inUseBytes,
-					gpuAllocatedBytes: latestSyncTelemetry?.gpu?.allocatedBytes,
-					gpuPowerW: latestSyncTelemetry?.gpu?.powerW,
-				})
-				lastSampledPressureState = latestSyncTelemetry?.pressureState
-				lastRunHeartbeatAt = now
+					const parseSchedulingThrottled = Boolean(parseThrottleState)
+					const parseThrottleReason = parseThrottleState?.reason ?? null
+					const hostMemory = IndexDebugLoggerV2.getMemorySnapshot()
+					const hostCpu = IndexDebugLoggerV2.getCpuSnapshot()
+					const trackedSidecars = getTrackedSidecarMetrics()
+					const databaseFootprint = await getDatabaseFootprint()
 
-				if (now - lastMaintenanceAt >= CodeIndexEngineV2.SQLITE_MAINTENANCE_INTERVAL_MS) {
 					await (
 						this.metadataStore as MetadataGateway & {
-							checkpointWal?: (mode?: "PASSIVE" | "RESTART" | "TRUNCATE") => Promise<void>
+							heartbeatRun?: (runId: string, owner: string, progress?: unknown) => Promise<void>
 						}
-					).checkpointWal?.("PASSIVE")
-					lastMaintenanceAt = now
+					).heartbeatRun?.(runId, runHeartbeatOwner, {
+						filesDiscovered: statHashSummary.checkedFiles,
+						filesHashed: statHashSummary.checkedFiles,
+						filesParsed: parsedRevisionsCompleted,
+						filesPlanned: Math.max(parsedRevisionsCompleted - latestBacklogMetrics.parsedRevisions, 0),
+						filesCommitted:
+							(latestSyncTelemetry?.degradedRevisions ?? 0) +
+							(latestSyncTelemetry?.terminalFailedRevisions ?? 0) +
+							Math.min(
+								parsedRevisionsCompleted,
+								Math.max(parsedRevisionsCompleted - latestBacklogMetrics.plannedRevisions, 0),
+							),
+						stagedChunks: latestBacklogMetrics.stagedChunks,
+						stagedChunkBytes: latestBacklogMetrics.stagedChunkBytes,
+						queuedUpsertJobs: latestBacklogMetrics.queuedUpsertJobs,
+						runningUpsertJobs: latestBacklogMetrics.runningUpsertJobs,
+						queuedDeleteJobs: latestBacklogMetrics.queuedDeleteJobs,
+						runningDeleteJobs: latestBacklogMetrics.runningDeleteJobs,
+						retryingParseRevisions,
+						terminalFailedParseRevisions,
+						retryingChunks: latestSyncTelemetry?.retryingChunks ?? 0,
+						terminalFailedChunks: latestSyncTelemetry?.terminallyFailedChunks ?? 0,
+						degradedRevisions: latestSyncTelemetry?.degradedRevisions ?? 0,
+						terminalFailedRevisions: latestSyncTelemetry?.terminalFailedRevisions ?? 0,
+						parseThrottleMs: totalParseThrottleMs,
+						averageParseBatchMs:
+							parsedRevisionsCompleted > 0
+								? parseChunkMs / Math.max(parsedRevisionsCompleted, 1)
+								: undefined,
+						averagePlanBatchMs:
+							parsedRevisionsCompleted > 0
+								? diffPlanningMs / Math.max(parsedRevisionsCompleted, 1)
+								: undefined,
+						averageEmbedBatchMs: latestSyncTelemetry?.averageBatchLatencyMs,
+						peakStagedChunks,
+						peakQueuedJobs,
+						blockingReason: parseSchedulingThrottled
+							? `parse_throttled:${parseThrottleReason ?? latestBacklogMetrics.blockingReason ?? "unknown"}`
+							: latestBacklogMetrics.blockingReason,
+					})
+					const sampleEventType =
+						force && lastSampledPressureState !== latestSyncTelemetry?.pressureState
+							? "pressure_transition"
+							: force
+								? "stage_transition"
+								: "heartbeat"
+					await (
+						this.metadataStore as MetadataGateway & {
+							appendRunSample?: (input: Record<string, unknown>) => Promise<void>
+						}
+					).appendRunSample?.({
+						runId,
+						workspaceId: this.metadataStore.getWorkspaceId(),
+						recordedAt: now,
+						stage: latestTelemetryStage,
+						eventType: sampleEventType,
+						blockingReason: latestBacklogMetrics.blockingReason,
+						pressureState: latestSyncTelemetry?.pressureState,
+						pressureReasons: latestSyncTelemetry?.pressureReasons,
+						laneConcurrency: latestSyncTelemetry?.laneConcurrency,
+						effectiveBatchSize: latestSyncTelemetry?.effectiveBatchSize,
+						workerPhase: latestSyncTelemetry?.workerPhase ?? null,
+						activeLaneCount: latestSyncTelemetry?.activeLaneCount,
+						inFlightChunkCount: latestSyncTelemetry?.inFlightChunkCount,
+						peakInFlightChunkCount: latestSyncTelemetry?.peakInFlightChunkCount,
+						chunksPerSecond: latestSyncTelemetry?.chunksPerSecond,
+						peakChunksPerSecond: latestSyncTelemetry?.peakChunksPerSecond,
+						averageBatchLatencyMs: latestSyncTelemetry?.averageBatchLatencyMs,
+						averageEmbedLatencyMs: latestSyncTelemetry?.averageEmbedLatencyMs,
+						averageUpsertLatencyMs: latestSyncTelemetry?.averageUpsertLatencyMs,
+						averageMetadataCommitLatencyMs: latestSyncTelemetry?.averageMetadataCommitLatencyMs,
+						averageIdleGapMs: latestSyncTelemetry?.averageIdleGapMs,
+						waitingForJobsMs: latestSyncTelemetry?.waitingForJobsMs,
+						waitingForInFlightCapacityMs: latestSyncTelemetry?.waitingForInFlightCapacityMs,
+						waitingForPressureMs: latestSyncTelemetry?.waitingForPressureMs,
+						providerBatchUtilization: latestSyncTelemetry?.providerBatchUtilization,
+						embeddingsPerChunk: latestSyncTelemetry?.embeddingsPerChunk,
+						laneOccupancyPercent: latestSyncTelemetry?.laneOccupancyPercent,
+						embedActivePercent: latestSyncTelemetry?.embedActivePercent,
+						stagedChunks: latestBacklogMetrics.stagedChunks,
+						stagedChunkBytes: latestBacklogMetrics.stagedChunkBytes,
+						queuedUpsertJobs: latestBacklogMetrics.queuedUpsertJobs,
+						runningUpsertJobs: latestBacklogMetrics.runningUpsertJobs,
+						queuedDeleteJobs: latestBacklogMetrics.queuedDeleteJobs,
+						runningDeleteJobs: latestBacklogMetrics.runningDeleteJobs,
+						parsedRevisions: latestBacklogMetrics.parsedRevisions,
+						plannedRevisions: latestBacklogMetrics.plannedRevisions,
+						hostRssMB: hostMemory.rssMB,
+						hostHeapUsedMB: hostMemory.heapUsedMB,
+						hostExternalMB: hostMemory.externalMB,
+						hostCpuPercent: hostCpu.processPercent,
+						trackedSidecarRssMB: trackedSidecars.totalTrackedRssMB,
+						parseSidecarRssMB: trackedSidecars.parseSidecarRssMB,
+						embedSidecarRssMB: trackedSidecars.embedSidecarRssMB,
+						metadataSidecarRssMB: trackedSidecars.metadataSidecarRssMB,
+						metadataSidecarCpuPercent: trackedSidecars.metadataSidecarCpuPercent,
+						metadataSidecarHeapUsedMB: trackedSidecars.metadataSidecarHeapUsedMB,
+						metadataSidecarExternalMB: trackedSidecars.metadataSidecarExternalMB,
+						metadataSidecarArrayBuffersMB: trackedSidecars.metadataSidecarArrayBuffersMB,
+						metadataDbBytes: databaseFootprint.metadataDbBytes,
+						metadataWalBytes: databaseFootprint.metadataWalBytes,
+						telemetryDbBytes: databaseFootprint.telemetryDbBytes,
+						telemetryWalBytes: databaseFootprint.telemetryWalBytes,
+						gpuSampler: latestSyncTelemetry?.gpu?.sampler,
+						gpuUtilizationPercent: latestSyncTelemetry?.gpu?.utilizationPercent,
+						gpuMemoryPressurePercent: latestSyncTelemetry?.gpu?.memoryPressurePercent,
+						gpuInUseBytes: latestSyncTelemetry?.gpu?.inUseBytes,
+						gpuAllocatedBytes: latestSyncTelemetry?.gpu?.allocatedBytes,
+						gpuPowerW: latestSyncTelemetry?.gpu?.powerW,
+					})
+					lastSampledPressureState = latestSyncTelemetry?.pressureState
+					lastRunHeartbeatAt = now
+				})()
+				persistRunSnapshotPromise = promise
+				try {
+					await promise
+				} finally {
+					if (persistRunSnapshotPromise === promise) {
+						persistRunSnapshotPromise = undefined
+					}
 				}
 			}
 			const ensureEmbedPhaseStarted = (
@@ -4140,20 +4230,27 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				return fragments.length > 0 ? ` • ${fragments.join(" • ")}` : ""
 			}
 			const updateEmbeddingDetail = () => {
+				const parseSchedulingThrottled = Boolean(parseThrottleState)
+				const currentSyncedChunksCompleted = Math.max(syncedChunksCompleted, liveSyncedChunksCompleted)
 				const blockingReasonText = this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
-					parseThrottled: parseSchedulingThrottled,
-					parseThrottleReason,
+					parseThrottleState,
 					activationCatchUp:
 						latestBacklogMetrics.plannedRevisions > 0 &&
 						this.getRunnableEmbedQueueDepth(latestBacklogMetrics) === 0 &&
-						(latestSyncTelemetry?.readyRevisionCount ?? 0) > 0,
+						(latestSyncTelemetry?.workerPhase === "activation" ||
+							(latestSyncTelemetry?.readyRevisionCount ?? 0) > 0),
+					runnableEmbedQueueDepth: this.getRunnableEmbedQueueDepth(latestBacklogMetrics),
+					workerPhase: latestSyncTelemetry?.workerPhase,
+					vectorSyncOutstandingWork:
+						latestBacklogMetrics.stagedChunks > 0 ||
+						this.getRunnableEmbedQueueDepth(latestBacklogMetrics) > 0,
 				})
 				const throttleSuffix = parseSchedulingThrottled
 					? ` • ${blockingReasonText ?? `Parse throttled while ${latestBacklogMetrics.stagedChunks.toLocaleString()} parsed chunks and ${this.getRunnableEmbedQueueDepth(latestBacklogMetrics).toLocaleString()} runnable vector jobs drain`}`
 					: ""
 				this.stateManager.setActivityDetail(
 					[
-						`Parsing ${parsedRevisionsCompleted.toLocaleString()} of ${totalChangedFiles.toLocaleString()} files • Streaming ${syncedChunksCompleted.toLocaleString()} of ${Math.max(parsedChunksCompleted, 1).toLocaleString()} parsed chunks${buildFailureSuffix()}${throttleSuffix}`,
+						`Parsing ${parsedRevisionsCompleted.toLocaleString()} of ${totalChangedFiles.toLocaleString()} files • Streaming ${currentSyncedChunksCompleted.toLocaleString()} of ${Math.max(parsedChunksCompleted, 1).toLocaleString()} parsed chunks${buildFailureSuffix()}${throttleSuffix}`,
 						this.getEmbeddingRuntimeStatusText(dependencies.embeddingAdapter, latestSyncTelemetry),
 					].join("\n"),
 				)
@@ -4238,11 +4335,14 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						readyRevisionCount,
 						activatedChunkCount,
 						supersededChunkCount,
+						workerPhase,
 						activeLaneCount,
 						inFlightChunkCount,
 						gpu,
 					}) => {
-						const totalSyncedChunks = syncedChunksCompleted + upsertedChunks + deletedChunks
+						liveUpsertedChunksCompleted = upsertedChunksCompleted + upsertedChunks
+						liveDeletedChunksCompleted = deletedChunksCompleted + deletedChunks
+						liveSyncedChunksCompleted = liveUpsertedChunksCompleted + liveDeletedChunksCompleted
 						latestSyncTelemetry = {
 							laneConcurrency,
 							effectiveBatchSize,
@@ -4294,21 +4394,28 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 							readyRevisionCount,
 							activatedChunkCount,
 							supersededChunkCount,
+							workerPhase,
 							activeLaneCount,
 							inFlightChunkCount,
 							gpu,
 						}
 						updateEmbeddingDetail()
+						syncPipelineSnapshot(true)
 						updateResilienceStats()
 						this.stateManager.reportEmbedProgress(
-							totalSyncedChunks,
-							Math.max(parsedChunksCompleted, totalSyncedChunks, latestBacklogMetrics.stagedChunks, 1),
+							liveSyncedChunksCompleted,
+							Math.max(
+								parsedChunksCompleted,
+								liveSyncedChunksCompleted,
+								latestBacklogMetrics.stagedChunks,
+								1,
+							),
 							parsedRevisionsCompleted,
 							parseFinished,
 							{
 								detailedStage: "embedding",
 								hasKnownVectorWork: true,
-								hasStartedVectorSync: totalSyncedChunks > 0,
+								hasStartedVectorSync: liveSyncedChunksCompleted > 0,
 								isBackgroundReconcile: options?.isBackgroundReconcile ?? false,
 							},
 						)
@@ -4318,6 +4425,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				syncedChunksCompleted += syncSummary.upsertedChunks + syncSummary.deletedChunks
 				upsertedChunksCompleted += syncSummary.upsertedChunks
 				deletedChunksCompleted += syncSummary.deletedChunks
+				liveSyncedChunksCompleted = syncedChunksCompleted
+				liveUpsertedChunksCompleted = upsertedChunksCompleted
+				liveDeletedChunksCompleted = deletedChunksCompleted
 				await this.refreshOutstandingResumedJobs(runId)
 				await refreshBacklogMetrics(true)
 				updateResilienceStats()
@@ -4446,18 +4556,17 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					schedulerProfile,
 					embedPhaseStarted,
 				)
-				if (!parseSchedulingThrottled && !nextParseThrottleReason) {
+				if (!parseThrottleState && !nextParseThrottleReason) {
 					return
 				}
 
-				parseSchedulingThrottled = true
-				parseThrottleReason = nextParseThrottleReason
+				parseThrottleState = nextParseThrottleReason ? { reason: nextParseThrottleReason } : parseThrottleState
 				const throttledStartedAt = Date.now()
 				this._status = {
 					engine: this.engine,
 					state: "running",
 					message:
-						parseThrottleReason === "planner_starvation_guard"
+						parseThrottleState?.reason === "planner_starvation_guard"
 							? `Pausing parse scheduling while the planner refills runnable vector work`
 							: `Pausing parse scheduling while SQLite staging drains`,
 				}
@@ -4469,7 +4578,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						schedulerProfile,
 						embedPhaseStarted,
 					)
-					parseThrottleReason = currentParseThrottleReason
+					parseThrottleState = currentParseThrottleReason ? { reason: currentParseThrottleReason } : null
 					if (this.shouldResumeParse(latestBacklogMetrics, schedulerProfile, currentParseThrottleReason)) {
 						break
 					}
@@ -4485,8 +4594,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					await persistRunSnapshot()
 				}
 				totalParseThrottleMs += Date.now() - throttledStartedAt
-				parseSchedulingThrottled = false
-				parseThrottleReason = null
+				parseThrottleState = null
 				updateEmbeddingDetail()
 				await persistRunSnapshot(true)
 			}
@@ -4710,8 +4818,20 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				},
 			}
 		} catch (error) {
+			const metadataTimeout = this.isMetadataSidecarRuntimeError(error)
+			if (metadataTimeout) {
+				this.stopActivityHeartbeat()
+				this.stateManager.setActivityDetail("")
+				const failureMessage = this.getMetadataSidecarFailureMessage(error)
+				this._status = {
+					engine: this.engine,
+					state: "error",
+					message: failureMessage,
+				}
+				this.stateManager.setSystemState("Error", failureMessage)
+			}
 			if (this.isAbortError(error) && this._stopRequested) {
-				await this.metadataStore.markRunStopped(runId, "Stopped by user.")
+				await this.metadataStore.markRunStopped(runId, "Stopped by user.").catch(() => undefined)
 				this.logPipelineTerminalEvent("run-stopped", runId, {
 					message: "Run stopped by user.",
 					errorMessage: "Stopped by user.",
@@ -4719,7 +4839,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				})
 			} else {
 				const errorMessage = this.getStopAwareErrorMessage(error)
-				await this.metadataStore.markRunFailed(runId, errorMessage)
+				await this.metadataStore.markRunFailed(runId, errorMessage).catch(() => undefined)
 				this.logPipelineTerminalEvent("run-failed", runId, {
 					message: this._status.message,
 					errorMessage,
@@ -4864,24 +4984,40 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private describeBlockingReason(
 		blockingReason?: string | null,
 		options?: {
-			parseThrottled?: boolean
-			parseThrottleReason?: "high_watermark" | "planner_starvation_guard" | null
+			parseThrottleState?: ParseThrottleState | null
 			activationCatchUp?: boolean
+			runnableEmbedQueueDepth?: number
+			workerPhase?: string | null
+			vectorSyncOutstandingWork?: boolean
 		},
 	): string | undefined {
-		if (!blockingReason || blockingReason === "idle") {
+		const normalized = blockingReason?.trim()
+		const runnableEmbedQueueDepth = options?.runnableEmbedQueueDepth ?? 0
+		const workerPhase = options?.workerPhase ?? null
+		const vectorSyncOutstandingWork = options?.vectorSyncOutstandingWork ?? false
+
+		if (options?.parseThrottleState?.reason === "planner_starvation_guard") {
+			return "Parsing is temporarily throttled while the planner catches up."
+		}
+		if (options?.parseThrottleState?.reason === "high_watermark") {
+			return "Parsing is temporarily throttled while staged SQLite work drains."
+		}
+		if (workerPhase === "activation") {
+			return "Revision activation is catching up before more vector sync work starts."
+		}
+		if (workerPhase === "claiming" && runnableEmbedQueueDepth > 0) {
+			return "Claiming queued vector sync work."
+		}
+		if (workerPhase === "delete") {
+			return "Removing stale vectors."
+		}
+		if (vectorSyncOutstandingWork && runnableEmbedQueueDepth > 0) {
+			return undefined
+		}
+		if (!normalized || normalized === "idle") {
 			return undefined
 		}
 
-		const normalized = blockingReason.trim()
-		if (options?.parseThrottled) {
-			if (options.parseThrottleReason === "planner_starvation_guard") {
-				return "Parsing is temporarily throttled while the planner catches up."
-			}
-			if (options.parseThrottleReason === "high_watermark") {
-				return "Parsing is temporarily throttled while staged SQLite work drains."
-			}
-		}
 		if (normalized === "parse_throttled:planner_starvation_guard") {
 			return "Parsing is temporarily throttled while the planner catches up."
 		}
@@ -4894,10 +5030,16 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		if (options?.activationCatchUp && normalized === "parsed_revisions_waiting_for_planning") {
 			return "Revision activation is catching up before more vector sync work starts."
 		}
+		if (normalized === "staged_chunks_waiting_for_upsert" && runnableEmbedQueueDepth > 0) {
+			return "Queued vector sync work is actively being claimed and processed."
+		}
+		if (normalized === "parsed_revisions_waiting_for_planning" && runnableEmbedQueueDepth > 0) {
+			return "Planning continues while queued vector sync work drains."
+		}
 
 		switch (normalized) {
 			case "parsed_revisions_waiting_for_planning":
-				return "Planner is catching up before more parsed files are handed off."
+				return "Parsing is temporarily throttled while the planner catches up."
 			case "staged_chunks_waiting_for_upsert":
 				return "Waiting for queued vector sync work to drain."
 			default:
@@ -5110,6 +5252,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		},
 	): Promise<void> {
 		const build = IndexDebugLoggerV2.getBuildInfo()
+		await this.performMetadataMaintenance({
+			checkpointMode: "TRUNCATE",
+			shrinkMemory: true,
+		})
 		const hostMemory = IndexDebugLoggerV2.getMemorySnapshot()
 		const hostCpu = IndexDebugLoggerV2.getCpuSnapshot()
 		const progressRecord = await (
@@ -5129,8 +5275,27 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		).getRunProgressRecord?.(runId)
 		const tracked = (IndexDebugLoggerV2.getTrackedProcessSummary() ?? {}) as {
 			totalTrackedRssMB?: number
-			byGroup?: Record<string, { totalRssMB?: number; totalCpuPercent?: number }>
+			byGroup?: Record<
+				string,
+				{
+					totalRssMB?: number
+					totalCpuPercent?: number
+					totalHeapUsedMB?: number
+					totalExternalMB?: number
+					totalArrayBuffersMB?: number
+				}
+			>
 		}
+		const statBytes = async (filePath: string) => {
+			try {
+				const stat = await fs.stat(filePath)
+				return stat.size
+			} catch {
+				return 0
+			}
+		}
+		const metadataDbPath = this.metadataStore.getDatabasePath()
+		const telemetryDbPath = this.metadataStore.getTelemetryDatabasePath()
 		await (
 			this.metadataStore as MetadataGateway & {
 				writeRunSummary?: (input: Record<string, unknown>) => Promise<void>
@@ -5209,6 +5374,13 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			embedSidecarRssMB: tracked.byGroup?.embedSidecars?.totalRssMB ?? 0,
 			metadataSidecarRssMB: tracked.byGroup?.metadataSidecar?.totalRssMB ?? 0,
 			metadataSidecarCpuPercent: tracked.byGroup?.metadataSidecar?.totalCpuPercent ?? 0,
+			metadataSidecarHeapUsedMB: tracked.byGroup?.metadataSidecar?.totalHeapUsedMB ?? 0,
+			metadataSidecarExternalMB: tracked.byGroup?.metadataSidecar?.totalExternalMB ?? 0,
+			metadataSidecarArrayBuffersMB: tracked.byGroup?.metadataSidecar?.totalArrayBuffersMB ?? 0,
+			metadataDbBytes: await statBytes(metadataDbPath),
+			metadataWalBytes: await statBytes(`${metadataDbPath}-wal`),
+			telemetryDbBytes: await statBytes(telemetryDbPath),
+			telemetryWalBytes: await statBytes(`${telemetryDbPath}-wal`),
 			gpuSampler: input.pipelineSummary?.performance.gpu?.sampler,
 			gpuUtilizationPercent: input.pipelineSummary?.performance.gpu?.utilizationPercent,
 			gpuMemoryPressurePercent: input.pipelineSummary?.performance.gpu?.memoryPressurePercent,
@@ -5483,6 +5655,45 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			return "Stopped by user."
 		}
 		return error instanceof Error ? error.message : String(error)
+	}
+
+	private isMetadataSidecarRuntimeError(error: unknown): error is Error {
+		return (
+			error instanceof Error &&
+			(error.name === "MetadataSidecarRequestTimeoutError" || error.name === "MetadataSidecarUnavailableError")
+		)
+	}
+
+	private getMetadataSidecarFailureMessage(error: unknown): string {
+		const message = this.getStopAwareErrorMessage(error)
+		return `Code Index V2 stopped because the metadata sidecar stalled: ${message}`
+	}
+
+	private async performMetadataMaintenance(input?: {
+		checkpointMode?: "PASSIVE" | "RESTART" | "TRUNCATE"
+		shrinkMemory?: boolean
+	}): Promise<unknown> {
+		const performMaintenance = (
+			this.metadataStore as MetadataGateway & {
+				performMaintenance?: (input?: {
+					checkpointMode?: "PASSIVE" | "RESTART" | "TRUNCATE"
+					shrinkMemory?: boolean
+				}) => Promise<unknown>
+			}
+		).performMaintenance
+		if (!performMaintenance) {
+			return undefined
+		}
+		if (this._metadataMaintenancePromise) {
+			return this._metadataMaintenancePromise
+		}
+		const promise = performMaintenance.call(this.metadataStore, input).finally(() => {
+			if (this._metadataMaintenancePromise === promise) {
+				this._metadataMaintenancePromise = undefined
+			}
+		})
+		this._metadataMaintenancePromise = promise
+		return promise
 	}
 
 	private startActivityHeartbeat(messageFactory: () => string): void {

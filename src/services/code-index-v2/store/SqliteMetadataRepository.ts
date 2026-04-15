@@ -25,6 +25,7 @@ import {
 	IndexRunSummaryRecord,
 	JobInput,
 	JobRecord,
+	MetadataMaintenanceSummary,
 	OversizedTrackedFileInput,
 	OversizedTrackedFileRecord,
 	PaginatedOversizedTrackedFiles,
@@ -70,6 +71,7 @@ const PRESERVED_PENDING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const DEFAULT_JOB_LEASE_MS = 30_000
 const MAX_PERSISTED_RUN_SUMMARIES = 100
 const MAX_PERSISTED_RUN_SAMPLES_PER_RUN = 512
+const RUN_BACKLOG_CACHE_TTL_MS = 250
 const FTS_STOPWORDS = new Set([
 	"a",
 	"about",
@@ -172,6 +174,7 @@ export class SqliteMetadataRepository {
 	private readonly bootstrapPath: string
 	private _db: SqliteDatabaseSync | undefined
 	private _telemetryDb: SqliteDatabaseSync | undefined
+	private readonly _runBacklogMetricsCache = new Map<string, { recordedAt: number; metrics: RunBacklogMetrics }>()
 
 	constructor(paths: ResolvedMetadataStorePaths) {
 		this.workspaceHash = paths.workspaceHash
@@ -238,6 +241,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async dispose(): Promise<void> {
+		this.invalidateRunBacklogMetricsCache()
 		this._db?.close()
 		this._db = undefined
 		this._telemetryDb?.close()
@@ -246,6 +250,7 @@ export class SqliteMetadataRepository {
 
 	async clearStorage(options?: { includeTelemetry?: boolean }): Promise<void> {
 		const includeTelemetry = options?.includeTelemetry ?? false
+		this.invalidateRunBacklogMetricsCache()
 		await this.disposeOperationalDatabase()
 		const persistentOperationalStoreRemoved = await this.removeSqliteArtifacts(this.dbPath)
 		const legacyOperationalStoreRemoved = await this.removeSqliteArtifacts(this.getLegacyDatabasePath())
@@ -315,6 +320,7 @@ export class SqliteMetadataRepository {
 				) VALUES (?, ?, ?, ?, ?, ?, 0, 0)`,
 			)
 			.run(runId, this.workspaceHash, triggerType, "started", now, now)
+		this.invalidateRunBacklogMetricsCache(runId)
 
 		return runId
 	}
@@ -323,6 +329,7 @@ export class SqliteMetadataRepository {
 		this.db()
 			.prepare(`UPDATE index_runs SET state = ?, discovery_complete = 1, last_heartbeat_at = ? WHERE run_id = ?`)
 			.run("discovery_complete", Date.now(), runId)
+		this.invalidateRunBacklogMetricsCache(runId)
 	}
 
 	async markRunComplete(runId: string): Promise<void> {
@@ -333,6 +340,7 @@ export class SqliteMetadataRepository {
 				 WHERE run_id = ?`,
 			)
 			.run("complete", Date.now(), Date.now(), null, runId)
+		this.invalidateRunBacklogMetricsCache(runId)
 	}
 
 	async markRunFailed(runId: string, errorMessage: string): Promise<void> {
@@ -343,6 +351,7 @@ export class SqliteMetadataRepository {
 				 WHERE run_id = ?`,
 			)
 			.run("failed", Date.now(), Date.now(), errorMessage, runId)
+		this.invalidateRunBacklogMetricsCache(runId)
 	}
 
 	async markRunStopped(runId: string, errorMessage = "Stopped by user."): Promise<void> {
@@ -392,6 +401,7 @@ export class SqliteMetadataRepository {
 					AND state NOT IN ('upserted', 'deleted', 'abandoned')`,
 			)
 			.run(now, runId, runId)
+		this.invalidateRunBacklogMetricsCache(runId)
 	}
 
 	async heartbeatRun(runId: string, owner: string, progress?: RunProgressSnapshot): Promise<void> {
@@ -467,6 +477,13 @@ export class SqliteMetadataRepository {
 			input.embedSidecarRssMB ?? null,
 			input.metadataSidecarRssMB ?? null,
 			input.metadataSidecarCpuPercent ?? null,
+			input.metadataSidecarHeapUsedMB ?? null,
+			input.metadataSidecarExternalMB ?? null,
+			input.metadataSidecarArrayBuffersMB ?? null,
+			input.metadataDbBytes ?? null,
+			input.metadataWalBytes ?? null,
+			input.telemetryDbBytes ?? null,
+			input.telemetryWalBytes ?? null,
 			input.gpuSampler ?? null,
 			input.gpuUtilizationPercent ?? null,
 			input.gpuMemoryPressurePercent ?? null,
@@ -511,7 +528,9 @@ export class SqliteMetadataRepository {
 					pressure_soft_duration_ms, pressure_hard_duration_ms, parse_throttle_ms,
 					peak_staged_chunks, peak_queued_jobs, host_rss_mb, host_heap_used_mb, host_external_mb,
 					host_cpu_percent, tracked_sidecar_rss_mb, parse_sidecar_rss_mb, embed_sidecar_rss_mb,
-					metadata_sidecar_rss_mb, metadata_sidecar_cpu_percent,
+					metadata_sidecar_rss_mb, metadata_sidecar_cpu_percent, metadata_sidecar_heap_used_mb,
+					metadata_sidecar_external_mb, metadata_sidecar_array_buffers_mb, metadata_db_bytes,
+					metadata_wal_bytes, telemetry_db_bytes, telemetry_wal_bytes,
 					gpu_sampler, gpu_utilization_percent, gpu_memory_pressure_percent, gpu_in_use_bytes,
 					gpu_allocated_bytes, gpu_power_w, average_gpu_utilization_percent, peak_gpu_utilization_percent,
 					average_gpu_in_use_bytes, peak_gpu_in_use_bytes, gpu_sample_count, embeddings_per_chunk,
@@ -576,6 +595,13 @@ export class SqliteMetadataRepository {
 					embed_sidecar_rss_mb=excluded.embed_sidecar_rss_mb,
 					metadata_sidecar_rss_mb=excluded.metadata_sidecar_rss_mb,
 					metadata_sidecar_cpu_percent=excluded.metadata_sidecar_cpu_percent,
+					metadata_sidecar_heap_used_mb=excluded.metadata_sidecar_heap_used_mb,
+					metadata_sidecar_external_mb=excluded.metadata_sidecar_external_mb,
+					metadata_sidecar_array_buffers_mb=excluded.metadata_sidecar_array_buffers_mb,
+					metadata_db_bytes=excluded.metadata_db_bytes,
+					metadata_wal_bytes=excluded.metadata_wal_bytes,
+					telemetry_db_bytes=excluded.telemetry_db_bytes,
+					telemetry_wal_bytes=excluded.telemetry_wal_bytes,
 					gpu_sampler=excluded.gpu_sampler,
 					gpu_utilization_percent=excluded.gpu_utilization_percent,
 					gpu_memory_pressure_percent=excluded.gpu_memory_pressure_percent,
@@ -612,7 +638,7 @@ export class SqliteMetadataRepository {
 			.prepare(
 				`INSERT INTO index_run_samples (
 					sample_id, run_id, workspace_id, recorded_at, stage, event_type, blocking_reason,
-					pressure_state, pressure_reasons_json, lane_concurrency, effective_batch_size, active_lane_count,
+					pressure_state, pressure_reasons_json, lane_concurrency, effective_batch_size, worker_phase, active_lane_count,
 					in_flight_chunk_count, peak_in_flight_chunk_count, chunks_per_second, peak_chunks_per_second,
 					average_batch_latency_ms, average_embed_latency_ms, average_upsert_latency_ms,
 					average_metadata_commit_latency_ms, average_idle_gap_ms, waiting_for_jobs_ms,
@@ -622,11 +648,13 @@ export class SqliteMetadataRepository {
 					queued_upsert_jobs, running_upsert_jobs, queued_delete_jobs, running_delete_jobs,
 					parsed_revisions, planned_revisions, host_rss_mb, host_heap_used_mb, host_external_mb,
 					host_cpu_percent, tracked_sidecar_rss_mb, parse_sidecar_rss_mb, embed_sidecar_rss_mb,
-					metadata_sidecar_rss_mb, metadata_sidecar_cpu_percent,
+					metadata_sidecar_rss_mb, metadata_sidecar_cpu_percent, metadata_sidecar_heap_used_mb,
+					metadata_sidecar_external_mb, metadata_sidecar_array_buffers_mb, metadata_db_bytes,
+					metadata_wal_bytes, telemetry_db_bytes, telemetry_wal_bytes,
 					gpu_sampler, gpu_utilization_percent, gpu_memory_pressure_percent, gpu_in_use_bytes,
 					gpu_allocated_bytes, gpu_power_w, details_json
 				) VALUES (
-					${Array.from({ length: 54 }, () => "?").join(", ")}
+					${Array.from({ length: 62 }, () => "?").join(", ")}
 				)`,
 			)
 			.run(
@@ -641,6 +669,7 @@ export class SqliteMetadataRepository {
 				input.pressureReasons ? JSON.stringify(input.pressureReasons) : null,
 				input.laneConcurrency ?? null,
 				input.effectiveBatchSize ?? null,
+				input.workerPhase ?? null,
 				input.activeLaneCount ?? null,
 				input.inFlightChunkCount ?? null,
 				input.peakInFlightChunkCount ?? null,
@@ -677,6 +706,13 @@ export class SqliteMetadataRepository {
 				input.embedSidecarRssMB ?? null,
 				input.metadataSidecarRssMB ?? null,
 				input.metadataSidecarCpuPercent ?? null,
+				input.metadataSidecarHeapUsedMB ?? null,
+				input.metadataSidecarExternalMB ?? null,
+				input.metadataSidecarArrayBuffersMB ?? null,
+				input.metadataDbBytes ?? null,
+				input.metadataWalBytes ?? null,
+				input.telemetryDbBytes ?? null,
+				input.telemetryWalBytes ?? null,
 				input.gpuSampler ?? null,
 				input.gpuUtilizationPercent ?? null,
 				input.gpuMemoryPressurePercent ?? null,
@@ -749,6 +785,13 @@ export class SqliteMetadataRepository {
 					embed_sidecar_rss_mb AS embedSidecarRssMB,
 					metadata_sidecar_rss_mb AS metadataSidecarRssMB,
 					metadata_sidecar_cpu_percent AS metadataSidecarCpuPercent,
+					metadata_sidecar_heap_used_mb AS metadataSidecarHeapUsedMB,
+					metadata_sidecar_external_mb AS metadataSidecarExternalMB,
+					metadata_sidecar_array_buffers_mb AS metadataSidecarArrayBuffersMB,
+					metadata_db_bytes AS metadataDbBytes,
+					metadata_wal_bytes AS metadataWalBytes,
+					telemetry_db_bytes AS telemetryDbBytes,
+					telemetry_wal_bytes AS telemetryWalBytes,
 					gpu_sampler AS gpuSampler,
 					gpu_utilization_percent AS gpuUtilizationPercent,
 					gpu_memory_pressure_percent AS gpuMemoryPressurePercent,
@@ -844,6 +887,13 @@ export class SqliteMetadataRepository {
 					embed_sidecar_rss_mb AS embedSidecarRssMB,
 					metadata_sidecar_rss_mb AS metadataSidecarRssMB,
 					metadata_sidecar_cpu_percent AS metadataSidecarCpuPercent,
+					metadata_sidecar_heap_used_mb AS metadataSidecarHeapUsedMB,
+					metadata_sidecar_external_mb AS metadataSidecarExternalMB,
+					metadata_sidecar_array_buffers_mb AS metadataSidecarArrayBuffersMB,
+					metadata_db_bytes AS metadataDbBytes,
+					metadata_wal_bytes AS metadataWalBytes,
+					telemetry_db_bytes AS telemetryDbBytes,
+					telemetry_wal_bytes AS telemetryWalBytes,
 					gpu_sampler AS gpuSampler,
 					gpu_utilization_percent AS gpuUtilizationPercent,
 					gpu_memory_pressure_percent AS gpuMemoryPressurePercent,
@@ -891,6 +941,7 @@ export class SqliteMetadataRepository {
 					pressure_reasons_json AS pressureReasonsJson,
 					lane_concurrency AS laneConcurrency,
 					effective_batch_size AS effectiveBatchSize,
+					worker_phase AS workerPhase,
 					active_lane_count AS activeLaneCount,
 					in_flight_chunk_count AS inFlightChunkCount,
 					peak_in_flight_chunk_count AS peakInFlightChunkCount,
@@ -927,6 +978,13 @@ export class SqliteMetadataRepository {
 					embed_sidecar_rss_mb AS embedSidecarRssMB,
 					metadata_sidecar_rss_mb AS metadataSidecarRssMB,
 					metadata_sidecar_cpu_percent AS metadataSidecarCpuPercent,
+					metadata_sidecar_heap_used_mb AS metadataSidecarHeapUsedMB,
+					metadata_sidecar_external_mb AS metadataSidecarExternalMB,
+					metadata_sidecar_array_buffers_mb AS metadataSidecarArrayBuffersMB,
+					metadata_db_bytes AS metadataDbBytes,
+					metadata_wal_bytes AS metadataWalBytes,
+					telemetry_db_bytes AS telemetryDbBytes,
+					telemetry_wal_bytes AS telemetryWalBytes,
 					gpu_sampler AS gpuSampler,
 					gpu_utilization_percent AS gpuUtilizationPercent,
 					gpu_memory_pressure_percent AS gpuMemoryPressurePercent,
@@ -950,6 +1008,61 @@ export class SqliteMetadataRepository {
 
 	async checkpointWal(mode: "PASSIVE" | "RESTART" | "TRUNCATE" = "PASSIVE"): Promise<void> {
 		this.db().prepare(`PRAGMA wal_checkpoint(${mode})`).get()
+	}
+
+	async performMaintenance(input?: {
+		checkpointMode?: "PASSIVE" | "RESTART" | "TRUNCATE"
+		shrinkMemory?: boolean
+	}): Promise<MetadataMaintenanceSummary> {
+		const checkpointMode = input?.checkpointMode ?? "PASSIVE"
+		const shrinkMemory = input?.shrinkMemory ?? false
+		const memoryBefore = IndexDebugLoggerV2.getMemorySnapshot()
+		await this.checkpointWal(checkpointMode)
+		this.telemetryDb().prepare(`PRAGMA wal_checkpoint(${checkpointMode})`).get()
+		if (shrinkMemory) {
+			this.db().prepare("PRAGMA shrink_memory").run()
+			this.telemetryDb().prepare("PRAGMA shrink_memory").run()
+		}
+		const memoryAfter = IndexDebugLoggerV2.getMemorySnapshot()
+		const summary: MetadataMaintenanceSummary = {
+			checkpointMode,
+			shrinkMemory,
+			operationalDbBytes: await this.getFileSize(this.dbPath),
+			operationalWalBytes: await this.getFileSize(`${this.dbPath}-wal`),
+			telemetryDbBytes: await this.getFileSize(this.telemetryDbPath),
+			telemetryWalBytes: await this.getFileSize(`${this.telemetryDbPath}-wal`),
+			memoryBefore: {
+				rssMB: memoryBefore.rssMB,
+				heapUsedMB: memoryBefore.heapUsedMB,
+				externalMB: memoryBefore.externalMB,
+				arrayBuffersMB: memoryBefore.arrayBuffersMB ?? 0,
+			},
+			memoryAfter: {
+				rssMB: memoryAfter.rssMB,
+				heapUsedMB: memoryAfter.heapUsedMB,
+				externalMB: memoryAfter.externalMB,
+				arrayBuffersMB: memoryAfter.arrayBuffersMB ?? 0,
+			},
+		}
+
+		IndexDebugLoggerV2.log("basic", "MetadataStore", "metadata-maintenance-complete", {
+			component: "MetadataStore",
+			workspacePath: this.workspacePath,
+			checkpointMode,
+			shrinkMemory,
+			operationalDbBytes: summary.operationalDbBytes,
+			operationalWalBytes: summary.operationalWalBytes,
+			telemetryDbBytes: summary.telemetryDbBytes,
+			telemetryWalBytes: summary.telemetryWalBytes,
+			memoryBefore: summary.memoryBefore,
+			memoryAfter: summary.memoryAfter,
+			rssDeltaMB: summary.memoryAfter.rssMB - summary.memoryBefore.rssMB,
+			heapUsedDeltaMB: summary.memoryAfter.heapUsedMB - summary.memoryBefore.heapUsedMB,
+			externalDeltaMB: summary.memoryAfter.externalMB - summary.memoryBefore.externalMB,
+			arrayBuffersDeltaMB: summary.memoryAfter.arrayBuffersMB - summary.memoryBefore.arrayBuffersMB,
+		})
+
+		return summary
 	}
 
 	async getRunProgressRecord(runId: string): Promise<RunProgressRecord | undefined> {
@@ -1157,6 +1270,7 @@ export class SqliteMetadataRepository {
 			jobId: `${jobsResult.changes ?? 0}:${revisionsResult.changes ?? 0}:${chunksResult.changes ?? 0}`,
 		})
 		const garbageCollection = this.garbageCollectExpiredPendingRuns()
+		this.invalidateRunBacklogMetricsCache()
 
 		return {
 			staleRunIds,
@@ -1217,6 +1331,7 @@ export class SqliteMetadataRepository {
 				)`,
 		)
 		adoptPlannedRevisions.run(targetRunId, ...candidateRunIds, targetRunId)
+		this.invalidateRunBacklogMetricsCache(targetRunId)
 
 		return adoptedJobsResult.changes ?? 0
 	}
@@ -1741,6 +1856,7 @@ export class SqliteMetadataRepository {
 		this.db()
 			.prepare(`UPDATE file_revisions SET state = ?, failure_reason = ? WHERE revision_id = ?`)
 			.run("terminal_failed", reason, revisionId)
+		this.invalidateRunBacklogMetricsCache()
 	}
 
 	async markRevisionSuperseded(revisionId: string): Promise<void> {
@@ -1768,6 +1884,7 @@ export class SqliteMetadataRepository {
 
 	async markRevisionState(revisionId: string, state: FileRevisionRecord["state"]): Promise<void> {
 		this.db().prepare(`UPDATE file_revisions SET state = ? WHERE revision_id = ?`).run(state, revisionId)
+		this.invalidateRunBacklogMetricsCache()
 	}
 
 	async finalizeReadyRevisionsBatch(input: {
@@ -2384,6 +2501,7 @@ export class SqliteMetadataRepository {
 
 	async adoptRevisionToRun(revisionId: string, runId: string): Promise<void> {
 		this.db().prepare(`UPDATE file_revisions SET run_id = ? WHERE revision_id = ?`).run(runId, revisionId)
+		this.invalidateRunBacklogMetricsCache(runId)
 	}
 
 	async upsertChunks(chunks: ChunkInput[]): Promise<ChunkRecord[]> {
@@ -3565,6 +3683,7 @@ export class SqliteMetadataRepository {
 				Date.now(),
 				chunkId,
 			)
+		this.invalidateRunBacklogMetricsCache()
 	}
 
 	async markChunkStates(
@@ -3604,6 +3723,7 @@ export class SqliteMetadataRepository {
 				)
 			}
 			this.db().exec("COMMIT")
+			this.invalidateRunBacklogMetricsCache()
 		} catch (error) {
 			this.db().exec("ROLLBACK")
 			throw error
@@ -3682,6 +3802,7 @@ export class SqliteMetadataRepository {
 				)
 			}
 		})
+		this.invalidateRunBacklogMetricsCache()
 	}
 
 	async claimJobs(jobType: string, limit: number, runId?: string): Promise<JobRecord[]> {
@@ -3715,7 +3836,7 @@ export class SqliteMetadataRepository {
 			params.push(runId)
 		}
 
-		return this.withTransaction(() => {
+		const claimedRows = this.withTransaction(() => {
 			const rows = this.db()
 				.prepare(
 					`SELECT
@@ -3778,6 +3899,10 @@ export class SqliteMetadataRepository {
 
 			return claimedRows
 		}, "IMMEDIATE")
+		if (claimedRows.length > 0) {
+			this.invalidateRunBacklogMetricsCache(runId)
+		}
+		return claimedRows
 	}
 
 	async heartbeatJobs(jobIds: string[], leaseOwner: string, leaseMs = DEFAULT_JOB_LEASE_MS): Promise<void> {
@@ -3805,6 +3930,7 @@ export class SqliteMetadataRepository {
 				`UPDATE jobs SET state = 'done', lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE job_id = ?`,
 			)
 			.run(Date.now(), jobId)
+		this.invalidateRunBacklogMetricsCache()
 	}
 
 	async completeJobs(jobIds: string[]): Promise<void> {
@@ -3822,6 +3948,7 @@ export class SqliteMetadataRepository {
 				statement.run(now, jobId)
 			}
 			this.db().exec("COMMIT")
+			this.invalidateRunBacklogMetricsCache()
 		} catch (error) {
 			this.db().exec("ROLLBACK")
 			throw error
@@ -3836,6 +3963,7 @@ export class SqliteMetadataRepository {
 				 WHERE job_id = ?`,
 			)
 			.run(errorMessage, Date.now(), jobId)
+		this.invalidateRunBacklogMetricsCache()
 	}
 
 	async failJob(jobId: string, errorMessage: string, nextAttemptAt: number): Promise<void> {
@@ -3847,6 +3975,7 @@ export class SqliteMetadataRepository {
 				 WHERE job_id = ?`,
 			)
 			.run(errorMessage, nextAttemptAt, Date.now(), jobId)
+		this.invalidateRunBacklogMetricsCache()
 	}
 
 	async releaseJobs(jobIds: string[], leaseOwner?: string): Promise<void> {
@@ -3873,6 +4002,7 @@ export class SqliteMetadataRepository {
 				 WHERE ${clauses.join(" AND ")}`,
 			)
 			.run(...params)
+		this.invalidateRunBacklogMetricsCache()
 	}
 
 	async getNextRetryAt(jobType: string, runId: string): Promise<number | undefined> {
@@ -3933,6 +4063,10 @@ export class SqliteMetadataRepository {
 	}
 
 	async getRunBacklogMetrics(runId: string): Promise<RunBacklogMetrics> {
+		const cachedMetrics = this.getCachedRunBacklogMetrics(runId)
+		if (cachedMetrics) {
+			return cachedMetrics
+		}
 		const row = this.db()
 			.prepare(
 				`SELECT
@@ -4020,6 +4154,7 @@ export class SqliteMetadataRepository {
 		}
 
 		metrics.blockingReason = this.getBlockingReason(metrics)
+		this.setCachedRunBacklogMetrics(runId, metrics)
 		return metrics
 	}
 
@@ -4475,6 +4610,15 @@ export class SqliteMetadataRepository {
 		return typeof value === "number" && Number.isFinite(value) ? value : null
 	}
 
+	private async getFileSize(filePath: string): Promise<number> {
+		try {
+			const stat = await fs.stat(filePath)
+			return stat.size
+		} catch {
+			return 0
+		}
+	}
+
 	private _openDatabase(): void {
 		if (!this._db) {
 			this._db = new DatabaseSync(this.dbPath)
@@ -4498,8 +4642,23 @@ export class SqliteMetadataRepository {
 		this.initializeDatabaseSchema(database)
 		this.ensureColumn(database, "index_run_summaries", "metadata_sidecar_rss_mb", "REAL")
 		this.ensureColumn(database, "index_run_summaries", "metadata_sidecar_cpu_percent", "REAL")
+		this.ensureColumn(database, "index_run_summaries", "metadata_sidecar_heap_used_mb", "REAL")
+		this.ensureColumn(database, "index_run_summaries", "metadata_sidecar_external_mb", "REAL")
+		this.ensureColumn(database, "index_run_summaries", "metadata_sidecar_array_buffers_mb", "REAL")
+		this.ensureColumn(database, "index_run_summaries", "metadata_db_bytes", "INTEGER")
+		this.ensureColumn(database, "index_run_summaries", "metadata_wal_bytes", "INTEGER")
+		this.ensureColumn(database, "index_run_summaries", "telemetry_db_bytes", "INTEGER")
+		this.ensureColumn(database, "index_run_summaries", "telemetry_wal_bytes", "INTEGER")
 		this.ensureColumn(database, "index_run_samples", "metadata_sidecar_rss_mb", "REAL")
 		this.ensureColumn(database, "index_run_samples", "metadata_sidecar_cpu_percent", "REAL")
+		this.ensureColumn(database, "index_run_samples", "worker_phase", "TEXT")
+		this.ensureColumn(database, "index_run_samples", "metadata_sidecar_heap_used_mb", "REAL")
+		this.ensureColumn(database, "index_run_samples", "metadata_sidecar_external_mb", "REAL")
+		this.ensureColumn(database, "index_run_samples", "metadata_sidecar_array_buffers_mb", "REAL")
+		this.ensureColumn(database, "index_run_samples", "metadata_db_bytes", "INTEGER")
+		this.ensureColumn(database, "index_run_samples", "metadata_wal_bytes", "INTEGER")
+		this.ensureColumn(database, "index_run_samples", "telemetry_db_bytes", "INTEGER")
+		this.ensureColumn(database, "index_run_samples", "telemetry_wal_bytes", "INTEGER")
 	}
 
 	private async enforceRunTelemetryRetention(): Promise<void> {
@@ -4610,11 +4769,39 @@ export class SqliteMetadataRepository {
 		try {
 			const result = callback()
 			this.db().exec("COMMIT")
+			this.invalidateRunBacklogMetricsCache()
 			return result
 		} catch (error) {
 			this.db().exec("ROLLBACK")
 			throw error
 		}
+	}
+
+	private getCachedRunBacklogMetrics(runId: string): RunBacklogMetrics | undefined {
+		const cached = this._runBacklogMetricsCache.get(runId)
+		if (!cached) {
+			return undefined
+		}
+		if (Date.now() - cached.recordedAt > RUN_BACKLOG_CACHE_TTL_MS) {
+			this._runBacklogMetricsCache.delete(runId)
+			return undefined
+		}
+		return { ...cached.metrics }
+	}
+
+	private setCachedRunBacklogMetrics(runId: string, metrics: RunBacklogMetrics): void {
+		this._runBacklogMetricsCache.set(runId, {
+			recordedAt: Date.now(),
+			metrics: { ...metrics },
+		})
+	}
+
+	private invalidateRunBacklogMetricsCache(runId?: string): void {
+		if (runId) {
+			this._runBacklogMetricsCache.delete(runId)
+			return
+		}
+		this._runBacklogMetricsCache.clear()
 	}
 
 	private getBlockingReason(metrics: RunBacklogMetrics): string {
