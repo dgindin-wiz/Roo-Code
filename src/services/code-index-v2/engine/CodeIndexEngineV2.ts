@@ -420,7 +420,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				this._indexEmbeddingAdapter = undefined
 				this._searchVectorStore = undefined
 				this._searchEmbeddingAdapter = undefined
-				await this.metadataStore.clearStorage({ includeTelemetry })
+				try {
+					await this.metadataStore.clearStorage({ includeTelemetry })
+				} finally {
+					await this.metadataStore.dispose()
+				}
 				this._workspaceAdapter = undefined
 				this._started = false
 				this._staleRunIdsToResume = []
