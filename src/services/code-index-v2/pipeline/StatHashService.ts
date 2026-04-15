@@ -1,7 +1,7 @@
 import { createHash } from "crypto"
 import pLimit from "p-limit"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
-import { MetadataStore } from "../store/MetadataStore"
+import type { MetadataGateway } from "../store/MetadataGateway"
 import { WorkspaceAdapter } from "../adapters/WorkspaceAdapter"
 import { CODE_INDEX_V2_CHUNKER_VERSION, CODE_INDEX_V2_PARSER_VERSION } from "../shared/chunkSurfaces"
 
@@ -66,7 +66,7 @@ export class StatHashService {
 	private static readonly STAT_HASH_CONCURRENCY = 8
 
 	constructor(
-		private readonly metadataStore: MetadataStore,
+		private readonly metadataStore: MetadataGateway,
 		private readonly workspaceAdapter: WorkspaceAdapter,
 	) {}
 

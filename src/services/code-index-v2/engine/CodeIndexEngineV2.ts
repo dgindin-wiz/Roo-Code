@@ -21,7 +21,6 @@ import { DiscoveryService } from "../discovery"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import {
 	describeOversizedFile,
-	DiffPlanner,
 	EmbedUpsertWorker,
 	ParseChunkService,
 	SidecarParseExecutor,
@@ -31,7 +30,9 @@ import {
 } from "../pipeline"
 import { ReconciliationService } from "../reconciliation/ReconciliationService"
 import { EmbeddingRuntimeProfileStore } from "../store/EmbeddingRuntimeProfileStore"
-import { MetadataStore } from "../store/MetadataStore"
+import { type MetadataGateway } from "../store/MetadataGateway"
+import { resolveMetadataStorePaths } from "../store/MetadataPathResolver"
+import { MetadataSidecarClient } from "../sidecar/MetadataSidecarClient"
 import { CODE_INDEX_V2_ENGINE_ID } from "../shared/constants"
 import {
 	AdaptiveEmbeddingControllerState,
@@ -112,6 +113,13 @@ type SearchSurfaceCategories = {
 	isContextManagementSurface: boolean
 }
 
+type ActiveChunkByFingerprint = Awaited<ReturnType<MetadataGateway["getActiveChunksByFingerprints"]>>[number]
+type ActiveChunkByRelativePath = Awaited<ReturnType<MetadataGateway["getActiveChunksByRelativePaths"]>>[number]
+type LexicalSearchChunk = Awaited<
+	ReturnType<MetadataGateway["searchActiveChunksLexicallyWithStatus"]>
+>["results"][number]
+type RunBacklogMetricsRecord = Awaited<ReturnType<MetadataGateway["getRunBacklogMetrics"]>>
+
 export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private static readonly REVISION_BATCH_SIZE = 20
 	private static readonly LARGE_WORKSPACE_FILE_THRESHOLD = 20_000
@@ -134,7 +142,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		engine: CODE_INDEX_V2_ENGINE_ID,
 		state: "idle",
 	}
-	private readonly metadataStore: MetadataStore
+	private readonly metadataStore: MetadataGateway
 	private readonly embeddingRuntimeProfileStore: EmbeddingRuntimeProfileStore
 	private _indexEmbeddingAdapter: ExistingEmbedderAdapter | undefined
 	private _indexVectorStore: QdrantRestVectorStoreAdapter | undefined
@@ -166,7 +174,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		private readonly configManager: CodeIndexConfigManager,
 		private readonly stateManager: CodeIndexStateManager,
 	) {
-		this.metadataStore = new MetadataStore(context, workspacePath)
+		this.metadataStore = new MetadataSidecarClient(
+			resolveMetadataStorePaths(context, workspacePath),
+		) as unknown as MetadataGateway
 		this.embeddingRuntimeProfileStore = new EmbeddingRuntimeProfileStore(context)
 	}
 
@@ -1256,10 +1266,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		const parentChunkMap = new Map<string, (typeof parentChunks)[number]>(
 			parentChunks.map((chunk) => [`${chunk.relativePath}::${chunk.chunkFingerprint}`, chunk] as const),
 		)
-		const siblingChunksByParent = new Map<
-			string,
-			Awaited<ReturnType<MetadataStore["getActiveChunksByRelativePaths"]>>
-		>()
+		const siblingChunksByParent = new Map<string, ActiveChunkByRelativePath[]>()
 		for (const chunk of activeFileChunks) {
 			if (!chunk.parentChunkFingerprint) {
 				continue
@@ -1344,7 +1351,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}
 
 	private createParentContextResult(
-		chunk: Awaited<ReturnType<MetadataStore["getActiveChunksByFingerprints"]>>[number],
+		chunk: ActiveChunkByFingerprint,
 		childResult: VectorStoreSearchResult,
 	): VectorStoreSearchResult {
 		const childReasons = childResult.matchReasons ?? []
@@ -1375,7 +1382,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}
 
 	private createSiblingContextResult(
-		chunk: Awaited<ReturnType<MetadataStore["getActiveChunksByRelativePaths"]>>[number],
+		chunk: ActiveChunkByRelativePath,
 		childResult: VectorStoreSearchResult,
 	): VectorStoreSearchResult {
 		const childReasons = childResult.matchReasons ?? []
@@ -1405,9 +1412,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 	}
 
-	private createLexicalSearchResult(
-		chunk: Awaited<ReturnType<MetadataStore["searchActiveChunksLexically"]>>[number],
-	): VectorStoreSearchResult {
+	private createLexicalSearchResult(chunk: LexicalSearchChunk): VectorStoreSearchResult {
 		const normalizedScore = Math.min(0.95, Math.max(0.3, chunk.lexicalScore / 20))
 		return {
 			id: chunk.vectorPointId ?? `lexical:${chunk.chunkId}`,
@@ -1433,10 +1438,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}
 
 	private findBestSiblingContextChunk(
-		siblings: Awaited<ReturnType<MetadataStore["getActiveChunksByRelativePaths"]>>,
+		siblings: ActiveChunkByRelativePath[],
 		result: VectorStoreSearchResult,
 		seenChunkKeys: Set<string>,
-	): Awaited<ReturnType<MetadataStore["getActiveChunksByRelativePaths"]>>[number] | undefined {
+	): ActiveChunkByRelativePath | undefined {
 		const resultFingerprint =
 			typeof result.payload?.chunkFingerprint === "string" ? result.payload.chunkFingerprint : null
 		const resultStartLine = result.payload?.startLine ?? 0
@@ -3117,7 +3122,6 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			parseSidecarExecutor,
 		)
 		this._activeParseChunkService = parseChunkService
-		const diffPlanner = new DiffPlanner(this.metadataStore)
 		const dependencies = this.getOrCreateIndexDependencies()
 		const resumedJobs = await this.metadataStore.adoptRetryableJobsFromStaleRuns(runId, this._staleRunIdsToResume)
 		this._resumedRetryJobsCount = resumedJobs
@@ -3414,12 +3418,15 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			const getTrackedSidecarMetrics = () => {
 				const tracked = (IndexDebugLoggerV2.getTrackedProcessSummary() ?? {}) as {
 					totalTrackedRssMB?: number
-					byGroup?: Record<string, { totalRssMB?: number }>
+					totalTrackedCpuPercent?: number
+					byGroup?: Record<string, { totalRssMB?: number; totalCpuPercent?: number }>
 				}
 				return {
 					totalTrackedRssMB: tracked.totalTrackedRssMB ?? 0,
 					parseSidecarRssMB: tracked.byGroup?.parseSidecars?.totalRssMB ?? 0,
 					embedSidecarRssMB: tracked.byGroup?.embedSidecars?.totalRssMB ?? 0,
+					metadataSidecarRssMB: tracked.byGroup?.metadataSidecar?.totalRssMB ?? 0,
+					metadataSidecarCpuPercent: tracked.byGroup?.metadataSidecar?.totalCpuPercent ?? 0,
 				}
 			}
 			const getPipelineRunMode = (): IndexingPipelineRunMode =>
@@ -3946,7 +3953,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				const trackedSidecars = getTrackedSidecarMetrics()
 
 				await (
-					this.metadataStore as MetadataStore & {
+					this.metadataStore as MetadataGateway & {
 						heartbeatRun?: (runId: string, owner: string, progress?: unknown) => Promise<void>
 					}
 				).heartbeatRun?.(runId, runHeartbeatOwner, {
@@ -3994,7 +4001,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 							? "stage_transition"
 							: "heartbeat"
 				await (
-					this.metadataStore as MetadataStore & {
+					this.metadataStore as MetadataGateway & {
 						appendRunSample?: (input: Record<string, unknown>) => Promise<void>
 					}
 				).appendRunSample?.({
@@ -4040,6 +4047,8 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					trackedSidecarRssMB: trackedSidecars.totalTrackedRssMB,
 					parseSidecarRssMB: trackedSidecars.parseSidecarRssMB,
 					embedSidecarRssMB: trackedSidecars.embedSidecarRssMB,
+					metadataSidecarRssMB: trackedSidecars.metadataSidecarRssMB,
+					metadataSidecarCpuPercent: trackedSidecars.metadataSidecarCpuPercent,
 					gpuSampler: latestSyncTelemetry?.gpu?.sampler,
 					gpuUtilizationPercent: latestSyncTelemetry?.gpu?.utilizationPercent,
 					gpuMemoryPressurePercent: latestSyncTelemetry?.gpu?.memoryPressurePercent,
@@ -4052,7 +4061,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 
 				if (now - lastMaintenanceAt >= CodeIndexEngineV2.SQLITE_MAINTENANCE_INTERVAL_MS) {
 					await (
-						this.metadataStore as MetadataStore & {
+						this.metadataStore as MetadataGateway & {
 							checkpointWal?: (mode?: "PASSIVE" | "RESTART" | "TRUNCATE") => Promise<void>
 						}
 					).checkpointWal?.("PASSIVE")
@@ -4137,7 +4146,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			}
 			const countChunksForRevisions = async (revisionIds: string[]) => {
 				const countChunksForRevisionsMethod = (
-					this.metadataStore as MetadataStore & {
+					this.metadataStore as MetadataGateway & {
 						countChunksForRevisions?: (revisionIds: string[]) => Promise<number>
 					}
 				).countChunksForRevisions
@@ -4328,10 +4337,14 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 								stagedChunkLowWatermark: schedulerProfile.stagedChunkLowWatermark,
 							})
 							const diffPlanningStartedAt = Date.now()
-							const plannerSummary = (await diffPlanner.run(runId, signal, {
-								limit: schedulerProfile.plannerRevisionSlice,
-								maxJobs: schedulerProfile.plannerJobBudget,
-							})) ?? {
+							const plannerSummary = (await this.metadataStore.runPlannerSlice(
+								runId,
+								{
+									limit: schedulerProfile.plannerRevisionSlice,
+									maxJobs: schedulerProfile.plannerJobBudget,
+								},
+								signal,
+							)) ?? {
 								runId,
 								plannedRevisions: 0,
 								upsertJobs: 0,
@@ -4900,16 +4913,16 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		})
 	}
 
-	private getRunnableEmbedQueueDepth(metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>): number {
+	private getRunnableEmbedQueueDepth(metrics: RunBacklogMetricsRecord): number {
 		return metrics.queuedUpsertJobs + metrics.runningUpsertJobs
 	}
 
-	private getTotalVectorBacklog(metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>): number {
+	private getTotalVectorBacklog(metrics: RunBacklogMetricsRecord): number {
 		return metrics.stagedChunks + this.getRunnableEmbedQueueDepth(metrics)
 	}
 
 	private getParseThrottleReason(
-		metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>,
+		metrics: RunBacklogMetricsRecord,
 		profile: ReturnType<CodeIndexEngineV2["getSchedulerProfile"]>,
 		embedPhaseStarted: boolean,
 	): "high_watermark" | "planner_starvation_guard" | null {
@@ -4944,7 +4957,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 	}
 
-	private isRunBacklogDrained(metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>): boolean {
+	private isRunBacklogDrained(metrics: RunBacklogMetricsRecord): boolean {
 		return (
 			metrics.parsedRevisions === 0 &&
 			metrics.plannedRevisions === 0 &&
@@ -4957,7 +4970,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}
 
 	private shouldThrottleParse(
-		metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>,
+		metrics: RunBacklogMetricsRecord,
 		profile: ReturnType<CodeIndexEngineV2["getSchedulerProfile"]>,
 		options?: {
 			embedPhaseStarted?: boolean
@@ -4967,7 +4980,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}
 
 	private shouldResumeParse(
-		metrics: Awaited<ReturnType<MetadataStore["getRunBacklogMetrics"]>>,
+		metrics: RunBacklogMetricsRecord,
 		profile: ReturnType<CodeIndexEngineV2["getSchedulerProfile"]>,
 		parseThrottleReason: "high_watermark" | "planner_starvation_guard" | null,
 	): boolean {
@@ -5086,7 +5099,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		const hostMemory = IndexDebugLoggerV2.getMemorySnapshot()
 		const hostCpu = IndexDebugLoggerV2.getCpuSnapshot()
 		const progressRecord = await (
-			this.metadataStore as MetadataStore & {
+			this.metadataStore as MetadataGateway & {
 				getRunProgressRecord?: (runId: string) => Promise<
 					| {
 							blockingReason: string | null
@@ -5102,10 +5115,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		).getRunProgressRecord?.(runId)
 		const tracked = (IndexDebugLoggerV2.getTrackedProcessSummary() ?? {}) as {
 			totalTrackedRssMB?: number
-			byGroup?: Record<string, { totalRssMB?: number }>
+			byGroup?: Record<string, { totalRssMB?: number; totalCpuPercent?: number }>
 		}
 		await (
-			this.metadataStore as MetadataStore & {
+			this.metadataStore as MetadataGateway & {
 				writeRunSummary?: (input: Record<string, unknown>) => Promise<void>
 			}
 		).writeRunSummary?.({
@@ -5180,6 +5193,8 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			trackedSidecarRssMB: tracked.totalTrackedRssMB ?? 0,
 			parseSidecarRssMB: tracked.byGroup?.parseSidecars?.totalRssMB ?? 0,
 			embedSidecarRssMB: tracked.byGroup?.embedSidecars?.totalRssMB ?? 0,
+			metadataSidecarRssMB: tracked.byGroup?.metadataSidecar?.totalRssMB ?? 0,
+			metadataSidecarCpuPercent: tracked.byGroup?.metadataSidecar?.totalCpuPercent ?? 0,
 			gpuSampler: input.pipelineSummary?.performance.gpu?.sampler,
 			gpuUtilizationPercent: input.pipelineSummary?.performance.gpu?.utilizationPercent,
 			gpuMemoryPressurePercent: input.pipelineSummary?.performance.gpu?.memoryPressurePercent,

@@ -252,6 +252,7 @@ export class IndexDebugLoggerV2 {
 				count: number
 				totalRssMB: number
 				peakRssMB: number
+				totalCpuPercent: number
 				labels: string[]
 			}
 		>()
@@ -261,25 +262,30 @@ export class IndexDebugLoggerV2 {
 				count: 0,
 				totalRssMB: 0,
 				peakRssMB: 0,
+				totalCpuPercent: 0,
 				labels: [],
 			}
 			entry.count += 1
 			entry.totalRssMB += tracked.memory?.rssMB ?? 0
 			entry.peakRssMB = Math.max(entry.peakRssMB, tracked.memory?.rssMB ?? 0)
+			entry.totalCpuPercent += tracked.cpu?.processPercent ?? 0
 			entry.labels.push(tracked.pid ? `${tracked.label}:${tracked.pid}` : tracked.label)
 			groups.set(tracked.group, entry)
 		}
 
 		let totalTrackedRssMB = 0
+		let totalTrackedCpuPercent = 0
 		const byGroup: Record<string, unknown> = {}
 		for (const [group, entry] of groups) {
 			totalTrackedRssMB += entry.totalRssMB
+			totalTrackedCpuPercent += entry.totalCpuPercent
 			byGroup[group] = entry
 		}
 
 		return {
 			totalTrackedProcesses: trackedProcesses.length,
 			totalTrackedRssMB,
+			totalTrackedCpuPercent,
 			byGroup,
 		}
 	}

@@ -49,6 +49,7 @@ const mocks = vi.hoisted(() => {
 		getChunksForRevision: vi.fn().mockResolvedValue([]),
 		getActiveChunksByFingerprints: vi.fn().mockResolvedValue([]),
 		getActiveChunksByRelativePaths: vi.fn().mockResolvedValue([]),
+		runPlannerSlice: vi.fn(),
 		getRunBacklogMetrics: vi.fn(),
 		searchActiveChunksLexically: vi.fn().mockResolvedValue([]),
 		searchActiveChunksLexicallyWithStatus: vi.fn().mockResolvedValue({
@@ -67,6 +68,12 @@ const mocks = vi.hoisted(() => {
 		markRunComplete: vi.fn().mockResolvedValue(undefined),
 		markRunFailed: vi.fn().mockResolvedValue(undefined),
 		markRunStopped: vi.fn().mockResolvedValue(undefined),
+		heartbeatRun: vi.fn().mockResolvedValue(undefined),
+		appendRunSample: vi.fn().mockResolvedValue(undefined),
+		checkpointWal: vi.fn().mockResolvedValue(undefined),
+		countChunksForRevisions: vi.fn().mockResolvedValue(0),
+		getRunProgressRecord: vi.fn().mockResolvedValue(undefined),
+		writeRunSummary: vi.fn().mockResolvedValue(undefined),
 		clearStorage: vi.fn().mockResolvedValue(undefined),
 		getDiagnosticsDirectoryPath: vi
 			.fn()
@@ -140,8 +147,13 @@ const mocks = vi.hoisted(() => {
 			plannedRevisions: 1,
 			upsertJobs: 3,
 			deleteJobs: 0,
+			reusedFingerprintUpserts: 0,
+			deletedMissingFingerprintChunks: 0,
+			safetyFallbackRevisions: 0,
+			plannerSliceLatencyMs: 0,
 		}),
 	}
+	metadataStore.runPlannerSlice = diffPlanner.run
 
 	const embedUpsertWorker = {
 		run: vi.fn().mockResolvedValue({
@@ -278,6 +290,24 @@ vi.mock("vscode", () => ({
 
 vi.mock("../store/MetadataStore", () => ({
 	MetadataStore: vi.fn(() => mocks.metadataStore),
+}))
+
+vi.mock("../sidecar/MetadataSidecarClient", () => ({
+	MetadataSidecarClient: vi.fn(() => mocks.metadataStore),
+}))
+
+vi.mock("../store/MetadataPathResolver", () => ({
+	resolveMetadataStorePaths: vi.fn((_context: unknown, workspacePath: string) => ({
+		workspaceHash: "workspace-1",
+		workspacePath,
+		rootDir: "/global-storage/code-index-v2/workspace-1",
+		persistentRootDir: "/global-storage/code-index-v2/persistent/workspace-1",
+		diagnosticsRootDir: "/global-storage/code-index-v2/persistent/workspace-1/diagnostics",
+		legacyDiagnosticsRootDir: "/global-storage/code-index-v2/workspace-1",
+		dbPath: "/global-storage/code-index-v2/persistent/workspace-1/roo-code-index-v2.sqlite",
+		telemetryDbPath: "/global-storage/code-index-v2/persistent/workspace-1/roo-code-index-v2-telemetry.sqlite",
+		bootstrapPath: "/global-storage/code-index-v2/workspace-1/bootstrap.json",
+	})),
 }))
 
 vi.mock("../adapters/VsCodeWorkspaceAdapter", () => ({
@@ -559,11 +589,11 @@ describe("CodeIndexEngineV2 smoke", () => {
 		)
 		expect(mocks.diffPlanner.run).toHaveBeenCalledWith(
 			"run-1",
-			expect.any(Object),
 			expect.objectContaining({
 				limit: 50,
 				maxJobs: 1500,
 			}),
+			expect.any(Object),
 		)
 		expect(mocks.embedUpsertWorker.run).toHaveBeenCalledWith("run-1", expect.any(Object), expect.any(Function))
 		expect(mocks.watcherCoordinator.initialize).toHaveBeenCalledTimes(1)
@@ -948,11 +978,11 @@ describe("CodeIndexEngineV2 smoke", () => {
 		)
 		expect(mocks.diffPlanner.run).toHaveBeenCalledWith(
 			"run-1",
-			expect.any(Object),
 			expect.objectContaining({
 				limit: 25,
 				maxJobs: 800,
 			}),
+			expect.any(Object),
 		)
 	})
 
@@ -2721,11 +2751,11 @@ describe("CodeIndexEngineV2 smoke", () => {
 
 		expect(mocks.diffPlanner.run).toHaveBeenCalledWith(
 			"run-1",
-			expect.anything(),
 			expect.objectContaining({
 				limit: 50,
 				maxJobs: 1500,
 			}),
+			expect.anything(),
 		)
 		expect(mocks.embedUpsertWorker.run).toHaveBeenCalled()
 	})
@@ -2991,11 +3021,11 @@ describe("CodeIndexEngineV2 smoke", () => {
 		expect(mocks.parseChunkService.run).toHaveBeenCalledTimes(3)
 		expect(mocks.diffPlanner.run).toHaveBeenCalledWith(
 			"run-1",
-			expect.any(Object),
 			expect.objectContaining({
 				limit: 50,
 				maxJobs: 1500,
 			}),
+			expect.any(Object),
 		)
 		expect(mocks.embedUpsertWorker.run).toHaveBeenCalled()
 	})

@@ -9,7 +9,7 @@ import {
 	type EmbedUpsertBatchItem,
 	type EmbedUpsertExecutionResult,
 } from "./EmbedUpsertExecution"
-import { MetadataStore } from "../store/MetadataStore"
+import type { MetadataGateway } from "../store/MetadataGateway"
 import type { PlannedRevisionResolution, ReadyRevisionResolution } from "../store/types"
 import {
 	getConfiguredEmbeddingBatchSize,
@@ -184,6 +184,11 @@ interface EmbedUpsertExecutor {
 	dispose?(): Promise<void>
 }
 
+type ClaimedJobs = Awaited<ReturnType<MetadataGateway["claimJobs"]>>
+type ClaimedJob = ClaimedJobs[number]
+type ChunkRecord = Awaited<ReturnType<MetadataGateway["getChunksByIds"]>>[number]
+type ChunkVariantRecord = Awaited<ReturnType<MetadataGateway["getChunkVariantsByChunkIds"]>>[number]
+
 function incrementVariantCountMap(
 	target: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>,
 	source?: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>,
@@ -253,7 +258,7 @@ export class EmbedUpsertWorker {
 	private readonly workspacePath: string | undefined
 
 	constructor(
-		private readonly metadataStore: MetadataStore,
+		private readonly metadataStore: MetadataGateway,
 		private readonly embeddingAdapter: EmbeddingAdapter,
 		private readonly vectorStore: VectorStoreAdapter,
 		private readonly upsertExecutor?: EmbedUpsertExecutor,
@@ -982,13 +987,13 @@ export class EmbedUpsertWorker {
 
 		const claimJobs = async (jobType: "upsert" | "delete", batchSize: number) => {
 			const claimWithLease = (
-				this.metadataStore as MetadataStore & {
+				this.metadataStore as MetadataGateway & {
 					claimJobsWithLease?: (
 						jobType: string,
 						limit: number,
 						runId?: string,
 						options?: { leaseOwner?: string; leaseMs?: number },
-					) => Promise<Awaited<ReturnType<MetadataStore["claimJobs"]>>>
+					) => Promise<ClaimedJobs>
 				}
 			).claimJobsWithLease
 
@@ -1022,7 +1027,7 @@ export class EmbedUpsertWorker {
 
 		const listPlannedRevisionResolutions = async (): Promise<PlannedRevisionResolution[]> => {
 			const listViaStore = await (
-				this.metadataStore as MetadataStore & {
+				this.metadataStore as MetadataGateway & {
 					listPlannedRevisionResolutions?: (runId: string) => Promise<PlannedRevisionResolution[]>
 				}
 			).listPlannedRevisionResolutions?.(runId)
@@ -1145,7 +1150,7 @@ export class EmbedUpsertWorker {
 			}
 
 			const finalizeBatch = (
-				this.metadataStore as MetadataStore & {
+				this.metadataStore as MetadataGateway & {
 					finalizeReadyRevisionsBatch?: (input: {
 						runId: string
 						resolutions: ReadyRevisionResolution[]
@@ -1467,13 +1472,13 @@ export class EmbedUpsertWorker {
 			}
 
 			const claimWithLease = (
-				this.metadataStore as MetadataStore & {
+				this.metadataStore as MetadataGateway & {
 					claimJobsWithLease?: (
 						jobType: string,
 						limit: number,
 						runId?: string,
 						options?: { leaseOwner?: string; leaseMs?: number },
-					) => Promise<Awaited<ReturnType<MetadataStore["claimJobs"]>>>
+					) => Promise<ClaimedJobs>
 				}
 			).claimJobsWithLease
 			const claimStartedAt = Date.now()
@@ -1565,7 +1570,7 @@ export class EmbedUpsertWorker {
 	}
 
 	private async processUpsertJobs(
-		jobs: Awaited<ReturnType<MetadataStore["claimJobs"]>>,
+		jobs: ClaimedJobs,
 		signal: AbortSignal | undefined,
 		laneId: number,
 		emitBatchProgress: (batchTelemetry?: BatchTelemetry) => Promise<void>,
@@ -1579,7 +1584,7 @@ export class EmbedUpsertWorker {
 		},
 	): Promise<void> {
 		await (
-			this.metadataStore as MetadataStore & {
+			this.metadataStore as MetadataGateway & {
 				heartbeatJobs?: (jobIds: string[], leaseOwner: string) => Promise<void>
 			}
 		).heartbeatJobs?.(
@@ -1718,8 +1723,8 @@ export class EmbedUpsertWorker {
 
 	private async processUpsertJobPairs(
 		jobPairs: Array<{
-			job: Awaited<ReturnType<MetadataStore["claimJobs"]>>[number]
-			chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number]
+			job: ClaimedJob
+			chunk: ChunkRecord
 		}>,
 		signal: AbortSignal | undefined,
 		laneId: number,
@@ -1914,8 +1919,8 @@ export class EmbedUpsertWorker {
 	}
 
 	private buildUpsertBatchItem(
-		chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number],
-		variantsByChunkId: Map<string, Awaited<ReturnType<MetadataStore["getChunkVariantsByChunkIds"]>>>,
+		chunk: ChunkRecord,
+		variantsByChunkId: Map<string, ChunkVariantRecord[]>,
 	): EmbedUpsertBatchItem {
 		const chunkInput = {
 			chunkId: chunk.chunkId,
@@ -1959,10 +1964,10 @@ export class EmbedUpsertWorker {
 
 	private selectJobPairsWithinEmbeddingBudget(
 		jobPairs: Array<{
-			job: Awaited<ReturnType<MetadataStore["claimJobs"]>>[number]
-			chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number]
+			job: ClaimedJob
+			chunk: ChunkRecord
 		}>,
-		variantsByChunkId: Map<string, Awaited<ReturnType<MetadataStore["getChunkVariantsByChunkIds"]>>>,
+		variantsByChunkId: Map<string, ChunkVariantRecord[]>,
 		embeddingBudget: number,
 	): typeof jobPairs {
 		const clampedBudget = Math.max(1, embeddingBudget)
@@ -1984,8 +1989,8 @@ export class EmbedUpsertWorker {
 
 	private async handleSingleUpsertFailure(
 		jobPair: {
-			job: Awaited<ReturnType<MetadataStore["claimJobs"]>>[number]
-			chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number]
+			job: ClaimedJob
+			chunk: ChunkRecord
 		},
 		error: unknown,
 		callbacks: {
@@ -2010,7 +2015,7 @@ export class EmbedUpsertWorker {
 	}
 
 	private async processDeleteJobs(
-		jobs: Awaited<ReturnType<MetadataStore["claimJobs"]>>,
+		jobs: ClaimedJobs,
 		signal: AbortSignal | undefined,
 		laneId: number,
 		emitBatchProgress: (batchTelemetry?: BatchTelemetry) => Promise<void>,
@@ -2020,7 +2025,7 @@ export class EmbedUpsertWorker {
 		},
 	): Promise<void> {
 		await (
-			this.metadataStore as MetadataStore & {
+			this.metadataStore as MetadataGateway & {
 				heartbeatJobs?: (jobIds: string[], leaseOwner: string) => Promise<void>
 			}
 		).heartbeatJobs?.(
@@ -2047,8 +2052,8 @@ export class EmbedUpsertWorker {
 
 	private async processDeleteJobPairs(
 		jobPairs: Array<{
-			job: Awaited<ReturnType<MetadataStore["claimJobs"]>>[number]
-			chunk: Awaited<ReturnType<MetadataStore["getChunksByIds"]>>[number]
+			job: ClaimedJob
+			chunk: ChunkRecord
 		}>,
 		signal: AbortSignal | undefined,
 		laneId: number,

@@ -3,7 +3,7 @@ import { generateRelativeFilePath } from "../../code-index/shared/get-relative-p
 import { scannerExtensions } from "../../code-index/shared/supported-extensions"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { WorkspaceAdapter } from "../adapters/WorkspaceAdapter"
-import { MetadataStore } from "../store/MetadataStore"
+import type { MetadataGateway } from "../store/MetadataGateway"
 
 export class WatcherCoordinator implements vscode.Disposable {
 	private watcher: vscode.FileSystemWatcher | undefined
@@ -12,7 +12,7 @@ export class WatcherCoordinator implements vscode.Disposable {
 
 	constructor(
 		private readonly workspacePath: string,
-		private readonly metadataStore: MetadataStore,
+		private readonly metadataStore: MetadataGateway,
 		private readonly workspaceAdapter: WorkspaceAdapter,
 		private readonly onPathsChanged: (paths: string[], reason: "watcher") => Promise<void>,
 	) {}

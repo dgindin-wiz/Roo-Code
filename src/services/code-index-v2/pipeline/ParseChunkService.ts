@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "crypto"
 import { ParserAdapter } from "../adapters/ParserAdapter"
 import { WorkspaceAdapter } from "../adapters/WorkspaceAdapter"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
-import { MetadataStore } from "../store/MetadataStore"
+import type { MetadataGateway } from "../store/MetadataGateway"
 import { buildChunkVariants, ParsedChunkUpsertInput } from "./ParseExecution"
 
 interface ParseExecutor {
@@ -28,6 +28,8 @@ export interface ParseChunkSummary {
 	terminalFailedRevisions: number
 }
 
+type RevisionStateRecord = Awaited<ReturnType<MetadataGateway["getRevisionsByState"]>>[number]
+
 export class ParseChunkService {
 	private static readonly MAX_PARSE_ATTEMPTS = 3
 	private static readonly RETRY_DELAY_BASE_MS = 250
@@ -35,7 +37,7 @@ export class ParseChunkService {
 	private static readonly PARSE_CONCURRENCY = 4
 
 	constructor(
-		private readonly metadataStore: MetadataStore,
+		private readonly metadataStore: MetadataGateway,
 		private readonly workspaceAdapter: WorkspaceAdapter,
 		private readonly parserAdapter: ParserAdapter,
 		private readonly resolveMaxFileSizeBytes?: (relativePath: string) => number,
@@ -129,7 +131,7 @@ export class ParseChunkService {
 	}
 
 	private async parseRevisionWithRetries(
-		revision: Awaited<ReturnType<MetadataStore["getRevisionsByState"]>>[number],
+		revision: RevisionStateRecord,
 		signal?: AbortSignal,
 		laneId = 1,
 	): Promise<

@@ -1,6 +1,6 @@
 import { generateRelativeFilePath } from "../../code-index/shared/get-relative-path"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
-import { MetadataStore } from "../store/MetadataStore"
+import type { MetadataGateway } from "../store/MetadataGateway"
 import { WorkspaceAdapter } from "../adapters/WorkspaceAdapter"
 import { DiscoverySummary } from "../discovery/DiscoveryService"
 
@@ -10,7 +10,7 @@ export interface ReconciliationSummary extends DiscoverySummary {
 
 export class ReconciliationService {
 	constructor(
-		private readonly metadataStore: MetadataStore,
+		private readonly metadataStore: MetadataGateway,
 		private readonly workspaceAdapter: WorkspaceAdapter,
 		private readonly getEffectiveMaxFileSizeBytes: (relativePath: string) => number = () => 1024 * 1024,
 	) {}

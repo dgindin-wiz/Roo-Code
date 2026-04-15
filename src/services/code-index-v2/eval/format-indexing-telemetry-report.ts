@@ -25,6 +25,8 @@ export function formatIndexingTelemetryReport(report: IndexingTelemetryReport): 
 		`Embed vs sync time share %: ${formatNumber(analysis.embedTimeSharePercent)} / ${formatNumber(analysis.upsertTimeSharePercent)}`,
 		`Pressure: soft=${formatNumber(summary["pressure_soft_transitions"])} hard=${formatNumber(summary["pressure_hard_transitions"])}`,
 		`Host RSS MB: ${formatNumber(summary["host_rss_mb"])}`,
+		`Metadata sidecar RSS MB: ${formatNumber(summary["metadata_sidecar_rss_mb"])}`,
+		`Metadata sidecar CPU %: ${formatNumber(summary["metadata_sidecar_cpu_percent"])}`,
 		`Embed sidecar RSS MB: ${formatNumber(summary["embed_sidecar_rss_mb"])}`,
 		`GPU util avg/max %: ${formatNumber(analysis.averageGpuUtilizationPercent)} / ${formatNumber(analysis.peakGpuUtilizationPercent)}`,
 		`GPU memory avg/max: ${formatBytes(analysis.averageGpuInUseBytes)} / ${formatBytes(analysis.peakGpuInUseBytes)}`,

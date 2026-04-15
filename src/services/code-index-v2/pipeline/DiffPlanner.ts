@@ -1,5 +1,5 @@
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
-import { MetadataStore } from "../store/MetadataStore"
+import { SqliteMetadataRepository } from "../store/SqliteMetadataRepository"
 
 export interface DiffPlannerSummary {
 	runId: string
@@ -13,7 +13,17 @@ export interface DiffPlannerSummary {
 }
 
 export class DiffPlanner {
-	constructor(private readonly metadataStore: MetadataStore) {}
+	constructor(
+		private readonly metadataStore: Pick<
+			SqliteMetadataRepository,
+			| "enqueueJobs"
+			| "getChunksForRevision"
+			| "getDiffBaselineRevision"
+			| "getRevisionsByState"
+			| "getWorkspaceId"
+			| "markRevisionState"
+		>,
+	) {}
 
 	async run(
 		runId: string,

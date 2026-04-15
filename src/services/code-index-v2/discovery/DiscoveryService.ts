@@ -2,7 +2,7 @@ import { createHash } from "crypto"
 import pLimit from "p-limit"
 import { generateRelativeFilePath } from "../../code-index/shared/get-relative-path"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
-import { MetadataStore } from "../store/MetadataStore"
+import type { MetadataGateway } from "../store/MetadataGateway"
 import { WorkspaceAdapter, WorkspaceDiscoveryProgress } from "../adapters/WorkspaceAdapter"
 import { FileRecordInput } from "../store/types"
 
@@ -17,7 +17,7 @@ export class DiscoveryService {
 	private static readonly DISCOVERY_WRITE_BATCH_SIZE = 256
 
 	constructor(
-		private readonly metadataStore: MetadataStore,
+		private readonly metadataStore: MetadataGateway,
 		private readonly workspaceAdapter: WorkspaceAdapter,
 	) {}
 

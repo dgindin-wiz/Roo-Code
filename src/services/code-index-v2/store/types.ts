@@ -378,6 +378,8 @@ export interface IndexRunSummaryInput extends IndexRunTelemetryIdentity {
 	trackedSidecarRssMB?: number | null
 	parseSidecarRssMB?: number | null
 	embedSidecarRssMB?: number | null
+	metadataSidecarRssMB?: number | null
+	metadataSidecarCpuPercent?: number | null
 	gpuSampler?: string | null
 	gpuUtilizationPercent?: number | null
 	gpuMemoryPressurePercent?: number | null
@@ -445,6 +447,8 @@ export interface IndexRunSampleInput {
 	trackedSidecarRssMB?: number | null
 	parseSidecarRssMB?: number | null
 	embedSidecarRssMB?: number | null
+	metadataSidecarRssMB?: number | null
+	metadataSidecarCpuPercent?: number | null
 	gpuSampler?: string | null
 	gpuUtilizationPercent?: number | null
 	gpuMemoryPressurePercent?: number | null

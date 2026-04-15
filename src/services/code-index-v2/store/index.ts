@@ -1,3 +1,6 @@
 export * from "./MetadataStore"
+export * from "./MetadataGateway"
+export * from "./MetadataPathResolver"
+export * from "./SqliteMetadataRepository"
 export * from "./schema"
 export * from "./types"
