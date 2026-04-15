@@ -154,4 +154,57 @@ describe("MetadataSidecarClient", () => {
 		expect(testState.fork).toHaveBeenCalledTimes(1)
 		expect((progressResult as PromiseRejectedResult).reason).not.toBeInstanceOf(MetadataSidecarUnavailableError)
 	})
+
+	it("allows reinitialization after a graceful dispose followed by a clean sidecar exit", async () => {
+		const firstChild = new MockChildProcess()
+		firstChild.send.mockImplementation((message: Record<string, unknown>) => {
+			if (message.type === "init") {
+				queueMicrotask(() => {
+					firstChild.emit("message", {
+						type: "ready",
+						pid: firstChild.pid,
+						memory: {
+							rssMB: 100,
+							heapUsedMB: 20,
+							heapTotalMB: 40,
+							externalMB: 5,
+							arrayBuffersMB: 1,
+						},
+						cpu: {
+							processPercent: 12,
+						},
+					})
+				})
+				return
+			}
+			if (message.type === "shutdown") {
+				queueMicrotask(() => {
+					firstChild.emit("message", {
+						type: "shutdown-complete",
+						requestId: message.requestId,
+					})
+				})
+			}
+		})
+
+		const secondChild = new MockChildProcess()
+		secondChild.pid = 4343
+		testState.fork.mockReturnValueOnce(firstChild as any).mockReturnValueOnce(secondChild as any)
+		const client = new MetadataSidecarClient(createResolvedMetadataPaths("/workspace"))
+
+		await client.initialize()
+		await client.dispose()
+		firstChild.emit("exit", 0, null)
+		await client.initialize()
+
+		expect(testState.fork).toHaveBeenCalledTimes(2)
+		expect(testState.logger.log).not.toHaveBeenCalledWith(
+			"basic",
+			"MetadataSidecar",
+			"metadata-sidecar-request-timeout",
+			expect.objectContaining({
+				operation: "shutdown",
+			}),
+		)
+	})
 })

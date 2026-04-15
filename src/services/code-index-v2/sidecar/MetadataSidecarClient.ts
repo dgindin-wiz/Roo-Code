@@ -238,6 +238,7 @@ export class MetadataSidecarClient {
 	private requestCounter = 0
 	private unhealthyError: Error | undefined
 	private terminatingChildPid: number | undefined
+	private expectedExitChildPid: number | undefined
 
 	constructor(private readonly paths: ResolvedMetadataStorePaths) {
 		return new Proxy(this, {
@@ -264,6 +265,7 @@ export class MetadataSidecarClient {
 			return
 		}
 		const child = this.child
+		this.expectedExitChildPid = child.pid
 		const requestId = this.nextRequestId("shutdown")
 		try {
 			await Promise.race([
@@ -286,7 +288,12 @@ export class MetadataSidecarClient {
 		} catch {
 			this.terminateChild(child)
 		} finally {
-			this.resetClientState()
+			this.clearPendingRequests()
+			if (this.child === child) {
+				this.child = undefined
+				this.ready = undefined
+			}
+			this.unhealthyError = undefined
 		}
 	}
 
@@ -633,6 +640,7 @@ export class MetadataSidecarClient {
 		})
 
 		const exitedChild = this.child === child
+		const expectedExit = this.expectedExitChildPid === child.pid
 		if (exitedChild) {
 			this.child = undefined
 			this.ready = undefined
@@ -646,11 +654,14 @@ export class MetadataSidecarClient {
 			const pending = this.takePendingRequest(requestId)
 			pending?.reject(error)
 		}
-		if (!this.unhealthyError && this.terminatingChildPid !== child.pid) {
+		if (!this.unhealthyError && this.terminatingChildPid !== child.pid && !expectedExit) {
 			this.unhealthyError = error
 		}
 		if (this.terminatingChildPid === child.pid) {
 			this.terminatingChildPid = undefined
+		}
+		if (expectedExit) {
+			this.expectedExitChildPid = undefined
 		}
 	}
 
@@ -695,15 +706,11 @@ export class MetadataSidecarClient {
 		return pending
 	}
 
-	private resetClientState() {
+	private clearPendingRequests() {
 		IndexDebugLoggerV2.clearTrackedProcessSnapshot(this.getTrackedProcessKey())
 		for (const requestId of Array.from(this.pending.keys())) {
 			this.takePendingRequest(requestId)
 		}
-		this.child = undefined
-		this.ready = undefined
-		this.unhealthyError = undefined
-		this.terminatingChildPid = undefined
 	}
 
 	private logRequestEvent(
