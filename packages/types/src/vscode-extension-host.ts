@@ -764,7 +764,7 @@ export type IndexingServiceId =
 	| "cleanup"
 export type IndexingServiceState = "pending" | "running" | "completed" | "warning" | "failed" | "skipped"
 export type IndexingHealthState = "healthy" | "watch" | "critical" | "unknown"
-export type IndexingPipelineRunMode = "start" | "refresh" | "reconcile" | "resume" | "unknown"
+export type IndexingPipelineRunMode = "initial-discovery" | "refresh" | "reconcile" | "resume" | "unknown" | "start"
 export type IndexingPipelineOverallState = "idle" | "running" | "completed" | "stopped" | "failed"
 export type IndexingMetricTone = "neutral" | "good" | "warning" | "critical"
 

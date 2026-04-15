@@ -64,6 +64,7 @@ export class StatHashService {
 	private static readonly PARSER_VERSION = CODE_INDEX_V2_PARSER_VERSION
 	private static readonly CHUNKER_VERSION = CODE_INDEX_V2_CHUNKER_VERSION
 	private static readonly STAT_HASH_CONCURRENCY = 8
+	private static readonly PROGRESS_REPORT_INTERVAL_MS = 200
 
 	constructor(
 		private readonly metadataStore: MetadataGateway,
@@ -102,16 +103,26 @@ export class StatHashService {
 		const oversizedDetails: OversizedFileDetail[] = []
 		let missingFiles = 0
 		const reusedParsedRevisionIds: string[] = []
-		const maybeReportProgress = () => {
-			if (checkedFiles === 1 || checkedFiles % 250 === 0) {
-				options?.onProgress?.({
-					checkedFiles,
-					changedFiles,
-					skippedFiles,
-					unchangedFiles,
-					oversizedFiles,
-					missingFiles,
-				})
+		let lastProgressReportAt = 0
+		const reportProgress = () => {
+			options?.onProgress?.({
+				checkedFiles,
+				changedFiles,
+				skippedFiles,
+				unchangedFiles,
+				oversizedFiles,
+				missingFiles,
+			})
+			lastProgressReportAt = Date.now()
+		}
+		const maybeReportProgress = (force = false) => {
+			const now = Date.now()
+			if (
+				force ||
+				checkedFiles === 1 ||
+				now - lastProgressReportAt >= StatHashService.PROGRESS_REPORT_INTERVAL_MS
+			) {
+				reportProgress()
 			}
 		}
 		const limiter = pLimit(StatHashService.STAT_HASH_CONCURRENCY)
@@ -236,6 +247,7 @@ export class StatHashService {
 			runId,
 			jobId: `${checkedFiles}:${changedFiles}`,
 		})
+		maybeReportProgress(true)
 
 		return {
 			runId,

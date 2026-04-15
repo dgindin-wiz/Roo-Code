@@ -4400,6 +4400,22 @@ export class SqliteMetadataRepository {
 	}
 
 	private async backfillRunSummariesFromLogs(): Promise<void> {
+		const telemetrySummaryCount =
+			(
+				this.telemetryDb()
+					.prepare(`SELECT COUNT(*) AS count FROM index_run_summaries WHERE workspace_id = ?`)
+					.get(this.workspaceHash) as { count?: number } | undefined
+			)?.count ?? 0
+		const operationalRunCount =
+			(
+				this.db()
+					.prepare(`SELECT COUNT(*) AS count FROM index_runs WHERE workspace_id = ?`)
+					.get(this.workspaceHash) as { count?: number } | undefined
+			)?.count ?? 0
+		if (telemetrySummaryCount > 0 || operationalRunCount > 0) {
+			return
+		}
+
 		const logFiles = await this.listWorkspaceDiagnosticsLogFiles()
 		if (logFiles.length === 0) {
 			return
@@ -4447,7 +4463,12 @@ export class SqliteMetadataRepository {
 				await this.writeRunSummary({
 					runId,
 					workspaceId: this.workspaceHash,
-					triggerType: typeof entry.runType === "string" ? entry.runType : "start",
+					triggerType:
+						typeof entry.runType === "string"
+							? entry.runType === "start"
+								? "initial-discovery"
+								: entry.runType
+							: "initial-discovery",
 					state: "complete",
 					startedAt,
 					completedAt: completedAtSafe ?? startedAt,

@@ -4,6 +4,7 @@ import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import {
 	createBaseEngineHarness,
 	createDeferred,
+	createDiscoverySummary,
 	createEmbedSummary,
 	createParseSummary,
 	createPlannerSummary,
@@ -260,6 +261,130 @@ describe("CodeIndexEngineV2 progress and scheduling", () => {
 		expect(vectorSyncService.progressCurrent).toBe(4)
 		expect(vectorSyncService.detail).not.toContain("Planner is catching up")
 		expect(vectorSyncService.detail).toContain("chunks synced")
+	})
+
+	it("uses final stat-hash totals for completed file-check cards on a fresh run", async () => {
+		testState.mocks.discoveryService.runWorkspaceDiscoveryWithProgress.mockImplementation(
+			async (_triggerType, _signal, onProgress) => {
+				onProgress?.({ discoveredFiles: 199 })
+				return createDiscoverySummary({ discoveredFiles: 199 })
+			},
+		)
+		testState.mocks.statHashService.run.mockReset()
+		testState.mocks.statHashService.run.mockResolvedValueOnce(
+			createStatHashSummary({
+				checkedFiles: 199,
+				skippedFiles: 0,
+				changedFiles: 199,
+				unchangedFiles: 0,
+				oversizedFiles: 0,
+				missingFiles: 0,
+			}),
+		)
+
+		const engine = createEngine()
+		await engine.start()
+
+		const completedSnapshot = [...testState.mocks.stateManager.setPipelineSnapshot.mock.calls]
+			.map(([snapshot]) => snapshot)
+			.reverse()
+			.find((snapshot: any) => snapshot?.overallState === "completed")
+
+		expect(completedSnapshot).toBeDefined()
+		expect(completedSnapshot.runMode).toBe("initial-discovery")
+		const fileChecks = completedSnapshot.services.find((service: any) => service.id === "file_checks")
+		expect(fileChecks).toEqual(
+			expect.objectContaining({
+				state: "completed",
+				progressCurrent: 199,
+				progressTotal: 199,
+				progressPercent: 100,
+				detail: "199 changed • 0 unchanged",
+			}),
+		)
+		expect(fileChecks.metrics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ key: "changed", value: "199" }),
+				expect.objectContaining({ key: "unchanged", value: "0" }),
+			]),
+		)
+	})
+
+	it("persists workspace-scoped metadata-sidecar metrics into terminal run summaries", async () => {
+		testState.mocks.logger.getTrackedProcessSummary.mockReturnValue({
+			totalTrackedRssMB: 121,
+			byGroup: {
+				parseSidecars: { totalRssMB: 48 },
+				embedSidecars: { totalRssMB: 36 },
+				metadataSidecar: {
+					totalRssMB: 123,
+					totalCpuPercent: 7,
+					totalHeapUsedMB: 55,
+					totalExternalMB: 9,
+					totalArrayBuffersMB: 3,
+				},
+			},
+		} as any)
+
+		const engine = createEngine()
+		await engine.start()
+
+		expect(testState.mocks.logger.getTrackedProcessSummary).toHaveBeenCalledWith("/workspace")
+		expect(testState.mocks.metadataStore.writeRunSummary).toHaveBeenCalledWith(
+			expect.objectContaining({
+				triggerType: "initial-discovery",
+				metadataSidecarRssMB: 123,
+				metadataSidecarCpuPercent: 7,
+				metadataSidecarHeapUsedMB: 55,
+				metadataSidecarExternalMB: 9,
+				metadataSidecarArrayBuffersMB: 3,
+			}),
+		)
+	})
+
+	it("does not preserve transient pressure-only warnings in the final completed snapshot", async () => {
+		testState.mocks.embedUpsertWorker.run.mockReset()
+		testState.mocks.embedUpsertWorker.run.mockImplementationOnce(async (_runId, _signal, onProgress) => {
+			onProgress?.({
+				upsertedChunks: 3,
+				deletedChunks: 0,
+				committedRevisions: 1,
+				pressureState: "hard",
+				pressureReasons: ["rss", "external"],
+				workerPhase: "embedding",
+				activeLaneCount: 1,
+				inFlightChunkCount: 1,
+			})
+			return createEmbedSummary({
+				upsertedChunks: 3,
+			})
+		})
+
+		const engine = createEngine()
+		await engine.start()
+
+		const completedSnapshot = [...testState.mocks.stateManager.setPipelineSnapshot.mock.calls]
+			.map(([snapshot]) => snapshot)
+			.reverse()
+			.find((snapshot: any) => snapshot?.overallState === "completed")
+
+		expect(completedSnapshot).toBeDefined()
+		const embedding = completedSnapshot.services.find((service: any) => service.id === "embedding")
+		const vectorSync = completedSnapshot.services.find((service: any) => service.id === "vector_sync")
+		expect(embedding).toEqual(
+			expect.objectContaining({
+				state: "completed",
+				health: "healthy",
+				summary: "Embedding complete",
+			}),
+		)
+		expect(vectorSync).toEqual(
+			expect.objectContaining({
+				state: "completed",
+				health: "healthy",
+				summary: "Vector sync complete",
+			}),
+		)
 	})
 
 	it("fails fast when a metadata-sidecar timeout interrupts backlog refresh", async () => {

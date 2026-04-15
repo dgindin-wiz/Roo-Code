@@ -279,6 +279,97 @@ describe("MetadataStore integration", () => {
 		await store.dispose()
 	})
 
+	it("lists the latest reconcile telemetry summary ahead of older runs", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const initialRunId = await store.beginRun("initial-discovery")
+		await store.writeRunSummary({
+			runId: initialRunId,
+			workspaceId: store.getWorkspaceId(),
+			triggerType: "initial-discovery",
+			state: "complete",
+			startedAt: 1,
+			completedAt: 2,
+			totalRunMs: 100,
+			filesChanged: 5,
+		})
+		const reconcileRunId = await store.beginRun("reconcile")
+		await store.writeRunSummary({
+			runId: reconcileRunId,
+			workspaceId: store.getWorkspaceId(),
+			triggerType: "reconcile",
+			state: "complete",
+			startedAt: 3,
+			completedAt: 4,
+			totalRunMs: 25,
+			filesChanged: 0,
+		})
+
+		const summaries = await store.listRunSummaries(10)
+		expect(summaries[0]).toEqual(
+			expect.objectContaining({
+				runId: reconcileRunId,
+				triggerType: "reconcile",
+				state: "complete",
+			}),
+		)
+		expect(summaries[1]).toEqual(
+			expect.objectContaining({
+				runId: initialRunId,
+				triggerType: "initial-discovery",
+			}),
+		)
+
+		await store.dispose()
+	})
+
+	it("skips legacy log backfill when authoritative operational run records already exist", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const diagnosticsRoot = path.join(
+			context.globalStorageUri.fsPath,
+			"code-index-v2",
+			"persistent",
+			createHash("sha256").update(workspacePath).digest("hex"),
+			"diagnostics",
+		)
+		const diagnosticsLogPath = path.join(diagnosticsRoot, "roo-code-index-v2.log")
+		const staleRunId = "legacy-log-run"
+
+		const initialStore = new MetadataStore(context, workspacePath)
+		await initialStore.initialize()
+		const operationalRunId = await initialStore.beginRun("reconcile")
+		await initialStore.markRunComplete(operationalRunId)
+		await fs.mkdir(diagnosticsRoot, { recursive: true })
+		await fs.writeFile(
+			diagnosticsLogPath,
+			`${JSON.stringify({
+				timestamp: "2026-04-15T16:00:00.000Z",
+				message: "index-performance-summary",
+				workspacePath,
+				runId: staleRunId,
+				runType: "start",
+				totalRunMs: 100,
+			})}\n`,
+		)
+		await initialStore.dispose()
+
+		const reloadedStore = new MetadataStore(context, workspacePath)
+		await reloadedStore.initialize()
+
+		expect(await reloadedStore.getRunSummary(staleRunId)).toBeUndefined()
+		expect(await reloadedStore.listRunSummaries(10)).toEqual([])
+
+		await reloadedStore.dispose()
+	})
+
 	it("runs metadata maintenance and reports memory and WAL footprint", async () => {
 		const context = {
 			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },

@@ -427,6 +427,14 @@ describe("CodeIndexEngineV2 maintenance and recovery", () => {
 			"Standby",
 			"V2 is current across 3 files",
 		)
+		expect(testState.mocks.metadataStore.writeRunSummary).toHaveBeenCalledWith(
+			expect.objectContaining({
+				runId: "run-reconcile",
+				triggerType: "reconcile",
+				state: "complete",
+				filesChanged: 0,
+			}),
+		)
 	})
 
 	it("resumes queued retry jobs from prior failed runs even without freshly detected stale runs", async () => {

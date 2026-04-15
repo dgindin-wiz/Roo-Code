@@ -164,8 +164,9 @@ function getIndexingOverallStateLabel(pipeline?: IndexingPipelineSnapshot): stri
 
 function getIndexingRunModeLabel(pipeline?: IndexingPipelineSnapshot): string {
 	switch (pipeline?.runMode) {
+		case "initial-discovery":
 		case "start":
-			return "Start"
+			return "Initial discovery"
 		case "refresh":
 			return "Refresh"
 		case "reconcile":

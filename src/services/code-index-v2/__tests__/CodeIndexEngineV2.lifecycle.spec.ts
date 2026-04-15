@@ -409,7 +409,7 @@ describe("CodeIndexEngineV2 lifecycle", () => {
 			"CodeIndexEngineV2",
 			"index-performance-summary",
 			expect.objectContaining({
-				runType: "start",
+				runType: "initial-discovery",
 				discoveredFiles: 2,
 				filesScanned: 2,
 				filesChanged: 1,

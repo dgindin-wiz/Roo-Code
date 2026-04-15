@@ -241,7 +241,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			await this._workspaceAdapter.initialize()
 			await this.refreshTrackedOversizedFiles()
 			await this.runSerialized(async (signal) => {
-				await this.runFullIndex("start", signal)
+				await this.runFullIndex("initial-discovery", signal)
 			})
 			await this.ensureWatcher()
 			this.startReconciliationTimer()
@@ -2293,7 +2293,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 	}
 
-	private async runFullIndex(mode: "start" | "refresh", signal?: AbortSignal): Promise<void> {
+	private async runFullIndex(mode: "initial-discovery" | "refresh", signal?: AbortSignal): Promise<void> {
 		const runStartedAt = Date.now()
 		const workspaceAdapter = this.requireWorkspaceAdapter()
 		const isRefresh = mode === "refresh"
@@ -2301,7 +2301,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		let pipelineSummary: Awaited<ReturnType<CodeIndexEngineV2["runPipelineForRun"]>> | undefined
 
 		try {
-			this.stateManager.beginPipelineRun(isRefresh ? "refresh" : "start")
+			this.stateManager.beginPipelineRun(isRefresh ? "refresh" : "initial-discovery")
 			await this.preflightIndexingDependencies(signal)
 			const discoveryService = new DiscoveryService(this.metadataStore, workspaceAdapter)
 			const discoveryMessage = isRefresh ? "Refreshing the workspace map" : "Walking the workspace"
@@ -2353,7 +2353,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			const updateDiscoveryPipelineSnapshot = (state: "running" | "completed") => {
 				this.stateManager.setPipelineSnapshot(
 					{
-						runMode: isRefresh ? "refresh" : "start",
+						runMode: isRefresh ? "refresh" : "initial-discovery",
 						overallState: "running",
 						etaMs: null,
 						services: this.buildPipelineServicesSnapshot({
@@ -2407,7 +2407,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			this.startActivityHeartbeat(() => discoveryMessage)
 			const discoveryStartedAt = Date.now()
 			summary = await discoveryService.runWorkspaceDiscoveryWithProgress(
-				"initial-discovery",
+				isRefresh ? "refresh" : "initial-discovery",
 				signal,
 				(progress) => {
 					discoveredFiles = progress.discoveredFiles
@@ -2439,13 +2439,13 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				summary.runId,
 				summary.discoveredFiles,
 				undefined,
-				{ runMode: isRefresh ? "refresh" : "start" },
+				{ runMode: isRefresh ? "refresh" : "initial-discovery" },
 				signal,
 			)
 			const totalRunMs = Date.now() - runStartedAt
 			await this.refreshTrackedOversizedFiles(pipelineSummary.oversizedDetails, summary.runId)
 			this.logIndexRunPerformanceSummary(
-				isRefresh ? "refresh" : "start",
+				isRefresh ? "refresh" : "initial-discovery",
 				summary.runId,
 				{
 					discoveryMs,
@@ -2456,7 +2456,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				pipelineSummary,
 			)
 			await this.persistRunTelemetrySummary(summary.runId, {
-				triggerType: isRefresh ? "refresh" : "start",
+				triggerType: isRefresh ? "refresh" : "initial-discovery",
 				state: "complete",
 				startedAt: runStartedAt,
 				completedAt: Date.now(),
@@ -2780,55 +2780,98 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}
 
 	private async runReconciliation(signal?: AbortSignal): Promise<void> {
-		this.stateManager.beginPipelineRun("reconcile")
-		this._status = {
-			engine: this.engine,
-			state: "running",
-			message: "Reconciling local state with the workspace",
-		}
-		this.stateManager.reportCustomProgress("Reconciling local state with the workspace", 0, 1, {
-			currentItemUnit: "passes",
-			phase: "scanning",
-			detailedStage: "reconciling",
-			isBackgroundReconcile: true,
-		})
-		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "reconciliation-start", {
-			component: "CodeIndexEngineV2",
-			workspacePath: this.workspacePath,
-		})
-		const workspaceAdapter = this.requireWorkspaceAdapter()
-		const discoveryService = new DiscoveryService(this.metadataStore, workspaceAdapter)
-		const reconciliationService = new ReconciliationService(this.metadataStore, workspaceAdapter, (relativePath) =>
-			this.getEffectiveMaxFileSizeBytes(relativePath),
-		)
-		const summary = await discoveryService.runReconciliationDiscovery(signal)
-		const reconciliationSummary = await reconciliationService.findMissingFiles(summary)
+		const runStartedAt = Date.now()
+		let summary: Awaited<ReturnType<DiscoveryService["runReconciliationDiscovery"]>> | undefined
+		let pipelineSummary: Awaited<ReturnType<CodeIndexEngineV2["runPipelineForRun"]>> | undefined
 
-		if (reconciliationSummary.missingFiles.length > 0) {
-			await this.runDeletionPipeline(
-				reconciliationSummary.missingFiles.map((relativePath) => path.join(this.workspacePath, relativePath)),
-				"reconcile-delete",
+		try {
+			this.stateManager.beginPipelineRun("reconcile")
+			this._status = {
+				engine: this.engine,
+				state: "running",
+				message: "Reconciling local state with the workspace",
+			}
+			this.stateManager.reportCustomProgress("Reconciling local state with the workspace", 0, 1, {
+				currentItemUnit: "passes",
+				phase: "scanning",
+				detailedStage: "reconciling",
+				isBackgroundReconcile: true,
+			})
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "reconciliation-start", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+			})
+			const workspaceAdapter = this.requireWorkspaceAdapter()
+			const discoveryService = new DiscoveryService(this.metadataStore, workspaceAdapter)
+			const reconciliationService = new ReconciliationService(
+				this.metadataStore,
+				workspaceAdapter,
+				(relativePath) => this.getEffectiveMaxFileSizeBytes(relativePath),
+			)
+			const discoveryStartedAt = Date.now()
+			summary = await discoveryService.runReconciliationDiscovery(signal)
+			const discoveryMs = Date.now() - discoveryStartedAt
+			const reconciliationSummary = await reconciliationService.findMissingFiles(summary)
+
+			if (reconciliationSummary.missingFiles.length > 0) {
+				await this.runDeletionPipeline(
+					reconciliationSummary.missingFiles.map((relativePath) =>
+						path.join(this.workspacePath, relativePath),
+					),
+					"reconcile-delete",
+					signal,
+				)
+			}
+
+			pipelineSummary = await this.runPipelineForRun(
+				summary.runId,
+				summary.discoveredFiles,
+				undefined,
+				{ isBackgroundReconcile: true, runMode: "reconcile" },
 				signal,
 			)
+			const totalRunMs = Date.now() - runStartedAt
+			await this.persistRunTelemetrySummary(summary.runId, {
+				triggerType: "reconcile",
+				state: "complete",
+				startedAt: runStartedAt,
+				completedAt: Date.now(),
+				totalRunMs,
+				discoveryMs,
+				discoveredFiles: summary.discoveredFiles,
+				pipelineSummary,
+			})
+			const indexedFiles = await this.metadataStore.countActiveIndexedFilesForWorkspace(
+				this.metadataStore.getWorkspaceId(),
+			)
+			const liveMessage = `V2 is current across ${indexedFiles.toLocaleString()} files`
+			this._status = {
+				engine: this.engine,
+				state: "idle",
+				message: liveMessage,
+			}
+			this.stateManager.setSystemState("Standby", liveMessage)
+		} catch (error) {
+			this.stateManager.setPipelineTerminalState(
+				this.isAbortError(error) && this._stopRequested ? "stopped" : "failed",
+			)
+			if (summary?.runId && !this.isMetadataSidecarRuntimeError(error)) {
+				await this.persistRunTelemetrySummary(summary.runId, {
+					triggerType: "reconcile",
+					state: this.isAbortError(error) && this._stopRequested ? "stopped" : "failed",
+					startedAt: runStartedAt,
+					completedAt: Date.now(),
+					totalRunMs: Date.now() - runStartedAt,
+					discoveredFiles: summary.discoveredFiles,
+					pipelineSummary,
+					errorMessage: this.getStopAwareErrorMessage(error),
+				}).catch(() => undefined)
+			}
+			if (this.isMetadataSidecarRuntimeError(error)) {
+				await this.metadataStore.dispose().catch(() => undefined)
+			}
+			throw error
 		}
-
-		await this.runPipelineForRun(
-			summary.runId,
-			summary.discoveredFiles,
-			undefined,
-			{ isBackgroundReconcile: true, runMode: "reconcile" },
-			signal,
-		)
-		const indexedFiles = await this.metadataStore.countActiveIndexedFilesForWorkspace(
-			this.metadataStore.getWorkspaceId(),
-		)
-		const liveMessage = `V2 is current across ${indexedFiles.toLocaleString()} files`
-		this._status = {
-			engine: this.engine,
-			state: "idle",
-			message: liveMessage,
-		}
-		this.stateManager.setSystemState("Standby", liveMessage)
 	}
 
 	private async runPipelineForRun(
@@ -2837,16 +2880,19 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		relativePaths?: string[],
 		options?: {
 			isBackgroundReconcile?: boolean
-			runMode?: "start" | "refresh" | "reconcile"
+			runMode?: "initial-discovery" | "refresh" | "reconcile"
 		},
 		signal?: AbortSignal,
 	): Promise<{
+		checkedFiles: number
 		changedFiles: number
+		unchangedFiles: number
 		parsedChunks: number
 		syncedChunks: number
 		upsertedChunks: number
 		deletedChunks: number
 		oversizedFiles: number
+		missingFiles: number
 		oversizedDetails: OversizedFileDetail[]
 		retryingParseRevisions: number
 		terminalFailedParseRevisions: number
@@ -3146,6 +3192,12 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		statHashMs += Date.now() - statHashStartedAt
 		this.stopActivityHeartbeat()
 		this.stateManager.setActivityDetail("")
+		checkedFiles = statHashSummary.checkedFiles
+		changedFiles = statHashSummary.changedFiles
+		skippedFiles = statHashSummary.skippedFiles
+		unchangedFiles = statHashSummary.unchangedFiles
+		oversizedFiles = statHashSummary.oversizedFiles
+		missingFiles = statHashSummary.missingFiles
 		statHashComplete = true
 		updateStatHashPipelineSnapshot("completed", true)
 		const parserAdapter = new CodeIndexParserAdapter()
@@ -3248,61 +3300,39 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			statHashMs += Date.now() - forcedStatHashStartedAt
 			this.stopActivityHeartbeat()
 			this.stateManager.setActivityDetail("")
+			checkedFiles = statHashSummary.checkedFiles
+			changedFiles = statHashSummary.changedFiles
+			skippedFiles = statHashSummary.skippedFiles
+			unchangedFiles = statHashSummary.unchangedFiles
+			oversizedFiles = statHashSummary.oversizedFiles
+			missingFiles = statHashSummary.missingFiles
 			statHashComplete = true
 			updateStatHashPipelineSnapshot("completed", true)
 		}
 		if (statHashSummary.changedFiles === 0 && this._resumedPendingJobsCount === 0) {
-			this.stateManager.setPipelineSnapshot(
-				{
-					overallState: "completed",
-					etaMs: null,
-					services: this.buildPipelineServicesSnapshot({
-						discovery: {
-							state: "completed",
-							health: "healthy",
-							summary: `${Math.max(statHashSummary.checkedFiles, checkedFiles).toLocaleString()} files discovered`,
-							progressCurrent: Math.max(statHashSummary.checkedFiles, checkedFiles, 1),
-							progressTotal: Math.max(statHashSummary.checkedFiles, checkedFiles, 1),
-							progressUnit: "files",
-							progressPercent: 100,
-							metrics: [
-								this.createServiceMetric(
-									"files",
-									"Files",
-									Math.max(statHashSummary.checkedFiles, checkedFiles).toLocaleString(),
-								),
-							],
-						},
-						file_checks: {
-							state: "completed",
-							health: missingFiles > 0 || oversizedFiles > 0 ? "watch" : "healthy",
-							summary: "File checks completed",
-							detail: `${changedFiles.toLocaleString()} changed • ${unchangedFiles.toLocaleString()} unchanged`,
-							progressCurrent: Math.max(statHashSummary.checkedFiles, checkedFiles, 1),
-							progressTotal: Math.max(statHashSummary.checkedFiles, checkedFiles, 1),
-							progressUnit: "files",
-							progressPercent: 100,
-							metrics: [
-								this.createServiceMetric("changed", "Changed", changedFiles.toLocaleString()),
-								this.createServiceMetric("unchanged", "Unchanged", unchangedFiles.toLocaleString()),
-								this.createServiceMetric(
-									"oversized",
-									"Oversized",
-									oversizedFiles.toLocaleString(),
-									oversizedFiles > 0 ? "warning" : "neutral",
-								),
-								this.createServiceMetric(
-									"missing",
-									"Missing",
-									missingFiles.toLocaleString(),
-									missingFiles > 0 ? "warning" : "neutral",
-								),
-							],
-						},
-					}),
-				},
-				{ forceImmediate: true },
-			)
+			this.setSuccessfulCompletedPipelineSnapshot({
+				runMode:
+					this._resumedRetryJobsCount > 0 || this._resumedPendingJobsCount > 0
+						? "resume"
+						: (options?.runMode ?? "unknown"),
+				discoveredFiles: Math.max(knownTotalFiles ?? 0, statHashSummary.checkedFiles),
+				checkedFiles: statHashSummary.checkedFiles,
+				changedFiles: statHashSummary.changedFiles,
+				unchangedFiles: statHashSummary.unchangedFiles,
+				oversizedFiles: statHashSummary.oversizedFiles,
+				missingFiles: statHashSummary.missingFiles,
+				parsedFiles: 0,
+				parsedChunks: 0,
+				syncedChunks: 0,
+				upsertedChunks: 0,
+				deletedChunks: 0,
+				retryingParseRevisions: 0,
+				terminalFailedParseRevisions: 0,
+				degradedRevisions: 0,
+				terminalFailedRevisions: 0,
+				retryingChunks: 0,
+				terminallyFailedChunks: 0,
+			})
 			await this.metadataStore.markRunComplete(runId)
 			this.logPipelineTerminalEvent("run-complete", runId, {
 				message: "No changed files required indexing work.",
@@ -3313,12 +3343,15 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				totalPipelineMs: Date.now() - pipelineStartedAt,
 			})
 			return {
+				checkedFiles: statHashSummary.checkedFiles,
 				changedFiles: 0,
+				unchangedFiles: statHashSummary.unchangedFiles,
 				parsedChunks: 0,
 				syncedChunks: 0,
 				upsertedChunks: 0,
 				deletedChunks: 0,
 				oversizedFiles: statHashSummary.oversizedFiles,
+				missingFiles: statHashSummary.missingFiles,
 				oversizedDetails: statHashSummary.oversizedDetails,
 				retryingParseRevisions: 0,
 				terminalFailedParseRevisions: 0,
@@ -3456,7 +3489,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				| "error" = "stat_hash"
 			let lastSampledPressureState: string | undefined
 			const getTrackedSidecarMetrics = () => {
-				const tracked = (IndexDebugLoggerV2.getTrackedProcessSummary() ?? {}) as {
+				const tracked = (IndexDebugLoggerV2.getTrackedProcessSummary(this.workspacePath) ?? {}) as {
 					totalTrackedRssMB?: number
 					totalTrackedCpuPercent?: number
 					byGroup?: Record<
@@ -4733,6 +4766,26 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			}
 
 			latestTelemetryStage = "complete"
+			this.setSuccessfulCompletedPipelineSnapshot({
+				runMode: getPipelineRunMode(),
+				discoveredFiles: Math.max(knownTotalFiles ?? 0, statHashSummary.checkedFiles),
+				checkedFiles: statHashSummary.checkedFiles,
+				changedFiles: statHashSummary.changedFiles,
+				unchangedFiles: statHashSummary.unchangedFiles,
+				oversizedFiles: statHashSummary.oversizedFiles,
+				missingFiles: statHashSummary.missingFiles,
+				parsedFiles: parsedRevisionsCompleted,
+				parsedChunks: parsedChunksCompleted,
+				syncedChunks: syncedChunksCompleted,
+				upsertedChunks: upsertedChunksCompleted,
+				deletedChunks: deletedChunksCompleted,
+				retryingParseRevisions,
+				terminalFailedParseRevisions,
+				degradedRevisions: latestSyncTelemetry?.degradedRevisions ?? 0,
+				terminalFailedRevisions: latestSyncTelemetry?.terminalFailedRevisions ?? 0,
+				retryingChunks: latestSyncTelemetry?.retryingChunks ?? 0,
+				terminallyFailedChunks: latestSyncTelemetry?.terminallyFailedChunks ?? 0,
+			})
 			await persistRunSnapshot(true)
 			await this.metadataStore.markRunComplete(runId)
 			this.logPipelineTerminalEvent("run-complete", runId, {
@@ -4753,12 +4806,15 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			})
 
 			return {
+				checkedFiles: statHashSummary.checkedFiles,
 				changedFiles: statHashSummary.changedFiles,
+				unchangedFiles: statHashSummary.unchangedFiles,
 				parsedChunks: parsedChunksCompleted,
 				syncedChunks: syncedChunksCompleted,
 				upsertedChunks: upsertedChunksCompleted,
 				deletedChunks: deletedChunksCompleted,
 				oversizedFiles: statHashSummary.oversizedFiles,
+				missingFiles: statHashSummary.missingFiles,
 				oversizedDetails: statHashSummary.oversizedDetails,
 				retryingParseRevisions,
 				terminalFailedParseRevisions,
@@ -4862,6 +4918,237 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			await dependencies.embeddingAdapter.recycleClient?.()
 			await dependencies.vectorStore.recycleClient?.()
 		}
+	}
+
+	private setSuccessfulCompletedPipelineSnapshot(input: {
+		runMode: IndexingPipelineRunMode
+		discoveredFiles: number
+		checkedFiles: number
+		changedFiles: number
+		unchangedFiles: number
+		oversizedFiles: number
+		missingFiles: number
+		parsedFiles: number
+		parsedChunks: number
+		syncedChunks: number
+		upsertedChunks: number
+		deletedChunks: number
+		retryingParseRevisions: number
+		terminalFailedParseRevisions: number
+		degradedRevisions: number
+		terminalFailedRevisions: number
+		retryingChunks: number
+		terminallyFailedChunks: number
+	}): void {
+		const fileChecksHealth: IndexingHealthState =
+			input.missingFiles > 0 || input.oversizedFiles > 0 ? "watch" : "healthy"
+		const parseIssueCount =
+			input.retryingParseRevisions +
+			input.terminalFailedParseRevisions +
+			input.degradedRevisions +
+			input.terminalFailedRevisions
+		const parseDidWork = input.changedFiles > 0 || input.parsedFiles > 0 || parseIssueCount > 0
+		const parseHealth: IndexingHealthState =
+			input.terminalFailedParseRevisions > 0 ? "critical" : parseIssueCount > 0 ? "watch" : "healthy"
+		const syncIssueCount =
+			input.retryingChunks +
+			input.terminallyFailedChunks +
+			input.degradedRevisions +
+			input.terminalFailedRevisions
+		const syncDidWork =
+			input.changedFiles > 0 ||
+			input.syncedChunks > 0 ||
+			input.upsertedChunks > 0 ||
+			input.deletedChunks > 0 ||
+			syncIssueCount > 0
+		const syncHealth: IndexingHealthState =
+			input.terminallyFailedChunks > 0 ? "critical" : syncIssueCount > 0 ? "watch" : "healthy"
+		const cleanupDidWork = input.deletedChunks > 0
+		const totalFiles = Math.max(input.discoveredFiles, input.checkedFiles, 1)
+		const parseProgressTotal = Math.max(input.changedFiles, input.parsedFiles, parseDidWork ? 1 : 0)
+		const syncProgressTotal = Math.max(
+			input.syncedChunks + input.retryingChunks + input.terminallyFailedChunks,
+			input.syncedChunks,
+			syncDidWork ? 1 : 0,
+		)
+		const embeddingProgressTotal = Math.max(
+			input.upsertedChunks + input.retryingChunks + input.terminallyFailedChunks,
+			input.upsertedChunks,
+			syncDidWork ? 1 : 0,
+		)
+		const completedServices = this.buildPipelineServicesSnapshot({
+			discovery: {
+				state: "completed",
+				health: "healthy",
+				summary: `${totalFiles.toLocaleString()} files discovered`,
+				detail: "Discovery complete",
+				progressCurrent: totalFiles,
+				progressTotal: totalFiles,
+				progressUnit: "files",
+				progressPercent: 100,
+				metrics: [
+					this.createServiceMetric("files", "Files", totalFiles.toLocaleString()),
+					this.createServiceMetric("mode", "Mode", input.runMode),
+				],
+			},
+			file_checks: {
+				state: "completed",
+				health: fileChecksHealth,
+				summary: "File checks completed",
+				detail: `${input.changedFiles.toLocaleString()} changed • ${input.unchangedFiles.toLocaleString()} unchanged`,
+				progressCurrent: Math.max(input.checkedFiles, totalFiles),
+				progressTotal: Math.max(input.checkedFiles, totalFiles),
+				progressUnit: "files",
+				progressPercent: 100,
+				metrics: [
+					this.createServiceMetric("changed", "Changed", input.changedFiles.toLocaleString()),
+					this.createServiceMetric("unchanged", "Unchanged", input.unchangedFiles.toLocaleString()),
+					this.createServiceMetric(
+						"oversized",
+						"Oversized",
+						input.oversizedFiles.toLocaleString(),
+						input.oversizedFiles > 0 ? "warning" : "neutral",
+					),
+					this.createServiceMetric(
+						"missing",
+						"Missing",
+						input.missingFiles.toLocaleString(),
+						input.missingFiles > 0 ? "warning" : "neutral",
+					),
+				],
+			},
+			parse: {
+				state: parseDidWork ? (parseIssueCount > 0 ? "warning" : "completed") : "skipped",
+				health: parseDidWork ? parseHealth : "healthy",
+				summary: parseDidWork ? "Parse complete" : "No parsing required",
+				detail: parseDidWork
+					? `${input.parsedChunks.toLocaleString()} chunks prepared`
+					: "No changed files required parsing",
+				progressCurrent: parseDidWork ? parseProgressTotal : undefined,
+				progressTotal: parseDidWork ? parseProgressTotal : undefined,
+				progressUnit: parseDidWork ? "files" : undefined,
+				progressPercent: parseDidWork ? 100 : null,
+				issueCount: parseDidWork ? parseIssueCount : undefined,
+				metrics: [
+					this.createServiceMetric("parsedFiles", "Parsed files", input.parsedFiles.toLocaleString()),
+					this.createServiceMetric("parsedChunks", "Parsed chunks", input.parsedChunks.toLocaleString()),
+					this.createServiceMetric(
+						"parseRetries",
+						"Retries",
+						input.retryingParseRevisions.toLocaleString(),
+						input.retryingParseRevisions > 0 ? "warning" : "neutral",
+					),
+					this.createServiceMetric(
+						"parserFailures",
+						"Parser failures",
+						input.terminalFailedParseRevisions.toLocaleString(),
+						input.terminalFailedParseRevisions > 0 ? "critical" : "neutral",
+					),
+				],
+			},
+			plan: {
+				state: input.changedFiles > 0 ? "completed" : "skipped",
+				health: "healthy",
+				summary: input.changedFiles > 0 ? "Planning complete" : "No planning required",
+				detail:
+					input.changedFiles > 0
+						? `${input.changedFiles.toLocaleString()} revisions planned`
+						: "No changed files required planning",
+				progressCurrent: input.changedFiles > 0 ? input.changedFiles : undefined,
+				progressTotal: input.changedFiles > 0 ? input.changedFiles : undefined,
+				progressUnit: input.changedFiles > 0 ? "files" : undefined,
+				progressPercent: input.changedFiles > 0 ? 100 : null,
+				metrics: [
+					this.createServiceMetric("planned", "Planned", input.changedFiles.toLocaleString()),
+					this.createServiceMetric("stagedChunks", "Staged chunks", "0"),
+					this.createServiceMetric("queuedUpserts", "Queued upserts", "0"),
+				],
+			},
+			embedding: {
+				state: syncDidWork ? (syncIssueCount > 0 ? "warning" : "completed") : "skipped",
+				health: syncDidWork ? syncHealth : "healthy",
+				summary: syncDidWork ? "Embedding complete" : "No embedding required",
+				detail: syncDidWork
+					? `${input.upsertedChunks.toLocaleString()} chunks embedded`
+					: "No vector embeddings were required",
+				progressCurrent: syncDidWork ? input.upsertedChunks : undefined,
+				progressTotal: syncDidWork ? embeddingProgressTotal : undefined,
+				progressUnit: syncDidWork ? "chunks" : undefined,
+				progressPercent:
+					syncDidWork && embeddingProgressTotal > 0
+						? Math.min(100, Math.round((input.upsertedChunks / embeddingProgressTotal) * 100))
+						: null,
+				issueCount: syncDidWork ? syncIssueCount : undefined,
+				metrics: [
+					this.createServiceMetric("embedded", "Embedded", input.upsertedChunks.toLocaleString()),
+					this.createServiceMetric(
+						"retrying",
+						"Retrying",
+						input.retryingChunks.toLocaleString(),
+						input.retryingChunks > 0 ? "warning" : "neutral",
+					),
+					this.createServiceMetric(
+						"terminalFailed",
+						"Failed",
+						input.terminallyFailedChunks.toLocaleString(),
+						input.terminallyFailedChunks > 0 ? "critical" : "neutral",
+					),
+				],
+			},
+			vector_sync: {
+				state: syncDidWork ? (syncIssueCount > 0 ? "warning" : "completed") : "skipped",
+				health: syncDidWork ? syncHealth : "healthy",
+				summary: syncDidWork ? "Vector sync complete" : "No vector sync required",
+				detail: syncDidWork
+					? `${input.syncedChunks.toLocaleString()} chunks synced`
+					: "No vector sync work was required",
+				progressCurrent: syncDidWork ? input.syncedChunks : undefined,
+				progressTotal: syncDidWork ? syncProgressTotal : undefined,
+				progressUnit: syncDidWork ? "chunks" : undefined,
+				progressPercent:
+					syncDidWork && syncProgressTotal > 0
+						? Math.min(100, Math.round((input.syncedChunks / syncProgressTotal) * 100))
+						: null,
+				issueCount: syncDidWork ? syncIssueCount : undefined,
+				metrics: [
+					this.createServiceMetric("synced", "Synced", input.syncedChunks.toLocaleString()),
+					this.createServiceMetric(
+						"retrying",
+						"Retrying",
+						input.retryingChunks.toLocaleString(),
+						input.retryingChunks > 0 ? "warning" : "neutral",
+					),
+					this.createServiceMetric(
+						"failed",
+						"Failed",
+						input.terminallyFailedChunks.toLocaleString(),
+						input.terminallyFailedChunks > 0 ? "critical" : "neutral",
+					),
+				],
+			},
+			cleanup: {
+				state: cleanupDidWork ? "completed" : "skipped",
+				health: "healthy",
+				summary: cleanupDidWork ? "Cleanup complete" : "No cleanup required",
+				detail: cleanupDidWork
+					? `${input.deletedChunks.toLocaleString()} stale vectors removed`
+					: "No stale vectors required cleanup",
+				progressCurrent: cleanupDidWork ? input.deletedChunks : undefined,
+				progressTotal: cleanupDidWork ? input.deletedChunks : undefined,
+				progressUnit: cleanupDidWork ? "vectors" : undefined,
+				progressPercent: cleanupDidWork ? 100 : null,
+				metrics: [this.createServiceMetric("deleted", "Removed", input.deletedChunks.toLocaleString())],
+			},
+		})
+		this.stateManager.setPipelineSnapshot(
+			{
+				runMode: input.runMode,
+				overallState: "completed",
+				etaMs: null,
+				services: completedServices,
+			},
+			{ forceImmediate: true },
+		)
 	}
 
 	private createServiceMetric(
@@ -5167,7 +5454,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}
 
 	private logIndexRunPerformanceSummary(
-		runType: "start" | "refresh",
+		runType: "initial-discovery" | "refresh",
 		runId: string,
 		runSummary: {
 			discoveryMs: number
@@ -5273,7 +5560,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				>
 			}
 		).getRunProgressRecord?.(runId)
-		const tracked = (IndexDebugLoggerV2.getTrackedProcessSummary() ?? {}) as {
+		const tracked = (IndexDebugLoggerV2.getTrackedProcessSummary(this.workspacePath) ?? {}) as {
 			totalTrackedRssMB?: number
 			byGroup?: Record<
 				string,
@@ -5415,7 +5702,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 
 	private logFullIndexTerminalEvent(
 		event: "full-index-complete" | "full-index-failed",
-		mode: "start" | "refresh",
+		mode: "initial-discovery" | "refresh",
 		context: Record<string, unknown>,
 	): void {
 		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", event, {
