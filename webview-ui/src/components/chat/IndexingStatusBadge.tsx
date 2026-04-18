@@ -21,7 +21,7 @@ interface IndexingStatusBadgeProps {
  * Mirrors the server-side formatEta() in state-manager.ts.
  */
 function formatEtaForDisplay(ms: number): string {
-	if (ms < 10_000) return "almost done"
+	if (ms < 10_000) return "<10s remaining"
 	if (ms < 60_000) return `~${Math.round(ms / 1000)}s remaining`
 	const minutes = Math.round(ms / 60_000)
 	if (minutes < 60) return `~${minutes}m remaining`
@@ -256,7 +256,7 @@ export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ classN
 	const isCurrentStandby = useMemo(
 		() =>
 			(indexingStatus.systemStatus === "Standby" &&
-				/^(?:V2 is current(?: across| after a partial scan of)|V2 mapped )/.test(
+				/^(?:V2 index ready across |V2 is current(?: across| after a partial scan of)|V2 mapped )/.test(
 					indexingStatus.message ?? "",
 				)) ||
 			(indexingStatus.systemStatus === "Indexed" &&
@@ -277,11 +277,25 @@ export const IndexingStatusBadge: React.FC<IndexingStatusBadgeProps> = ({ classN
 			Error: "bg-red-500",
 		}
 
+		if (indexingStatus.systemStatus === "Standby" && indexingStatus.pipeline) {
+			if (indexingStatus.pipeline.overallState === "failed") {
+				return statusColors.Error
+			}
+			if (
+				indexingStatus.pipeline.overallState === "stopped" ||
+				indexingStatus.pipeline.overallHealth === "watch"
+			) {
+				return "bg-amber-500"
+			}
+			if (indexingStatus.pipeline.overallState === "completed") {
+				return statusColors.Indexed
+			}
+		}
 		if (isCurrentStandby) {
 			return statusColors.Indexed
 		}
 		return statusColors[indexingStatus.systemStatus as keyof typeof statusColors] || statusColors.Standby
-	}, [indexingStatus.systemStatus, isCurrentStandby])
+	}, [indexingStatus.pipeline, indexingStatus.systemStatus, isCurrentStandby])
 
 	return (
 		<CodeIndexPopover indexingStatus={indexingStatus}>

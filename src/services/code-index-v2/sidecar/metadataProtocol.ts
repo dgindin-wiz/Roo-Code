@@ -1,8 +1,11 @@
 import { CodeIndexV2CpuSnapshot, CodeIndexV2MemorySnapshot } from "../logging/log-types"
 import type { ResolvedMetadataStorePaths } from "../store/MetadataPathResolver"
 
+export type MetadataSidecarRole = "writer" | "reader"
+
 export interface MetadataSidecarInitPayload {
 	paths: ResolvedMetadataStorePaths
+	role?: MetadataSidecarRole
 }
 
 export type MetadataSidecarHostToChildMessage =

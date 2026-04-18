@@ -75,6 +75,11 @@ export type SidecarChildToHostMessage =
 			embedLatencyMs: number
 			upsertLatencyMs: number
 			pointIds: string[]
+			vectorWriteQueueDepth?: number
+			queuedVectorWriteBatches?: number
+			queuedVectorWriteEmbeddings?: number
+			vectorWriteBackpressureMs?: number
+			laneReleasedAfterEmbedMs?: number
 			runtimeProfile?: AdaptiveEmbeddingControllerState
 			runtimeObservations?: AdaptiveProviderObservation[]
 			variantTelemetry: {
@@ -84,6 +89,20 @@ export type SidecarChildToHostMessage =
 				embeddedVariantCountsByType: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
 				skippedVectorizationReasons: Record<string, number>
 			}
+			memory: CodeIndexV2MemorySnapshot
+			cpu: CodeIndexV2CpuSnapshot
+	  }
+	| {
+			type: "upsert-embedded"
+			requestId: string
+			embeddingCount: number
+			embedLatencyMs: number
+			pointIds: string[]
+			vectorWriteQueueDepth: number
+			queuedVectorWriteBatches: number
+			queuedVectorWriteEmbeddings: number
+			vectorWriteBackpressureMs: number
+			laneReleasedAfterEmbedMs: number
 			memory: CodeIndexV2MemorySnapshot
 			cpu: CodeIndexV2CpuSnapshot
 	  }

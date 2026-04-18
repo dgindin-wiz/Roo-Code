@@ -1008,6 +1008,52 @@ describe("webviewMessageHandler - indexing flows", () => {
 			}),
 		})
 	})
+
+	it("compacts metadata DB and posts result plus refreshed status", async () => {
+		const mockManager = {
+			compactIndexMetadataDatabase: vi.fn().mockResolvedValue({
+				operationalDbBytesBefore: 9_000_000,
+				operationalDbBytesAfter: 4_000_000,
+				operationalWalBytesBefore: 0,
+				operationalWalBytesAfter: 0,
+				reclaimedBytes: 5_000_000,
+				requiredFreeBytes: 9_900_000,
+				availableFreeBytesBefore: 20_000_000,
+				availableFreeBytesAfter: 25_000_000,
+				elapsedMs: 12_000,
+			}),
+			getCurrentStatus: vi.fn().mockReturnValue({
+				systemStatus: "Indexed",
+				message: "Index ready",
+				processedItems: 0,
+				totalItems: 0,
+				currentItemUnit: "blocks",
+			}),
+		}
+		;(mockClineProvider as any).getCurrentWorkspaceCodeIndexManager = vi.fn().mockReturnValue(mockManager)
+
+		await webviewMessageHandler(mockClineProvider, {
+			type: "compactCodeIndexMetadata",
+		} as any)
+
+		expect(mockManager.compactIndexMetadataDatabase).toHaveBeenCalledTimes(1)
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenNthCalledWith(1, {
+			type: "indexMetadataCompactionResult",
+			values: expect.objectContaining({
+				success: true,
+				operationalDbBytesBefore: 9_000_000,
+				operationalDbBytesAfter: 4_000_000,
+				reclaimedBytes: 5_000_000,
+			}),
+		})
+		expect(mockClineProvider.postMessageToWebview).toHaveBeenNthCalledWith(2, {
+			type: "indexingStatusUpdate",
+			values: expect.objectContaining({
+				systemStatus: "Indexed",
+				message: "Index ready",
+			}),
+		})
+	})
 })
 
 describe("webviewMessageHandler - deleteCustomMode", () => {

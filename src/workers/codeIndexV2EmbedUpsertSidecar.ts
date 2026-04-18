@@ -1,7 +1,11 @@
 import { TelemetryService } from "@roo-code/telemetry"
 import { createSidecarDependencies } from "../services/code-index-v2/sidecar/dependencyFactory"
 import { SidecarChildToHostMessage, SidecarHostToChildMessage } from "../services/code-index-v2/sidecar/protocol"
-import { executeUpsertBatch } from "../services/code-index-v2/pipeline/EmbedUpsertExecution"
+import {
+	createEmbeddedUpsertBatch,
+	type EmbeddedUpsertBatch,
+	writeEmbeddedUpsertBatch,
+} from "../services/code-index-v2/pipeline/EmbedUpsertExecution"
 
 let initialized = false
 let dependencies: ReturnType<typeof createSidecarDependencies> | undefined
@@ -12,6 +16,24 @@ let lastCpuSample:
 			recordedAtMs: number
 	  }
 	| undefined
+
+const MAX_VECTOR_WRITE_BATCHES = 2
+const MAX_VECTOR_WRITE_BYTES = 128 * 1024 * 1024
+
+interface VectorWriteTask {
+	requestId: string
+	embedded: EmbeddedUpsertBatch
+	estimatedBytes: number
+	resolve: (upsertLatencyMs: number) => void
+	reject: (error: unknown) => void
+}
+
+const vectorWriteQueue: VectorWriteTask[] = []
+const vectorWriteCapacityWaiters = new Set<() => void>()
+let activeVectorWriteTask: VectorWriteTask | undefined
+let vectorWriteQueueBytes = 0
+let vectorWriteQueueEmbeddings = 0
+let vectorWriteDrainPromise: Promise<void> | undefined
 
 if (!TelemetryService.hasInstance()) {
 	TelemetryService.createInstance([])
@@ -69,6 +91,112 @@ function sendError(requestId: string | undefined, error: unknown, retryable?: bo
 	})
 }
 
+function estimateVectorWriteBytes(embedded: EmbeddedUpsertBatch): number {
+	let vectorBytes = 0
+	let payloadBytes = 0
+	for (const point of embedded.points) {
+		vectorBytes += point.vector.length * 4
+		try {
+			payloadBytes += Buffer.byteLength(JSON.stringify(point.payload), "utf8")
+		} catch {
+			payloadBytes += 8 * 1024
+		}
+	}
+	// Account for object overhead and transient serialization copies without pretending this is exact.
+	return Math.ceil((vectorBytes + payloadBytes) * 2.5)
+}
+
+function getVectorWriteQueueMetrics() {
+	return {
+		vectorWriteQueueDepth: vectorWriteQueue.length + (activeVectorWriteTask ? 1 : 0),
+		queuedVectorWriteBatches: vectorWriteQueue.length + (activeVectorWriteTask ? 1 : 0),
+		queuedVectorWriteEmbeddings: vectorWriteQueueEmbeddings,
+		queuedVectorWriteBytes: vectorWriteQueueBytes,
+	}
+}
+
+function notifyVectorWriteCapacity() {
+	for (const waiter of Array.from(vectorWriteCapacityWaiters)) {
+		waiter()
+	}
+}
+
+async function waitForVectorWriteCapacity(signal?: AbortSignal): Promise<number> {
+	const startedAt = Date.now()
+	while (
+		vectorWriteQueue.length + (activeVectorWriteTask ? 1 : 0) > MAX_VECTOR_WRITE_BATCHES - 1 ||
+		vectorWriteQueueBytes > MAX_VECTOR_WRITE_BYTES
+	) {
+		if (signal?.aborted) {
+			throw new Error("Embed/upsert worker aborted")
+		}
+		await new Promise<void>((resolve, reject) => {
+			const finish = () => {
+				vectorWriteCapacityWaiters.delete(finish)
+				signal?.removeEventListener("abort", onAbort)
+				resolve()
+			}
+			const onAbort = () => {
+				vectorWriteCapacityWaiters.delete(finish)
+				signal?.removeEventListener("abort", onAbort)
+				reject(new Error("Embed/upsert worker aborted"))
+			}
+			vectorWriteCapacityWaiters.add(finish)
+			signal?.addEventListener("abort", onAbort, { once: true })
+		})
+	}
+	return Date.now() - startedAt
+}
+
+function enqueueVectorWrite(requestId: string, embedded: EmbeddedUpsertBatch): Promise<number> {
+	const estimatedBytes = estimateVectorWriteBytes(embedded)
+	vectorWriteQueueBytes += estimatedBytes
+	vectorWriteQueueEmbeddings += embedded.embeddingCount
+	const writePromise = new Promise<number>((resolve, reject) => {
+		vectorWriteQueue.push({
+			requestId,
+			embedded,
+			estimatedBytes,
+			resolve,
+			reject,
+		})
+	})
+	void drainVectorWriteQueue()
+	return writePromise
+}
+
+async function drainVectorWriteQueue(): Promise<void> {
+	if (vectorWriteDrainPromise) {
+		return vectorWriteDrainPromise
+	}
+
+	vectorWriteDrainPromise = (async () => {
+		while (vectorWriteQueue.length > 0) {
+			const task = vectorWriteQueue.shift()!
+			activeVectorWriteTask = task
+			try {
+				if (!dependencies) {
+					throw new Error("Code index sidecar vector writer is unavailable")
+				}
+				const upsertLatencyMs = await writeEmbeddedUpsertBatch(task.embedded, dependencies.vectorStore)
+				task.resolve(upsertLatencyMs)
+			} catch (error) {
+				task.reject(error)
+			} finally {
+				vectorWriteQueueBytes = Math.max(0, vectorWriteQueueBytes - task.estimatedBytes)
+				vectorWriteQueueEmbeddings = Math.max(0, vectorWriteQueueEmbeddings - task.embedded.embeddingCount)
+				activeVectorWriteTask = undefined
+				notifyVectorWriteCapacity()
+			}
+		}
+	})().finally(() => {
+		vectorWriteDrainPromise = undefined
+		notifyVectorWriteCapacity()
+	})
+
+	return vectorWriteDrainPromise
+}
+
 async function handleMessage(message: SidecarHostToChildMessage) {
 	try {
 		switch (message.type) {
@@ -91,29 +219,53 @@ async function handleMessage(message: SidecarHostToChildMessage) {
 				const controller = new AbortController()
 				activeControllers.set(message.requestId, controller)
 				try {
-					const result = await executeUpsertBatch(
-						message.items,
-						dependencies.embeddingAdapter,
-						dependencies.vectorStore,
-						{
-							signal: controller.signal,
-							debugContext: {
-								runId: message.runId,
-								batchId: `${message.runId}:${message.laneId}:${message.requestId}`,
-								outerBatchSize: message.items.length,
-							},
+					const requestStartedAt = Date.now()
+					const vectorWriteBackpressureMs = await waitForVectorWriteCapacity(controller.signal)
+					const embedded = await createEmbeddedUpsertBatch(message.items, dependencies.embeddingAdapter, {
+						signal: controller.signal,
+						debugContext: {
+							runId: message.runId,
+							batchId: `${message.runId}:${message.laneId}:${message.requestId}`,
+							outerBatchSize: message.items.length,
 						},
-					)
+					})
+					const vectorWritePromise =
+						embedded.points.length > 0
+							? enqueueVectorWrite(message.requestId, embedded)
+							: Promise.resolve(0)
+					const queueMetrics = getVectorWriteQueueMetrics()
+					const laneReleasedAfterEmbedMs = Date.now() - requestStartedAt
+					send({
+						type: "upsert-embedded",
+						requestId: message.requestId,
+						embeddingCount: embedded.embeddingCount,
+						embedLatencyMs: embedded.embedLatencyMs,
+						pointIds: embedded.pointIds,
+						vectorWriteQueueDepth: queueMetrics.vectorWriteQueueDepth,
+						queuedVectorWriteBatches: queueMetrics.queuedVectorWriteBatches,
+						queuedVectorWriteEmbeddings: queueMetrics.queuedVectorWriteEmbeddings,
+						vectorWriteBackpressureMs,
+						laneReleasedAfterEmbedMs,
+						memory: getMemorySnapshot(),
+						cpu: getCpuSnapshot(),
+					})
+					const upsertLatencyMs = await vectorWritePromise
+					const completionQueueMetrics = getVectorWriteQueueMetrics()
 					send({
 						type: "upsert-result",
 						requestId: message.requestId,
-						embeddingCount: result.embeddingCount,
-						embedLatencyMs: result.embedLatencyMs,
-						upsertLatencyMs: result.upsertLatencyMs,
-						pointIds: result.pointIds,
-						runtimeProfile: result.adaptiveControllerState,
-						runtimeObservations: result.adaptiveControllerObservations,
-						variantTelemetry: result.variantTelemetry,
+						embeddingCount: embedded.embeddingCount,
+						embedLatencyMs: embedded.embedLatencyMs,
+						upsertLatencyMs,
+						pointIds: embedded.pointIds,
+						vectorWriteQueueDepth: completionQueueMetrics.vectorWriteQueueDepth,
+						queuedVectorWriteBatches: completionQueueMetrics.queuedVectorWriteBatches,
+						queuedVectorWriteEmbeddings: completionQueueMetrics.queuedVectorWriteEmbeddings,
+						vectorWriteBackpressureMs,
+						laneReleasedAfterEmbedMs,
+						runtimeProfile: embedded.adaptiveControllerState,
+						runtimeObservations: embedded.adaptiveControllerObservations,
+						variantTelemetry: embedded.variantTelemetry,
 						memory: getMemorySnapshot(),
 						cpu: getCpuSnapshot(),
 					})

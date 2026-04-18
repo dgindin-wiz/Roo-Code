@@ -1,5 +1,6 @@
 import { VectorStoreSearchResult } from "./vector-store"
 import * as vscode from "vscode"
+import type { CodeIndexMetadataCompactionResult } from "../../code-index-v2/engine/interfaces"
 
 /**
  * Interface for the code index manager
@@ -77,6 +78,7 @@ export interface ICodeIndexManager {
 	 */
 	clearIndexData(): Promise<void>
 	clearIndexDatabase?(): Promise<void>
+	compactIndexMetadataDatabase?(): Promise<CodeIndexMetadataCompactionResult>
 
 	/**
 	 * Searches the index

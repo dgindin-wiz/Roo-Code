@@ -3,83 +3,17 @@ import { DiffPlanner } from "../services/code-index-v2/pipeline/DiffPlanner"
 import {
 	MetadataSidecarChildToHostMessage,
 	MetadataSidecarHostToChildMessage,
+	MetadataSidecarRole,
 } from "../services/code-index-v2/sidecar/metadataProtocol"
+import {
+	READ_ONLY_METADATA_OPERATION_SET,
+	REMOTE_METADATA_OPERATION_SET,
+} from "../services/code-index-v2/sidecar/metadataOperations"
 import { SqliteMetadataRepository } from "../services/code-index-v2/store/SqliteMetadataRepository"
-
-const ALLOWED_OPERATIONS = new Set([
-	"adoptRetryableJobsFromStaleRuns",
-	"adoptRevisionToRun",
-	"beginRun",
-	"claimJobs",
-	"claimJobsWithLease",
-	"countChunksForRevisions",
-	"cleanupStaleRuns",
-	"clearStorage",
-	"completeJobs",
-	"countActiveChunksForWorkspace",
-	"countActiveIndexedFilesForWorkspace",
-	"countOutstandingResumedJobs",
-	"countTrackedFilesForWorkspace",
-	"createFileRevision",
-	"enqueueJobs",
-	"ensureWorkspaceRecord",
-	"excludeFilesFromIndexing",
-	"failJob",
-	"finalizeReadyRevisionsBatch",
-	"findReusableRevision",
-	"getActiveChunksByFingerprints",
-	"getActiveChunksByRelativePaths",
-	"getActiveRevisionForFile",
-	"getChunkVariantsByChunkIds",
-	"getChunksByIds",
-	"getChunksForRevision",
-	"getDiffBaselineRevision",
-	"getDiscoveredFilesByRelativePaths",
-	"getDiscoveredFilesForWorkspace",
-	"getFileRecordByWorkspacePathOptional",
-	"getNextRetryAt",
-	"getRunProgressRecord",
-	"getRevisionJobResolution",
-	"getRevisionsByState",
-	"getRunBacklogMetrics",
-	"getTrackedFilesForWorkspace",
-	"heartbeatJobs",
-	"heartbeatRun",
-	"listRevisionWarnings",
-	"listPlannedRevisionResolutions",
-	"listTrackedOversizedFiles",
-	"listTrackedOversizedRelativePaths",
-	"listWarningRelativePaths",
-	"markChunkState",
-	"markChunkStates",
-	"markChunkVariantStates",
-	"markFileTombstoned",
-	"markJobTerminalFailed",
-	"markRevisionCommitted",
-	"markRevisionDegraded",
-	"markRevisionState",
-	"markRevisionSuperseded",
-	"markRevisionTerminalFailure",
-	"markRunComplete",
-	"markRunDiscoveryComplete",
-	"markRunFailed",
-	"markRunStopped",
-	"persistParsedRevision",
-	"recordWatchEvent",
-	"releaseJobs",
-	"replaceTrackedOversizedFiles",
-	"searchActiveChunksLexically",
-	"searchActiveChunksLexicallyWithStatus",
-	"upsertFileRecords",
-	"appendRunSample",
-	"checkpointWal",
-	"performMaintenance",
-	"writeRunSummary",
-	"runPlannerSlice",
-])
 
 let repository: SqliteMetadataRepository | undefined
 let diffPlanner: DiffPlanner | undefined
+let sidecarRole: MetadataSidecarRole = "writer"
 const pendingControllers = new Map<string, AbortController>()
 
 function send(message: MetadataSidecarChildToHostMessage) {
@@ -115,6 +49,7 @@ function summarizeOperationArgs(operation: string, args: unknown[]): Record<stri
 				runId: args[2] ?? null,
 			}
 		case "getRunBacklogMetrics":
+		case "getRunSummary":
 		case "heartbeatRun":
 		case "getRunProgressRecord":
 		case "markRunComplete":
@@ -123,6 +58,16 @@ function summarizeOperationArgs(operation: string, args: unknown[]): Record<stri
 		case "markRunStopped":
 			return {
 				runId: args[0] ?? null,
+			}
+		case "listRunSummaries":
+		case "listRecentRunProgress":
+			return {
+				limit: args[0] ?? null,
+			}
+		case "listReadyRevisionResolutions":
+			return {
+				runId: args[0] ?? null,
+				limit: args[1] ?? null,
 			}
 		case "appendRunSample": {
 			const input = (args[0] as { runId?: string; stage?: string; eventType?: string } | undefined) ?? {}
@@ -160,10 +105,24 @@ function summarizeOperationArgs(operation: string, args: unknown[]): Record<stri
 			}
 		}
 		case "performMaintenance": {
-			const input = (args[0] as { checkpointMode?: string; shrinkMemory?: boolean } | undefined) ?? {}
+			const input =
+				(args[0] as
+					| {
+							checkpointMode?: string
+							shrinkMemory?: boolean
+							pruneFootprint?: boolean
+							markFootprintCleanup?: boolean
+							maxPruneBatches?: number
+							vacuumMode?: string
+					  }
+					| undefined) ?? {}
 			return {
 				checkpointMode: input.checkpointMode ?? "PASSIVE",
 				shrinkMemory: input.shrinkMemory ?? false,
+				pruneFootprint: input.pruneFootprint ?? true,
+				markFootprintCleanup: input.markFootprintCleanup ?? false,
+				maxPruneBatches: input.maxPruneBatches ?? null,
+				vacuumMode: input.vacuumMode ?? "none",
 			}
 		}
 		default:
@@ -180,6 +139,8 @@ function logRequestEvent(
 	IndexDebugLoggerV2.log("basic", "MetadataSidecar", message, {
 		component: "MetadataSidecar",
 		processRole: "sidecar",
+		sidecarRole,
+		sidecarLabel: getSidecarLabel(),
 		requestId,
 		operation,
 		sidecarPid: process.pid,
@@ -194,13 +155,14 @@ async function handleMessage(message: MetadataSidecarHostToChildMessage) {
 	try {
 		switch (message.type) {
 			case "init": {
+				sidecarRole = message.payload.role ?? "writer"
 				IndexDebugLoggerV2.configureDiagnosticsDirectory(
 					message.payload.paths.diagnosticsRootDir,
 					message.payload.paths.workspacePath,
 				)
-				repository = new SqliteMetadataRepository(message.payload.paths)
+				repository = new SqliteMetadataRepository(message.payload.paths, { mode: sidecarRole })
 				await repository.initialize()
-				diffPlanner = new DiffPlanner(repository as any)
+				diffPlanner = sidecarRole === "writer" ? new DiffPlanner(repository as any) : undefined
 				send({
 					type: "ready",
 					pid: process.pid,
@@ -213,8 +175,11 @@ async function handleMessage(message: MetadataSidecarHostToChildMessage) {
 				if (!repository) {
 					throw new Error("Metadata sidecar received work before initialization")
 				}
-				if (!ALLOWED_OPERATIONS.has(message.operation)) {
+				if (!REMOTE_METADATA_OPERATION_SET.has(message.operation)) {
 					throw new Error(`Unsupported metadata sidecar operation: ${message.operation}`)
+				}
+				if (sidecarRole === "reader" && !READ_ONLY_METADATA_OPERATION_SET.has(message.operation)) {
+					throw new Error(`Metadata reader sidecar cannot invoke write operation: ${message.operation}`)
 				}
 				const startedAt = Date.now()
 				const summary = summarizeOperationArgs(message.operation, message.args)
@@ -222,6 +187,9 @@ async function handleMessage(message: MetadataSidecarHostToChildMessage) {
 				try {
 					let result: unknown
 					if (message.operation === "runPlannerSlice") {
+						if (sidecarRole !== "writer") {
+							throw new Error("Metadata reader sidecar cannot run planner slices")
+						}
 						if (!diffPlanner) {
 							throw new Error("Metadata sidecar planner is unavailable")
 						}
@@ -308,3 +276,7 @@ async function handleMessage(message: MetadataSidecarHostToChildMessage) {
 process.on("message", (message: MetadataSidecarHostToChildMessage) => {
 	void handleMessage(message)
 })
+
+function getSidecarLabel(): string {
+	return sidecarRole === "writer" ? "metadata-writer-sidecar" : "metadata-reader-sidecar"
+}

@@ -52,6 +52,11 @@ export interface EmbedUpsertExecutionResult {
 	pointIds: string[]
 	sidecarRoundTripLatencyMs?: number
 	sidecarDeliveryDelayMs?: number
+	vectorWriteQueueDepth?: number
+	queuedVectorWriteBatches?: number
+	queuedVectorWriteEmbeddings?: number
+	vectorWriteBackpressureMs?: number
+	laneReleasedAfterEmbedMs?: number
 	variantTelemetry: {
 		storedVariantCount: number
 		embeddedVariantCount: number
@@ -59,6 +64,16 @@ export interface EmbedUpsertExecutionResult {
 		embeddedVariantCountsByType: Partial<Record<EmbedUpsertVariantInput["variantType"], number>>
 		skippedVectorizationReasons: Record<string, number>
 	}
+	adaptiveControllerState?: AdaptiveEmbeddingControllerState
+	adaptiveControllerObservations?: AdaptiveProviderObservation[]
+}
+
+export interface EmbeddedUpsertBatch {
+	embeddingCount: number
+	embedLatencyMs: number
+	points: VectorPoint[]
+	pointIds: string[]
+	variantTelemetry: EmbedUpsertExecutionResult["variantTelemetry"]
 	adaptiveControllerState?: AdaptiveEmbeddingControllerState
 	adaptiveControllerObservations?: AdaptiveProviderObservation[]
 }
@@ -197,6 +212,44 @@ export async function executeUpsertBatch(
 		}
 	},
 ): Promise<EmbedUpsertExecutionResult> {
+	const embedded = await createEmbeddedUpsertBatch(items, embeddingAdapter, options)
+	if (embedded.points.length === 0) {
+		return {
+			embeddingCount: embedded.embeddingCount,
+			embedLatencyMs: embedded.embedLatencyMs,
+			upsertLatencyMs: 0,
+			pointIds: [],
+			variantTelemetry: embedded.variantTelemetry,
+			adaptiveControllerState: embedded.adaptiveControllerState,
+			adaptiveControllerObservations: embedded.adaptiveControllerObservations,
+		}
+	}
+
+	const upsertLatencyMs = await writeEmbeddedUpsertBatch(embedded, vectorStore)
+	return {
+		embeddingCount: embedded.embeddingCount,
+		embedLatencyMs: embedded.embedLatencyMs,
+		upsertLatencyMs,
+		pointIds: embedded.pointIds,
+		variantTelemetry: embedded.variantTelemetry,
+		adaptiveControllerState: embedded.adaptiveControllerState,
+		adaptiveControllerObservations: embedded.adaptiveControllerObservations,
+	}
+}
+
+export async function createEmbeddedUpsertBatch(
+	items: EmbedUpsertBatchItem[],
+	embeddingAdapter: EmbeddingAdapter,
+	options?: {
+		signal?: AbortSignal
+		debugContext?: {
+			runId?: string
+			batchId?: string
+			outerBatchSize?: number
+			workspacePath?: string
+		}
+	},
+): Promise<EmbeddedUpsertBatch> {
 	const variantPairs = items.flatMap(({ chunk, variants }) =>
 		getChunkVariantsForEmbedding(chunk, variants).map((variant) => ({
 			chunk,
@@ -217,7 +270,7 @@ export async function executeUpsertBatch(
 		return {
 			embeddingCount: 0,
 			embedLatencyMs: 0,
-			upsertLatencyMs: 0,
+			points: [],
 			pointIds: [],
 			variantTelemetry,
 		}
@@ -236,17 +289,23 @@ export async function executeUpsertBatch(
 	const points = variantPairs.map(({ chunk, variant }, index) =>
 		createPoint(chunk, variant, embeddingResponse.embeddings[index] ?? [], embeddingAdapter.modelId),
 	)
-	const upsertStartedAt = Date.now()
-	await vectorStore.upsertPoints(points)
-	const upsertLatencyMs = Date.now() - upsertStartedAt
 
 	return {
 		embeddingCount: embeddingResponse.embeddings.length,
 		embedLatencyMs,
-		upsertLatencyMs,
+		points,
 		pointIds: points.map((point) => point.id),
 		variantTelemetry,
 		adaptiveControllerState: embeddingResponse.adaptiveControllerState,
 		adaptiveControllerObservations: embeddingResponse.adaptiveControllerObservations,
 	}
+}
+
+export async function writeEmbeddedUpsertBatch(
+	embedded: Pick<EmbeddedUpsertBatch, "points">,
+	vectorStore: VectorStoreAdapter,
+): Promise<number> {
+	const upsertStartedAt = Date.now()
+	await vectorStore.upsertPoints(embedded.points)
+	return Date.now() - upsertStartedAt
 }

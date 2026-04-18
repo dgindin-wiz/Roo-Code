@@ -249,9 +249,12 @@ export class CodeParser implements ICodeParser {
 			if (currentNode.text.length >= MIN_BLOCK_CHARS) {
 				// If it also exceeds the maximum character limit, try to break it down
 				if (currentNode.text.length > MAX_BLOCK_CHARS * MAX_CHARS_TOLERANCE_FACTOR) {
-					if (currentNode.children.filter((child) => child !== null).length > 0) {
+					const childNodes = currentNode.children.filter((child): child is Node => child !== null)
+					if (childNodes.length > 0) {
 						// If it has children, process them instead
-						queue.push(...currentNode.children.filter((child) => child !== null))
+						for (const childNode of childNodes) {
+							queue.push(childNode)
+						}
 					} else {
 						// If it's a leaf node, chunk it
 						const chunkedBlocks = this._chunkLeafNodeByLines(

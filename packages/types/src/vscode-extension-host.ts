@@ -77,6 +77,7 @@ export interface ExtensionMessage {
 		| "indexingWarningDetails"
 		| "indexingOversizedFilesDetails"
 		| "indexCleared"
+		| "indexMetadataCompactionResult"
 		| "codebaseIndexConfig"
 		| "marketplaceInstallResult"
 		| "marketplaceRemoveResult"
@@ -521,10 +522,12 @@ export interface WebviewMessage {
 		| "stopIndexing"
 		| "clearIndexData"
 		| "clearIndexDatabase"
+		| "compactCodeIndexMetadata"
 		| "codeIndexDebugLog"
 		| "indexingStatusUpdate"
 		| "indexingWarningDetails"
 		| "indexCleared"
+		| "indexMetadataCompactionResult"
 		| "toggleWorkspaceIndexing"
 		| "setAutoEnableDefault"
 		| "focusPanelRequest"
@@ -767,12 +770,27 @@ export type IndexingHealthState = "healthy" | "watch" | "critical" | "unknown"
 export type IndexingPipelineRunMode = "initial-discovery" | "refresh" | "reconcile" | "resume" | "unknown" | "start"
 export type IndexingPipelineOverallState = "idle" | "running" | "completed" | "stopped" | "failed"
 export type IndexingMetricTone = "neutral" | "good" | "warning" | "critical"
+export type IndexingMetricVisibility = "primary" | "detail"
+export type IndexingSidecarId = "metadata_writer" | "metadata_reader"
+export type IndexingSidecarState = "standby" | "online" | "busy" | "failed"
+export type IndexingRuntimeTaskId = "metadata_cleanup"
+export type IndexingRuntimeTaskState = "idle" | "scheduled" | "running" | "partial" | "complete" | "failed" | "skipped"
+export type IndexingRuntimeTaskActionId = "compact_metadata_db"
+
+export interface IndexingRuntimeTaskAction {
+	id: IndexingRuntimeTaskActionId
+	label: string
+	enabled: boolean
+	reason?: string
+	tone?: IndexingMetricTone
+}
 
 export interface IndexingServiceMetric {
 	key: string
 	label: string
 	value: string
 	tone?: IndexingMetricTone
+	visibility?: IndexingMetricVisibility
 }
 
 export interface IndexingServiceSnapshot {
@@ -792,15 +810,101 @@ export interface IndexingServiceSnapshot {
 	updatedAt?: number
 }
 
+export interface IndexingSidecarSnapshot {
+	id: IndexingSidecarId
+	title: string
+	state: IndexingSidecarState
+	health: IndexingHealthState
+	summary: string
+	detail?: string
+	pid?: number | null
+	pendingRequestCount?: number
+	lastOperation?: string | null
+	lastElapsedMs?: number | null
+	lastError?: string | null
+	metrics: IndexingServiceMetric[]
+	updatedAt?: number
+}
+
+export interface IndexingRuntimeTaskSnapshot {
+	id: IndexingRuntimeTaskId
+	title: string
+	state: IndexingRuntimeTaskState
+	health: IndexingHealthState
+	summary: string
+	detail?: string
+	progressCurrent?: number
+	progressTotal?: number
+	progressUnit?: string
+	progressPercent?: number | null
+	indeterminate?: boolean
+	rateLabel?: string
+	etaLabel?: string
+	phaseLabel?: string
+	metrics: IndexingServiceMetric[]
+	actions?: IndexingRuntimeTaskAction[]
+	updatedAt?: number
+}
+
+export interface IndexMetadataCompactionResultPayload {
+	success: boolean
+	error?: string
+	operationalDbBytesBefore?: number
+	operationalDbBytesAfter?: number
+	operationalWalBytesBefore?: number
+	operationalWalBytesAfter?: number
+	reclaimedBytes?: number
+	requiredFreeBytes?: number
+	availableFreeBytesBefore?: number | null
+	availableFreeBytesAfter?: number | null
+	elapsedMs?: number
+}
+
+export interface IndexingRuntimeSnapshot {
+	sidecars: IndexingSidecarSnapshot[]
+	tasks?: IndexingRuntimeTaskSnapshot[]
+	updatedAt?: number
+}
+
+export interface IndexingPhaseTimingSnapshot {
+	discoveryMs?: number
+	fileChecksMs?: number
+	parseMs?: number
+	planMs?: number
+	embedSyncMs?: number
+	cleanupMs?: number
+}
+
+export type IndexingProgressTotalKind = "exact" | "estimated" | "available"
+
+export interface IndexingCodebaseProgressSnapshot {
+	indexedFiles?: number
+	totalFiles?: number
+	fileTotalKind?: IndexingProgressTotalKind
+	syncedChunks?: number
+	knownTotalChunks?: number
+	chunkTotalKind?: IndexingProgressTotalKind
+	historicalTombstonedFiles?: number
+}
+
 export interface IndexingRunSummarySnapshot {
 	primaryServiceId?: IndexingServiceId
 	headline: string
 	progressLabel?: string
 	secondaryLabel?: string
+	recoveredProgressLabel?: string
+	elapsedLabel?: string
+	etaLabel?: string
 	progressCurrent?: number
 	progressTotal?: number
 	progressUnit?: string
 	progressPercent?: number | null
+	elapsedMs?: number | null
+	recoveredElapsedMs?: number | null
+	investedElapsedMs?: number | null
+	totalTimeMs?: number | null
+	phaseTimingMs?: IndexingPhaseTimingSnapshot
+	codebaseProgress?: IndexingCodebaseProgressSnapshot
 	indeterminate?: boolean
 }
 
@@ -809,6 +913,15 @@ export interface IndexingPipelineSnapshot {
 	overallHealth: IndexingHealthState
 	runMode: IndexingPipelineRunMode
 	etaMs?: number | null
+	elapsedMs?: number | null
+	recoveredElapsedMs?: number | null
+	investedElapsedMs?: number | null
+	baselineIndexedFiles?: number
+	baselineIndexedChunks?: number
+	baselineSyncedChunks?: number
+	phaseTimingMs?: IndexingPhaseTimingSnapshot
+	codebaseProgress?: IndexingCodebaseProgressSnapshot
+	runtime?: IndexingRuntimeSnapshot
 	services: IndexingServiceSnapshot[]
 	summary?: IndexingRunSummarySnapshot
 	lastCompletedAt?: number

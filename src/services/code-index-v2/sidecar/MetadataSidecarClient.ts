@@ -1,10 +1,16 @@
 import { ChildProcess, fork } from "child_process"
 import { existsSync } from "fs"
 import * as path from "path"
+import type { IndexingSidecarState } from "@roo-code/types"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import type { DiffPlannerSummary } from "../pipeline/DiffPlanner"
 import type { ResolvedMetadataStorePaths } from "../store/MetadataPathResolver"
-import type { MetadataSidecarChildToHostMessage, MetadataSidecarHostToChildMessage } from "./metadataProtocol"
+import { REMOTE_METADATA_OPERATION_SET } from "./metadataOperations"
+import type {
+	MetadataSidecarChildToHostMessage,
+	MetadataSidecarHostToChildMessage,
+	MetadataSidecarRole,
+} from "./metadataProtocol"
 
 interface PendingRequest {
 	resolve: (value: unknown) => void
@@ -16,102 +22,35 @@ interface PendingRequest {
 }
 
 const HOT_PATH_TIMEOUT_MS = 5_000
+const CLAIM_TIMEOUT_MS = 10_000
+const POLL_TIMEOUT_MS = 10_000
 const HEAVY_OPERATION_TIMEOUT_MS = 30_000
 const CLEANUP_TIMEOUT_MS = 90_000
+const VACUUM_TIMEOUT_MS = 10 * 60_000
 const INIT_TIMEOUT_MS = 10_000
 const KILL_GRACE_MS = 2_000
 
 const HOT_PATH_OPERATIONS = new Set([
-	"getRunBacklogMetrics",
-	"claimJobs",
-	"claimJobsWithLease",
 	"heartbeatRun",
 	"appendRunSample",
 	"heartbeatJobs",
 	"getRunProgressRecord",
 	"getNextRetryAt",
 ])
+
+const CLAIM_OPERATIONS = new Set(["claimJobs", "claimJobsWithLease"])
+
+const POLL_OPERATIONS = new Set(["getRunBacklogMetrics"])
 
 const HEAVY_OPERATIONS = new Set([
 	"runPlannerSlice",
 	"persistParsedRevision",
 	"finalizeReadyRevisionsBatch",
-	"performMaintenance",
-])
-
-const CLEANUP_OPERATIONS = new Set(["clearStorage", "cleanupStaleRuns"])
-
-const REMOTE_OPERATION_ALLOWLIST = new Set([
-	"adoptRetryableJobsFromStaleRuns",
-	"adoptRevisionToRun",
-	"beginRun",
-	"claimJobs",
-	"claimJobsWithLease",
-	"countChunksForRevisions",
-	"cleanupStaleRuns",
-	"clearStorage",
-	"completeJobs",
-	"countActiveChunksForWorkspace",
-	"countActiveIndexedFilesForWorkspace",
-	"countOutstandingResumedJobs",
-	"countTrackedFilesForWorkspace",
-	"createFileRevision",
-	"enqueueJobs",
-	"ensureWorkspaceRecord",
-	"excludeFilesFromIndexing",
-	"failJob",
-	"finalizeReadyRevisionsBatch",
-	"findReusableRevision",
-	"getActiveChunksByFingerprints",
-	"getActiveChunksByRelativePaths",
-	"getActiveRevisionForFile",
-	"getChunkVariantsByChunkIds",
-	"getChunksByIds",
-	"getChunksForRevision",
-	"getDiffBaselineRevision",
-	"getDiscoveredFilesByRelativePaths",
-	"getDiscoveredFilesForWorkspace",
-	"getFileRecordByWorkspacePathOptional",
-	"getNextRetryAt",
-	"getRunProgressRecord",
-	"getRevisionJobResolution",
-	"getRevisionsByState",
-	"getRunBacklogMetrics",
-	"getTrackedFilesForWorkspace",
-	"heartbeatJobs",
-	"heartbeatRun",
-	"listRevisionWarnings",
 	"listPlannedRevisionResolutions",
-	"listTrackedOversizedFiles",
-	"listTrackedOversizedRelativePaths",
-	"listWarningRelativePaths",
-	"markChunkState",
-	"markChunkStates",
-	"markChunkVariantStates",
-	"markFileTombstoned",
-	"markJobTerminalFailed",
-	"markRevisionCommitted",
-	"markRevisionDegraded",
-	"markRevisionState",
-	"markRevisionSuperseded",
-	"markRevisionTerminalFailure",
-	"markRunComplete",
-	"markRunDiscoveryComplete",
-	"markRunFailed",
-	"markRunStopped",
-	"persistParsedRevision",
-	"recordWatchEvent",
-	"releaseJobs",
-	"replaceTrackedOversizedFiles",
-	"searchActiveChunksLexically",
-	"searchActiveChunksLexicallyWithStatus",
-	"upsertFileRecords",
-	"appendRunSample",
-	"checkpointWal",
-	"performMaintenance",
-	"writeRunSummary",
-	"runPlannerSlice",
+	"listReadyRevisionResolutions",
 ])
+
+const CLEANUP_OPERATIONS = new Set(["clearStorage", "cleanupStaleRuns", "performMaintenance"])
 
 export class MetadataSidecarRequestTimeoutError extends Error {
 	override name = "MetadataSidecarRequestTimeoutError"
@@ -141,14 +80,26 @@ export function isMetadataSidecarRuntimeError(error: unknown): boolean {
 	return error instanceof MetadataSidecarRequestTimeoutError || error instanceof MetadataSidecarUnavailableError
 }
 
-function getOperationTimeoutMs(operation: string): number {
+function getOperationTimeoutMs(operation: string, args: unknown[] = []): number {
+	if (CLAIM_OPERATIONS.has(operation)) {
+		return CLAIM_TIMEOUT_MS
+	}
 	if (HOT_PATH_OPERATIONS.has(operation)) {
 		return HOT_PATH_TIMEOUT_MS
+	}
+	if (POLL_OPERATIONS.has(operation)) {
+		return POLL_TIMEOUT_MS
 	}
 	if (HEAVY_OPERATIONS.has(operation)) {
 		return HEAVY_OPERATION_TIMEOUT_MS
 	}
 	if (CLEANUP_OPERATIONS.has(operation)) {
+		if (operation === "performMaintenance") {
+			const input = args[0] as { vacuumMode?: string } | undefined
+			if (input?.vacuumMode === "full") {
+				return VACUUM_TIMEOUT_MS
+			}
+		}
 		return CLEANUP_TIMEOUT_MS
 	}
 	return HEAVY_OPERATION_TIMEOUT_MS
@@ -173,6 +124,7 @@ function summarizeOperationArgs(operation: string, args: unknown[]): Record<stri
 				runId: args[2] ?? null,
 			}
 		case "getRunBacklogMetrics":
+		case "getRunSummary":
 		case "heartbeatRun":
 		case "getRunProgressRecord":
 		case "markRunComplete":
@@ -181,6 +133,16 @@ function summarizeOperationArgs(operation: string, args: unknown[]): Record<stri
 		case "markRunStopped":
 			return {
 				runId: args[0] ?? null,
+			}
+		case "listRunSummaries":
+		case "listRecentRunProgress":
+			return {
+				limit: args[0] ?? null,
+			}
+		case "listReadyRevisionResolutions":
+			return {
+				runId: args[0] ?? null,
+				limit: args[1] ?? null,
 			}
 		case "appendRunSample": {
 			const input = (args[0] as { runId?: string; stage?: string; eventType?: string } | undefined) ?? {}
@@ -218,10 +180,24 @@ function summarizeOperationArgs(operation: string, args: unknown[]): Record<stri
 			}
 		}
 		case "performMaintenance": {
-			const input = (args[0] as { checkpointMode?: string; shrinkMemory?: boolean } | undefined) ?? {}
+			const input =
+				(args[0] as
+					| {
+							checkpointMode?: string
+							shrinkMemory?: boolean
+							pruneFootprint?: boolean
+							markFootprintCleanup?: boolean
+							maxPruneBatches?: number
+							vacuumMode?: string
+					  }
+					| undefined) ?? {}
 			return {
 				checkpointMode: input.checkpointMode ?? "PASSIVE",
 				shrinkMemory: input.shrinkMemory ?? false,
+				pruneFootprint: input.pruneFootprint ?? true,
+				markFootprintCleanup: input.markFootprintCleanup ?? false,
+				maxPruneBatches: input.maxPruneBatches ?? null,
+				vacuumMode: input.vacuumMode ?? "none",
 			}
 		}
 		default:
@@ -229,9 +205,27 @@ function summarizeOperationArgs(operation: string, args: unknown[]): Record<stri
 	}
 }
 
+interface MetadataSidecarClientOptions {
+	role?: MetadataSidecarRole
+}
+
+export interface MetadataSidecarClientDiagnostics {
+	role: MetadataSidecarRole
+	label: string
+	state: IndexingSidecarState
+	pid: number | null
+	pendingRequestCount: number
+	lastOperation: string | null
+	lastElapsedMs: number | null
+	lastTimeoutMs: number | null
+	lastError: string | null
+	updatedAt: number
+}
+
 export class MetadataSidecarClient {
 	private static readonly SHUTDOWN_TIMEOUT_MS = 5_000
 	private readonly sidecarScriptPath = this.resolveSidecarScriptPath()
+	private readonly role: MetadataSidecarRole
 	private child: ChildProcess | undefined
 	private ready: Promise<void> | undefined
 	private readonly pending = new Map<string, PendingRequest>()
@@ -239,15 +233,24 @@ export class MetadataSidecarClient {
 	private unhealthyError: Error | undefined
 	private terminatingChildPid: number | undefined
 	private expectedExitChildPid: number | undefined
+	private lastOperation: string | undefined
+	private lastElapsedMs: number | undefined
+	private lastTimeoutMs: number | undefined
+	private lastError: string | undefined
+	private diagnosticsUpdatedAt = Date.now()
 
-	constructor(private readonly paths: ResolvedMetadataStorePaths) {
+	constructor(
+		private readonly paths: ResolvedMetadataStorePaths,
+		options: MetadataSidecarClientOptions = {},
+	) {
+		this.role = options.role ?? "writer"
 		return new Proxy(this, {
 			get: (target, prop, receiver) => {
 				if (typeof prop !== "string" || prop in target) {
 					const value = Reflect.get(target, prop, receiver)
 					return typeof value === "function" ? value.bind(target) : value
 				}
-				if (!REMOTE_OPERATION_ALLOWLIST.has(prop)) {
+				if (!REMOTE_METADATA_OPERATION_SET.has(prop)) {
 					return undefined
 				}
 				return (...args: unknown[]) => target.invokeRemote(prop, args)
@@ -262,11 +265,14 @@ export class MetadataSidecarClient {
 	async dispose(): Promise<void> {
 		if (!this.child) {
 			this.unhealthyError = undefined
+			this.lastError = undefined
+			this.diagnosticsUpdatedAt = Date.now()
 			return
 		}
 		const child = this.child
 		this.expectedExitChildPid = child.pid
 		const requestId = this.nextRequestId("shutdown")
+		let shutdownError: Error | undefined
 		try {
 			await Promise.race([
 				this.sendRequest<void>(
@@ -285,15 +291,26 @@ export class MetadataSidecarClient {
 					),
 				),
 			])
-		} catch {
+		} catch (error) {
+			shutdownError = error instanceof Error ? error : new Error(String(error))
 			this.terminateChild(child)
+			await this.waitForChildExit(child, KILL_GRACE_MS + 500).catch(() => undefined)
 		} finally {
-			this.clearPendingRequests()
+			this.clearPendingRequests(
+				shutdownError
+					? new MetadataSidecarUnavailableError(
+							"Metadata sidecar was disposed while requests were pending.",
+							shutdownError,
+						)
+					: undefined,
+			)
 			if (this.child === child) {
 				this.child = undefined
 				this.ready = undefined
 			}
 			this.unhealthyError = undefined
+			this.lastError = undefined
+			this.diagnosticsUpdatedAt = Date.now()
 		}
 	}
 
@@ -315,6 +332,21 @@ export class MetadataSidecarClient {
 
 	getDiagnosticsDirectoryPath(): string {
 		return this.paths.diagnosticsRootDir
+	}
+
+	getDiagnosticsSnapshot(): MetadataSidecarClientDiagnostics {
+		return {
+			role: this.role,
+			label: this.getSidecarLabel(),
+			state: this.getDiagnosticState(),
+			pid: this.child?.pid ?? null,
+			pendingRequestCount: this.pending.size,
+			lastOperation: this.lastOperation ?? null,
+			lastElapsedMs: this.lastElapsedMs ?? null,
+			lastTimeoutMs: this.lastTimeoutMs ?? null,
+			lastError: this.unhealthyError?.message ?? this.lastError ?? null,
+			updatedAt: this.diagnosticsUpdatedAt,
+		}
 	}
 
 	async runPlannerSlice(
@@ -378,7 +410,7 @@ export class MetadataSidecarClient {
 			},
 			requestId,
 			operation,
-			getOperationTimeoutMs(operation),
+			getOperationTimeoutMs(operation, args),
 		)
 	}
 
@@ -423,6 +455,8 @@ export class MetadataSidecarClient {
 		IndexDebugLoggerV2.log("basic", "MetadataSidecar", "metadata-sidecar-spawn", {
 			component: "MetadataSidecar",
 			processRole: "host",
+			sidecarRole: this.role,
+			sidecarLabel: this.getSidecarLabel(),
 			sidecarScriptPath: this.sidecarScriptPath,
 			workspacePath: this.paths.workspacePath,
 		})
@@ -441,6 +475,7 @@ export class MetadataSidecarClient {
 					timeoutMs: INIT_TIMEOUT_MS,
 					pendingRequestCount: this.pending.size,
 				})
+				this.recordRequestError("init", elapsedMs, error.message, INIT_TIMEOUT_MS)
 				this.failSidecar(error)
 			}, INIT_TIMEOUT_MS)
 			this.pending.set(requestId, {
@@ -455,10 +490,12 @@ export class MetadataSidecarClient {
 				timeoutMs: INIT_TIMEOUT_MS,
 				pendingRequestCount: this.pending.size,
 			})
+			this.recordRequestStart("init")
 			child.send({
 				type: "init",
 				payload: {
 					paths: this.paths,
+					role: this.role,
 				},
 			} satisfies MetadataSidecarHostToChildMessage)
 		})
@@ -497,6 +534,7 @@ export class MetadataSidecarClient {
 					pendingRequestCount: this.pending.size,
 					...summarizeOperationArgs(operation, message.type === "call" ? message.args : []),
 				})
+				this.recordRequestError(operation, elapsedMs, error.message, timeoutMs)
 				if (operation === "runPlannerSlice") {
 					this.sendFireAndForget({
 						type: "cancel",
@@ -519,6 +557,7 @@ export class MetadataSidecarClient {
 				pendingRequestCount: this.pending.size,
 				...summarizeOperationArgs(operation, message.type === "call" ? message.args : []),
 			})
+			this.recordRequestStart(operation)
 			this.child?.send(message)
 		})
 	}
@@ -528,8 +567,8 @@ export class MetadataSidecarClient {
 			case "ready": {
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
 					this.getTrackedProcessKey(),
-					"metadataSidecar",
-					"metadata-sidecar",
+					this.getTrackedProcessGroup(),
+					this.getSidecarLabel(),
 					this.paths.workspacePath,
 					message.pid,
 					message.memory,
@@ -538,6 +577,8 @@ export class MetadataSidecarClient {
 				IndexDebugLoggerV2.log("basic", "MetadataSidecar", "metadata-sidecar-ready", {
 					component: "MetadataSidecar",
 					processRole: "sidecar",
+					sidecarRole: this.role,
+					sidecarLabel: this.getSidecarLabel(),
 					sidecarPid: message.pid,
 					workspacePath: this.paths.workspacePath,
 					memory: message.memory,
@@ -546,10 +587,12 @@ export class MetadataSidecarClient {
 				const requestId = this.findReadyRequestId()
 				const pending = this.takePendingRequest(requestId)
 				if (pending) {
+					const elapsedMs = Math.max(Date.now() - pending.startedAtMs, 0)
 					this.logRequestEvent("metadata-sidecar-request-complete", requestId, pending.operation, {
-						elapsedMs: Math.max(Date.now() - pending.startedAtMs, 0),
+						elapsedMs,
 						pendingRequestCount: this.pending.size,
 					})
+					this.recordRequestComplete(pending.operation, elapsedMs)
 					pending.resolve(undefined)
 				}
 				return
@@ -557,8 +600,8 @@ export class MetadataSidecarClient {
 			case "response": {
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
 					this.getTrackedProcessKey(),
-					"metadataSidecar",
-					"metadata-sidecar",
+					this.getTrackedProcessGroup(),
+					this.getSidecarLabel(),
 					this.paths.workspacePath,
 					this.child?.pid,
 					message.memory,
@@ -566,10 +609,12 @@ export class MetadataSidecarClient {
 				)
 				const pending = this.takePendingRequest(message.requestId)
 				if (pending) {
+					const elapsedMs = Math.max(Date.now() - pending.startedAtMs, 0)
 					this.logRequestEvent("metadata-sidecar-request-complete", message.requestId, pending.operation, {
-						elapsedMs: Math.max(Date.now() - pending.startedAtMs, 0),
+						elapsedMs,
 						pendingRequestCount: this.pending.size,
 					})
+					this.recordRequestComplete(pending.operation, elapsedMs)
 					pending.resolve(message.result)
 				}
 				return
@@ -577,8 +622,8 @@ export class MetadataSidecarClient {
 			case "error": {
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
 					this.getTrackedProcessKey(),
-					"metadataSidecar",
-					"metadata-sidecar",
+					this.getTrackedProcessGroup(),
+					this.getSidecarLabel(),
 					this.paths.workspacePath,
 					this.child?.pid,
 					message.memory,
@@ -587,6 +632,8 @@ export class MetadataSidecarClient {
 				IndexDebugLoggerV2.log("basic", "MetadataSidecar", "metadata-sidecar-error", {
 					component: "MetadataSidecar",
 					processRole: "sidecar",
+					sidecarRole: this.role,
+					sidecarLabel: this.getSidecarLabel(),
 					sidecarPid: this.child?.pid,
 					errorMessage: message.errorMessage,
 					workspacePath: this.paths.workspacePath,
@@ -596,12 +643,13 @@ export class MetadataSidecarClient {
 				if (message.requestId) {
 					const pending = this.takePendingRequest(message.requestId)
 					if (pending) {
+						const elapsedMs = Math.max(Date.now() - pending.startedAtMs, 0)
 						this.logRequestEvent(
 							"metadata-sidecar-request-complete",
 							message.requestId,
 							pending.operation,
 							{
-								elapsedMs: Math.max(Date.now() - pending.startedAtMs, 0),
+								elapsedMs,
 								pendingRequestCount: this.pending.size,
 								status: "error",
 							},
@@ -610,6 +658,7 @@ export class MetadataSidecarClient {
 							`Metadata sidecar failed during ${pending.operation}: ${message.errorMessage}`,
 						)
 						error.stack = message.stack
+						this.recordRequestError(pending.operation, elapsedMs, error.message)
 						pending.reject(error)
 					}
 				}
@@ -618,10 +667,12 @@ export class MetadataSidecarClient {
 			case "shutdown-complete": {
 				const pending = this.takePendingRequest(message.requestId)
 				if (pending) {
+					const elapsedMs = Math.max(Date.now() - pending.startedAtMs, 0)
 					this.logRequestEvent("metadata-sidecar-request-complete", message.requestId, pending.operation, {
-						elapsedMs: Math.max(Date.now() - pending.startedAtMs, 0),
+						elapsedMs,
 						pendingRequestCount: this.pending.size,
 					})
+					this.recordRequestComplete(pending.operation, elapsedMs)
 					pending.resolve(undefined)
 				}
 			}
@@ -633,6 +684,8 @@ export class MetadataSidecarClient {
 		IndexDebugLoggerV2.log("basic", "MetadataSidecar", "metadata-sidecar-exit", {
 			component: "MetadataSidecar",
 			processRole: "sidecar",
+			sidecarRole: this.role,
+			sidecarLabel: this.getSidecarLabel(),
 			sidecarPid: child.pid,
 			exitCode: code,
 			exitSignal: signal,
@@ -650,6 +703,9 @@ export class MetadataSidecarClient {
 			new MetadataSidecarUnavailableError(
 				`Metadata sidecar exited unexpectedly (code=${code ?? "null"}, signal=${signal ?? "null"}).`,
 			)
+		if (!expectedExit) {
+			this.recordClientError(error.message)
+		}
 		for (const requestId of Array.from(this.pending.keys())) {
 			const pending = this.takePendingRequest(requestId)
 			pending?.reject(error)
@@ -662,6 +718,9 @@ export class MetadataSidecarClient {
 		}
 		if (expectedExit) {
 			this.expectedExitChildPid = undefined
+		}
+		if (this.role === "reader") {
+			this.unhealthyError = undefined
 		}
 	}
 
@@ -689,11 +748,28 @@ export class MetadataSidecarClient {
 		if (child.exitCode == null && child.signalCode == null) {
 			child.kill("SIGTERM")
 			setTimeout(() => {
-				if (this.child === child && child.exitCode == null && child.signalCode == null) {
+				if (child.exitCode == null && child.signalCode == null) {
 					child.kill("SIGKILL")
 				}
 			}, KILL_GRACE_MS)
 		}
+	}
+
+	private waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+		if (child.exitCode != null || child.signalCode != null) {
+			return Promise.resolve()
+		}
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				child.off("exit", onExit)
+				reject(new Error("Timed out waiting for metadata sidecar exit"))
+			}, timeoutMs)
+			const onExit = () => {
+				clearTimeout(timer)
+				resolve()
+			}
+			child.once("exit", onExit)
+		})
 	}
 
 	private takePendingRequest(requestId: string): PendingRequest | undefined {
@@ -706,10 +782,13 @@ export class MetadataSidecarClient {
 		return pending
 	}
 
-	private clearPendingRequests() {
+	private clearPendingRequests(error?: Error) {
 		IndexDebugLoggerV2.clearTrackedProcessSnapshot(this.getTrackedProcessKey())
 		for (const requestId of Array.from(this.pending.keys())) {
-			this.takePendingRequest(requestId)
+			const pending = this.takePendingRequest(requestId)
+			if (error) {
+				pending?.reject(error)
+			}
 		}
 	}
 
@@ -725,6 +804,8 @@ export class MetadataSidecarClient {
 		IndexDebugLoggerV2.log("basic", "MetadataSidecar", message, {
 			component: "MetadataSidecar",
 			processRole: "host",
+			sidecarRole: this.role,
+			sidecarLabel: this.getSidecarLabel(),
 			workspacePath: this.paths.workspacePath,
 			requestId,
 			operation,
@@ -744,7 +825,51 @@ export class MetadataSidecarClient {
 		return `${prefix}:${this.requestCounter}`
 	}
 
+	private getDiagnosticState(): IndexingSidecarState {
+		if (this.unhealthyError || (!this.child && this.lastError)) {
+			return "failed"
+		}
+		if (!this.child) {
+			return "standby"
+		}
+		return this.pending.size > 0 ? "busy" : "online"
+	}
+
+	private recordRequestStart(operation: string) {
+		this.lastOperation = operation
+		this.diagnosticsUpdatedAt = Date.now()
+	}
+
+	private recordRequestComplete(operation: string, elapsedMs: number) {
+		this.lastOperation = operation
+		this.lastElapsedMs = elapsedMs
+		this.lastTimeoutMs = undefined
+		this.lastError = undefined
+		this.diagnosticsUpdatedAt = Date.now()
+	}
+
+	private recordRequestError(operation: string, elapsedMs: number, errorMessage: string, timeoutMs?: number) {
+		this.lastOperation = operation
+		this.lastElapsedMs = elapsedMs
+		this.lastTimeoutMs = timeoutMs
+		this.lastError = errorMessage
+		this.diagnosticsUpdatedAt = Date.now()
+	}
+
+	private recordClientError(errorMessage: string) {
+		this.lastError = errorMessage
+		this.diagnosticsUpdatedAt = Date.now()
+	}
+
 	private getTrackedProcessKey(): string {
-		return `metadata-sidecar:${this.paths.workspaceHash}`
+		return `metadata-${this.role}-sidecar:${this.paths.workspaceHash}`
+	}
+
+	private getTrackedProcessGroup(): string {
+		return this.role === "writer" ? "metadataWriterSidecar" : "metadataReaderSidecar"
+	}
+
+	private getSidecarLabel(): string {
+		return this.role === "writer" ? "metadata-writer-sidecar" : "metadata-reader-sidecar"
 	}
 }

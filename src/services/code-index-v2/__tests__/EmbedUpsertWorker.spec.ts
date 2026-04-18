@@ -49,6 +49,7 @@ describe("EmbedUpsertWorker", () => {
 			markRevisionTerminalFailure: vi.fn().mockResolvedValue(undefined),
 			markRevisionSuperseded: vi.fn().mockResolvedValue(undefined),
 			finalizeReadyRevisionsBatch: vi.fn(),
+			heartbeatJobs: vi.fn().mockResolvedValue(undefined),
 		}
 
 		metadataStore.finalizeReadyRevisionsBatch.mockImplementation(
@@ -780,7 +781,10 @@ describe("EmbedUpsertWorker", () => {
 			}
 			return []
 		})
-		;(metadataStore as any).listPlannedRevisionResolutions = vi.fn().mockImplementation(async () => readyRevisions)
+		;(metadataStore as any).listPlannedRevisionResolutions = vi.fn()
+		;(metadataStore as any).listReadyRevisionResolutions = vi
+			.fn()
+			.mockImplementation(async (_runId: string, limit: number) => readyRevisions.slice(0, limit))
 		metadataStore.finalizeReadyRevisionsBatch.mockImplementation(
 			async ({ resolutions }: { resolutions: any[] }) => {
 				sequence.push(`finalize:${resolutions.length}`)
@@ -824,6 +828,8 @@ describe("EmbedUpsertWorker", () => {
 
 		expect(sequence).toEqual(["finalize:32", "claim-after-burst", "finalize:8"])
 		expect(metadataStore.finalizeReadyRevisionsBatch).toHaveBeenCalledTimes(2)
+		expect((metadataStore as any).listReadyRevisionResolutions).toHaveBeenCalled()
+		expect((metadataStore as any).listPlannedRevisionResolutions).not.toHaveBeenCalled()
 		const activationBurstCall = logSpy.mock.calls.find(
 			([, component, message]) =>
 				component === "EmbedUpsertWorker" && message === "revision-activation-burst-complete",
@@ -840,6 +846,246 @@ describe("EmbedUpsertWorker", () => {
 		expect(summary.activationBurstLatencyMs).toBe(40)
 		expect(progressPhases).toContain("activation")
 		expect(progressPhases.some((phase) => phase === "claiming" || phase === "embedding")).toBe(true)
+	})
+
+	it("releases an embedding lane after embedded notification but waits for vector write completion before completing jobs", async () => {
+		mockConfigValues["codeIndex.embeddingBatchSize"] = 1
+		mockConfigValues["codeIndex.embeddingLaneConcurrency"] = 1
+		const { metadataStore, embeddingAdapter, vectorStore } = createWorkerDeps()
+		const now = Date.now()
+		const jobs = [1, 2].map((index) => ({
+			jobId: `job-${index}`,
+			workspaceId: "workspace-1",
+			runId: "run-1",
+			jobType: "upsert",
+			entityId: `chunk-${index}`,
+			state: "running" as const,
+			priority: 100,
+			attemptCount: 1,
+			nextAttemptAt: now,
+			lastError: null,
+			createdAt: now,
+			updatedAt: now,
+		}))
+		const chunks = jobs.map((job, index) => ({
+			chunkId: job.entityId,
+			revisionId: `revision-${index + 1}`,
+			chunkFingerprint: `fp-${index + 1}`,
+			startLine: 1,
+			endLine: 2,
+			content: `content-${index + 1}`,
+			contentHash: `hash-${index + 1}`,
+			tokenEstimate: 5,
+			embeddingModel: null,
+			vectorPointId: null,
+			state: "parsed" as const,
+			createdAt: now,
+			updatedAt: now,
+			fileId: `file-${index + 1}`,
+			workspaceId: "workspace-1",
+			relativePath: `src/file-${index + 1}.ts`,
+			normalizedPath: `/workspace/src/file-${index + 1}.ts`,
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+		}))
+		let claimIndex = 0
+		metadataStore.claimJobs.mockImplementation(async (jobType: string, limit: number) => {
+			if (jobType === "delete") {
+				return []
+			}
+			if (claimIndex >= jobs.length) {
+				return []
+			}
+			const claimed = jobs.slice(claimIndex, claimIndex + limit)
+			claimIndex += claimed.length
+			return claimed
+		})
+		metadataStore.getChunksByIds.mockImplementation(async (chunkIds: string[]) =>
+			chunks.filter((chunk) => chunkIds.includes(chunk.chunkId)),
+		)
+		metadataStore.getNextRetryAt.mockResolvedValue(undefined)
+		metadataStore.getRevisionsByState.mockResolvedValue(
+			chunks.map((chunk) => ({ revisionId: chunk.revisionId, fileId: chunk.fileId, runId: "run-1" })),
+		)
+		metadataStore.getRevisionJobResolution.mockResolvedValue({
+			doneJobs: 1,
+			queuedJobs: 0,
+			runningJobs: 0,
+			terminalFailedJobs: 0,
+			totalJobs: 1,
+		})
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
+		const vectorWriteResolvers: Array<() => void> = []
+		const upsertExecutor = {
+			executeUpsertBatch: vi.fn(
+				async (_runId: string, _laneId: number, items: any[], _signal?: AbortSignal, options?: any) => {
+					options?.onEmbedded?.({
+						embeddingCount: items.length,
+						embedLatencyMs: 20,
+						pointIds: items.map(({ chunk }: any) => `${chunk.chunkId}:raw_code`),
+						vectorWriteQueueDepth: 1,
+						queuedVectorWriteBatches: 1,
+						queuedVectorWriteEmbeddings: items.length,
+						vectorWriteBackpressureMs: 0,
+						laneReleasedAfterEmbedMs: 25,
+					})
+					await new Promise<void>((resolve) => vectorWriteResolvers.push(resolve))
+					return {
+						embeddingCount: items.length,
+						embedLatencyMs: 20,
+						upsertLatencyMs: 30,
+						pointIds: items.map(({ chunk }: any) => `${chunk.chunkId}:raw_code`),
+						vectorWriteQueueDepth: 0,
+						queuedVectorWriteBatches: 0,
+						queuedVectorWriteEmbeddings: 0,
+						vectorWriteBackpressureMs: 0,
+						laneReleasedAfterEmbedMs: 25,
+						variantTelemetry: {
+							storedVariantCount: items.length,
+							embeddedVariantCount: items.length,
+							storedVariantCountsByType: { raw_code: items.length },
+							embeddedVariantCountsByType: { raw_code: items.length },
+							skippedVectorizationReasons: {},
+						},
+					}
+				},
+			),
+		}
+
+		const worker = new EmbedUpsertWorker(
+			metadataStore as any,
+			embeddingAdapter as any,
+			vectorStore as any,
+			upsertExecutor as any,
+		)
+		const summaryPromise = worker.run("run-1")
+
+		await vi.waitFor(() => {
+			expect(upsertExecutor.executeUpsertBatch).toHaveBeenCalledTimes(2)
+		})
+		expect(metadataStore.markChunkStates).not.toHaveBeenCalled()
+		expect(metadataStore.completeJobs).not.toHaveBeenCalled()
+
+		vectorWriteResolvers.forEach((resolve) => resolve())
+		const summary = await summaryPromise
+
+		expect(metadataStore.markChunkStates).toHaveBeenCalledTimes(2)
+		expect(metadataStore.completeJobs).toHaveBeenCalledTimes(2)
+		expect(summary.upsertedChunks).toBe(2)
+		expect(summary.laneReleasedAfterEmbedMs).toBe(25)
+	})
+
+	it("heartbeats claimed jobs while waiting for queued vector writes to finish", async () => {
+		vi.useFakeTimers()
+		mockConfigValues["codeIndex.embeddingBatchSize"] = 1
+		mockConfigValues["codeIndex.embeddingLaneConcurrency"] = 1
+		const { metadataStore, embeddingAdapter, vectorStore } = createWorkerDeps()
+		const now = Date.now()
+		const job = {
+			jobId: "job-lease",
+			workspaceId: "workspace-1",
+			runId: "run-1",
+			jobType: "upsert",
+			entityId: "chunk-lease",
+			state: "running" as const,
+			priority: 100,
+			attemptCount: 1,
+			nextAttemptAt: now,
+			lastError: null,
+			createdAt: now,
+			updatedAt: now,
+		}
+		const chunk = {
+			chunkId: "chunk-lease",
+			revisionId: "revision-lease",
+			chunkFingerprint: "fp-lease",
+			startLine: 1,
+			endLine: 2,
+			content: "content-lease",
+			contentHash: "hash-lease",
+			tokenEstimate: 5,
+			embeddingModel: null,
+			vectorPointId: null,
+			state: "parsed" as const,
+			createdAt: now,
+			updatedAt: now,
+			fileId: "file-lease",
+			workspaceId: "workspace-1",
+			relativePath: "src/lease.ts",
+			normalizedPath: "/workspace/src/lease.ts",
+			parserVersion: "parser-v1",
+			chunkerVersion: "chunker-v1",
+		}
+		metadataStore.claimJobs.mockImplementation(async (jobType: string) => {
+			if (jobType === "delete") {
+				return []
+			}
+			return metadataStore.claimJobs.mock.calls.filter(([type]) => type === "upsert").length === 1 ? [job] : []
+		})
+		metadataStore.getChunksByIds.mockResolvedValue([chunk])
+		metadataStore.getNextRetryAt.mockResolvedValue(undefined)
+		metadataStore.getRevisionsByState.mockResolvedValue([
+			{ revisionId: "revision-lease", fileId: "file-lease", runId: "run-1" },
+		])
+		metadataStore.getRevisionJobResolution.mockResolvedValue({
+			doneJobs: 1,
+			queuedJobs: 0,
+			runningJobs: 0,
+			terminalFailedJobs: 0,
+			totalJobs: 1,
+		})
+		metadataStore.getDiffBaselineRevision.mockResolvedValue(undefined)
+		let finishVectorWrite: (() => void) | undefined
+		const upsertExecutor = {
+			executeUpsertBatch: vi.fn(
+				async (_runId: string, _laneId: number, items: any[], _signal?: AbortSignal, options?: any) => {
+					options?.onEmbedded?.({
+						embeddingCount: items.length,
+						embedLatencyMs: 20,
+						pointIds: ["chunk-lease:raw_code"],
+						vectorWriteQueueDepth: 1,
+						queuedVectorWriteBatches: 1,
+						queuedVectorWriteEmbeddings: items.length,
+						vectorWriteBackpressureMs: 0,
+						laneReleasedAfterEmbedMs: 20,
+					})
+					await new Promise<void>((resolve) => {
+						finishVectorWrite = resolve
+					})
+					return {
+						embeddingCount: items.length,
+						embedLatencyMs: 20,
+						upsertLatencyMs: 30,
+						pointIds: ["chunk-lease:raw_code"],
+						variantTelemetry: {
+							storedVariantCount: items.length,
+							embeddedVariantCount: items.length,
+							storedVariantCountsByType: { raw_code: items.length },
+							embeddedVariantCountsByType: { raw_code: items.length },
+							skippedVectorizationReasons: {},
+						},
+					}
+				},
+			),
+		}
+
+		const worker = new EmbedUpsertWorker(
+			metadataStore as any,
+			embeddingAdapter as any,
+			vectorStore as any,
+			upsertExecutor as any,
+		)
+		const summaryPromise = worker.run("run-1")
+		await vi.waitFor(() => {
+			expect(upsertExecutor.executeUpsertBatch).toHaveBeenCalledTimes(1)
+		})
+
+		await vi.advanceTimersByTimeAsync(10_100)
+		expect(metadataStore.heartbeatJobs).toHaveBeenCalledWith(["job-lease"], expect.stringMatching(/^embed-worker:/))
+		expect(metadataStore.completeJobs).not.toHaveBeenCalled()
+
+		finishVectorWrite?.()
+		await expect(summaryPromise).resolves.toMatchObject({ upsertedChunks: 1 })
 	})
 
 	it("processes upsert batches with bounded concurrency and tracks in-flight counts", async () => {

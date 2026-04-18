@@ -54,7 +54,9 @@ vi.mock("../store/MetadataStore", () => ({
 }))
 
 vi.mock("../sidecar/MetadataSidecarClient", () => ({
-	MetadataSidecarClient: vi.fn(() => testState.mocks.metadataStore),
+	MetadataSidecarClient: vi.fn((_paths: unknown, options?: { role?: string }) =>
+		options?.role === "reader" ? testState.mocks.metadataReadStore : testState.mocks.metadataStore,
+	),
 }))
 
 vi.mock("../store/MetadataPathResolver", () => ({

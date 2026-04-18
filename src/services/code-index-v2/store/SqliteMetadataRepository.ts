@@ -25,6 +25,9 @@ import {
 	IndexRunSummaryRecord,
 	JobInput,
 	JobRecord,
+	MetadataCompactionSummary,
+	MetadataFootprintPrunePhase,
+	MetadataFootprintPruneSummary,
 	MetadataMaintenanceSummary,
 	OversizedTrackedFileInput,
 	OversizedTrackedFileRecord,
@@ -62,9 +65,14 @@ interface SqliteDatabaseSync {
 }
 
 type TransactionMode = "DEFERRED" | "IMMEDIATE" | "EXCLUSIVE"
+type MetadataRepositoryMode = "writer" | "reader"
+
+interface SqliteMetadataRepositoryOptions {
+	mode?: MetadataRepositoryMode
+}
 
 const { DatabaseSync } = require("node:sqlite") as {
-	DatabaseSync: new (path: string) => SqliteDatabaseSync
+	DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => SqliteDatabaseSync
 }
 
 const PRESERVED_PENDING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
@@ -163,6 +171,15 @@ interface MetadataBootstrapFile {
  * without changing where state lives on disk.
  */
 export class SqliteMetadataRepository {
+	private static readonly LEGACY_STALE_RUN_ERROR_MESSAGE = "Marked stale after restart before the V2 run completed."
+	private static readonly INTERRUPTED_STALE_RUN_ERROR_MESSAGE =
+		"Interrupted by restart before the V2 run completed; resumable work was preserved for the next run."
+	private static readonly FOOTPRINT_CLEANUP_MARKER_KEY = "metadataFootprintCleanupV1"
+	private static readonly FOOTPRINT_CLEANUP_MARKER_VALUE = "completed"
+	private static readonly FOOTPRINT_PRUNE_BATCH_SIZE = 5_000
+	private static readonly FOOTPRINT_JOB_PRUNE_BATCH_SIZE = 10_000
+	private static readonly FOOTPRINT_REVISION_PRUNE_BATCH_SIZE = 10_000
+
 	private readonly workspaceHash: string
 	private readonly workspacePath: string
 	private readonly rootDir: string
@@ -172,11 +189,12 @@ export class SqliteMetadataRepository {
 	private readonly dbPath: string
 	private readonly telemetryDbPath: string
 	private readonly bootstrapPath: string
+	private readonly mode: MetadataRepositoryMode
 	private _db: SqliteDatabaseSync | undefined
 	private _telemetryDb: SqliteDatabaseSync | undefined
 	private readonly _runBacklogMetricsCache = new Map<string, { recordedAt: number; metrics: RunBacklogMetrics }>()
 
-	constructor(paths: ResolvedMetadataStorePaths) {
+	constructor(paths: ResolvedMetadataStorePaths, options: SqliteMetadataRepositoryOptions = {}) {
 		this.workspaceHash = paths.workspaceHash
 		this.workspacePath = paths.workspacePath
 		this.rootDir = paths.rootDir
@@ -186,15 +204,26 @@ export class SqliteMetadataRepository {
 		this.dbPath = paths.dbPath
 		this.telemetryDbPath = paths.telemetryDbPath
 		this.bootstrapPath = paths.bootstrapPath
+		this.mode = options.mode ?? "writer"
 	}
 
 	async initialize(): Promise<void> {
-		await fs.mkdir(this.rootDir, { recursive: true })
-		await fs.mkdir(this.persistentRootDir, { recursive: true })
-		await fs.mkdir(this.diagnosticsRootDir, { recursive: true })
+		if (this.mode === "writer") {
+			await fs.mkdir(this.rootDir, { recursive: true })
+			await fs.mkdir(this.persistentRootDir, { recursive: true })
+			await fs.mkdir(this.diagnosticsRootDir, { recursive: true })
+		}
 		IndexDebugLoggerV2.configureDiagnosticsDirectory(this.diagnosticsRootDir, this.workspacePath)
 		this._openDatabase()
 		this._openTelemetryDatabase()
+		if (this.mode === "reader") {
+			IndexDebugLoggerV2.log("basic", "MetadataStore", "bootstrap-initialized", {
+				component: "MetadataStore",
+				workspacePath: this.workspacePath,
+				mode: this.mode,
+			})
+			return
+		}
 		this._initializeSchema()
 		this._initializeTelemetrySchema()
 		this.ensureChunkLexicalFtsPopulated()
@@ -208,6 +237,7 @@ export class SqliteMetadataRepository {
 		IndexDebugLoggerV2.log("basic", "MetadataStore", "bootstrap-initialized", {
 			component: "MetadataStore",
 			workspacePath: this.workspacePath,
+			mode: this.mode,
 		})
 	}
 
@@ -249,6 +279,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async clearStorage(options?: { includeTelemetry?: boolean }): Promise<void> {
+		this.assertWritable("clearStorage")
 		const includeTelemetry = options?.includeTelemetry ?? false
 		this.invalidateRunBacklogMetricsCache()
 		await this.disposeOperationalDatabase()
@@ -310,6 +341,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async beginRun(triggerType: string): Promise<string> {
+		this.assertWritable("beginRun")
 		const runId = uuidv4()
 		const now = Date.now()
 		this.db()
@@ -326,6 +358,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async markRunDiscoveryComplete(runId: string): Promise<void> {
+		this.assertWritable("markRunDiscoveryComplete")
 		this.db()
 			.prepare(`UPDATE index_runs SET state = ?, discovery_complete = 1, last_heartbeat_at = ? WHERE run_id = ?`)
 			.run("discovery_complete", Date.now(), runId)
@@ -333,6 +366,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async markRunComplete(runId: string): Promise<void> {
+		this.assertWritable("markRunComplete")
 		this.db()
 			.prepare(
 				`UPDATE index_runs
@@ -344,6 +378,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async markRunFailed(runId: string, errorMessage: string): Promise<void> {
+		this.assertWritable("markRunFailed")
 		this.db()
 			.prepare(
 				`UPDATE index_runs
@@ -355,6 +390,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async markRunStopped(runId: string, errorMessage = "Stopped by user."): Promise<void> {
+		this.assertWritable("markRunStopped")
 		const now = Date.now()
 		this.db()
 			.prepare(
@@ -405,6 +441,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async heartbeatRun(runId: string, owner: string, progress?: RunProgressSnapshot): Promise<void> {
+		this.assertWritable("heartbeatRun")
 		const now = Date.now()
 		this.db()
 			.prepare(
@@ -419,6 +456,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async writeRunSummary(input: IndexRunSummaryInput): Promise<void> {
+		this.assertWritable("writeRunSummary")
 		const values = [
 			input.runId,
 			input.workspaceId,
@@ -634,6 +672,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async appendRunSample(input: IndexRunSampleInput): Promise<void> {
+		this.assertWritable("appendRunSample")
 		this.telemetryDb()
 			.prepare(
 				`INSERT INTO index_run_samples (
@@ -1007,30 +1046,85 @@ export class SqliteMetadataRepository {
 	}
 
 	async checkpointWal(mode: "PASSIVE" | "RESTART" | "TRUNCATE" = "PASSIVE"): Promise<void> {
+		this.assertWritable("checkpointWal")
 		this.db().prepare(`PRAGMA wal_checkpoint(${mode})`).get()
 	}
 
 	async performMaintenance(input?: {
 		checkpointMode?: "PASSIVE" | "RESTART" | "TRUNCATE"
 		shrinkMemory?: boolean
+		pruneFootprint?: boolean
+		markFootprintCleanup?: boolean
+		maxPruneBatches?: number
+		vacuumMode?: "none" | "full"
 	}): Promise<MetadataMaintenanceSummary> {
-		const checkpointMode = input?.checkpointMode ?? "PASSIVE"
+		this.assertWritable("performMaintenance")
+		const requestedCheckpointMode = input?.checkpointMode ?? "PASSIVE"
 		const shrinkMemory = input?.shrinkMemory ?? false
+		const pruneFootprint = input?.pruneFootprint ?? true
+		const markFootprintCleanup = input?.markFootprintCleanup ?? false
+		const maxPruneBatches = Math.max(1, Math.floor(input?.maxPruneBatches ?? Number.MAX_SAFE_INTEGER))
+		const vacuumMode = input?.vacuumMode ?? "none"
 		const memoryBefore = IndexDebugLoggerV2.getMemorySnapshot()
+		const footprintPrune = pruneFootprint
+			? this.pruneMetadataFootprint({ useMarker: markFootprintCleanup, maxPruneBatches })
+			: undefined
+		const checkpointMode =
+			requestedCheckpointMode === "TRUNCATE" &&
+			pruneFootprint &&
+			footprintPrune?.hasMore === true &&
+			vacuumMode === "none"
+				? "PASSIVE"
+				: requestedCheckpointMode
+		const checkpointStartedAt = this.logMaintenanceSubphaseStart("checkpoint_shrink_files", {
+			requestedCheckpointMode,
+			checkpointMode,
+			shrinkMemory,
+			vacuumMode,
+			partialFootprintPrune: footprintPrune?.hasMore === true,
+		})
 		await this.checkpointWal(checkpointMode)
 		this.telemetryDb().prepare(`PRAGMA wal_checkpoint(${checkpointMode})`).get()
 		if (shrinkMemory) {
 			this.db().prepare("PRAGMA shrink_memory").run()
 			this.telemetryDb().prepare("PRAGMA shrink_memory").run()
 		}
+		const compaction = vacuumMode === "full" ? await this.compactOperationalDatabase() : undefined
+		this.logMaintenanceSubphaseComplete("checkpoint_shrink_files", checkpointStartedAt, {
+			requestedCheckpointMode,
+			checkpointMode,
+			shrinkMemory,
+			vacuumMode,
+			partialFootprintPrune: footprintPrune?.hasMore === true,
+		})
+		if (
+			markFootprintCleanup &&
+			footprintPrune &&
+			!footprintPrune.hasMore &&
+			footprintPrune.markerState !== "already_completed"
+		) {
+			this.withTransaction(() => {
+				this.setSchemaMetaValueInTransaction(
+					SqliteMetadataRepository.FOOTPRINT_CLEANUP_MARKER_KEY,
+					SqliteMetadataRepository.FOOTPRINT_CLEANUP_MARKER_VALUE,
+				)
+			}, "IMMEDIATE")
+			footprintPrune.markerState = "completed"
+		}
 		const memoryAfter = IndexDebugLoggerV2.getMemorySnapshot()
 		const summary: MetadataMaintenanceSummary = {
 			checkpointMode,
 			shrinkMemory,
+			pruneFootprint,
+			markFootprintCleanup,
+			maxPruneBatches,
+			vacuumMode,
 			operationalDbBytes: await this.getFileSize(this.dbPath),
 			operationalWalBytes: await this.getFileSize(`${this.dbPath}-wal`),
 			telemetryDbBytes: await this.getFileSize(this.telemetryDbPath),
 			telemetryWalBytes: await this.getFileSize(`${this.telemetryDbPath}-wal`),
+			footprintPrune,
+			compaction,
 			memoryBefore: {
 				rssMB: memoryBefore.rssMB,
 				heapUsedMB: memoryBefore.heapUsedMB,
@@ -1049,11 +1143,18 @@ export class SqliteMetadataRepository {
 			component: "MetadataStore",
 			workspacePath: this.workspacePath,
 			checkpointMode,
+			requestedCheckpointMode,
 			shrinkMemory,
+			pruneFootprint,
+			markFootprintCleanup,
+			maxPruneBatches,
+			vacuumMode,
 			operationalDbBytes: summary.operationalDbBytes,
 			operationalWalBytes: summary.operationalWalBytes,
 			telemetryDbBytes: summary.telemetryDbBytes,
 			telemetryWalBytes: summary.telemetryWalBytes,
+			footprintPrune,
+			compaction,
 			memoryBefore: summary.memoryBefore,
 			memoryAfter: summary.memoryAfter,
 			rssDeltaMB: summary.memoryAfter.rssMB - summary.memoryBefore.rssMB,
@@ -1063,6 +1164,534 @@ export class SqliteMetadataRepository {
 		})
 
 		return summary
+	}
+
+	private getFootprintPhaseLabel(phase: MetadataFootprintPrunePhase): string {
+		switch (phase) {
+			case "finalized_jobs":
+				return "Finalized jobs"
+			case "deleted_chunks":
+				return "Deleted chunks"
+			case "superseded_chunks":
+				return "Superseded revision chunks"
+			case "obsolete_revisions":
+				return "Obsolete revisions"
+			case "complete":
+			default:
+				return "Complete"
+		}
+	}
+
+	private getFootprintPhaseBatchLimit(phase: MetadataFootprintPrunePhase, maxPruneBatches: number): number {
+		switch (phase) {
+			case "finalized_jobs":
+				return SqliteMetadataRepository.FOOTPRINT_JOB_PRUNE_BATCH_SIZE
+			case "deleted_chunks":
+			case "superseded_chunks":
+				return SqliteMetadataRepository.FOOTPRINT_PRUNE_BATCH_SIZE * maxPruneBatches
+			case "obsolete_revisions":
+				return SqliteMetadataRepository.FOOTPRINT_REVISION_PRUNE_BATCH_SIZE
+			case "complete":
+			default:
+				return 0
+		}
+	}
+
+	private getFootprintTotalRowsPruned(
+		summary: Pick<
+			MetadataFootprintPruneSummary,
+			"prunedJobs" | "prunedChunks" | "prunedChunkVariants" | "prunedFtsRows" | "prunedRevisions"
+		>,
+	): number {
+		return (
+			(summary.prunedJobs ?? 0) +
+			(summary.prunedChunks ?? 0) +
+			(summary.prunedChunkVariants ?? 0) +
+			(summary.prunedFtsRows ?? 0) +
+			(summary.prunedRevisions ?? 0)
+		)
+	}
+
+	private logMaintenanceSubphaseStart(phase: string, details: Record<string, unknown>): number {
+		const startedAt = Date.now()
+		IndexDebugLoggerV2.log("basic", "MetadataStore", "metadata-maintenance-subphase-start", {
+			component: "MetadataStore",
+			workspacePath: this.workspacePath,
+			phase,
+			...details,
+		})
+		return startedAt
+	}
+
+	private logMaintenanceSubphaseComplete(phase: string, startedAt: number, details: Record<string, unknown>): void {
+		IndexDebugLoggerV2.log("basic", "MetadataStore", "metadata-maintenance-subphase-complete", {
+			component: "MetadataStore",
+			workspacePath: this.workspacePath,
+			phase,
+			elapsedMs: Date.now() - startedAt,
+			...details,
+		})
+	}
+
+	private pruneMetadataFootprint(input?: {
+		useMarker?: boolean
+		maxPruneBatches?: number
+	}): MetadataFootprintPruneSummary {
+		const passStartedAt = Date.now()
+		const useMarker = input?.useMarker ?? false
+		const maxPruneBatches = Math.max(1, Math.floor(input?.maxPruneBatches ?? Number.MAX_SAFE_INTEGER))
+		const markerKey = SqliteMetadataRepository.FOOTPRINT_CLEANUP_MARKER_KEY
+		const markerValue = useMarker ? this.getSchemaMetaValue(markerKey) : undefined
+		const pageInfoBefore = this.getOperationalPageInfo()
+		const rowCountsBefore = this.getFootprintRowCounts()
+
+		if (useMarker && markerValue === SqliteMetadataRepository.FOOTPRINT_CLEANUP_MARKER_VALUE) {
+			return {
+				markerKey,
+				markerState: "already_completed",
+				phase: "complete",
+				phaseLabel: this.getFootprintPhaseLabel("complete"),
+				passElapsedMs: Date.now() - passStartedAt,
+				totalRowsPruned: 0,
+				phaseBatchLimit: 0,
+				prunedJobs: 0,
+				prunedChunks: 0,
+				prunedChunkVariants: 0,
+				prunedFtsRows: 0,
+				prunedRevisions: 0,
+				hasMore: false,
+				prunedJobBatchLimit: SqliteMetadataRepository.FOOTPRINT_JOB_PRUNE_BATCH_SIZE,
+				prunedChunkBatchLimit: SqliteMetadataRepository.FOOTPRINT_PRUNE_BATCH_SIZE * maxPruneBatches,
+				prunedRevisionBatchLimit: SqliteMetadataRepository.FOOTPRINT_REVISION_PRUNE_BATCH_SIZE,
+				jobsBefore: rowCountsBefore.jobs,
+				jobsAfter: rowCountsBefore.jobs,
+				chunksBefore: rowCountsBefore.chunks,
+				chunksAfter: rowCountsBefore.chunks,
+				chunkVariantsBefore: rowCountsBefore.chunkVariants,
+				chunkVariantsAfter: rowCountsBefore.chunkVariants,
+				ftsRowsBefore: rowCountsBefore.ftsRows,
+				ftsRowsAfter: rowCountsBefore.ftsRows,
+				revisionsBefore: rowCountsBefore.revisions,
+				revisionsAfter: rowCountsBefore.revisions,
+				freelistPagesBefore: pageInfoBefore.freelistPages,
+				freelistPagesAfter: pageInfoBefore.freelistPages,
+				pageSizeBytes: pageInfoBefore.pageSizeBytes,
+				estimatedReclaimableBytesBefore: pageInfoBefore.freelistPages * pageInfoBefore.pageSizeBytes,
+				estimatedReclaimableBytesAfter: pageInfoBefore.freelistPages * pageInfoBefore.pageSizeBytes,
+			}
+		}
+
+		const pruned = this.withTransaction(() => {
+			const jobPrune = this.pruneFinalizedJobsInTransaction(
+				SqliteMetadataRepository.FOOTPRINT_JOB_PRUNE_BATCH_SIZE,
+			)
+			if (jobPrune.jobsMayRemain) {
+				return {
+					...jobPrune,
+					phase: "finalized_jobs" as const,
+					prunedChunks: 0,
+					prunedChunkVariants: 0,
+					prunedFtsRows: 0,
+					prunedRevisions: 0,
+					chunksMayRemain: true,
+					revisionsMayRemain: true,
+					skippedChunkPruneDueToJobs: true,
+					skippedRevisionPruneDueToJobs: true,
+				}
+			}
+			const chunkPrune = this.pruneNonActionableChunkMetadataInTransaction(maxPruneBatches)
+			if (chunkPrune.chunksMayRemain) {
+				return {
+					...jobPrune,
+					...chunkPrune,
+					prunedRevisions: 0,
+					revisionsMayRemain: true,
+					skippedChunkPruneDueToJobs: false,
+					skippedRevisionPruneDueToJobs: false,
+				}
+			}
+			const revisionPrune = this.pruneObsoleteNonActionableRevisionsInTransaction(
+				SqliteMetadataRepository.FOOTPRINT_REVISION_PRUNE_BATCH_SIZE,
+			)
+			return {
+				...jobPrune,
+				...chunkPrune,
+				...revisionPrune,
+				phase:
+					revisionPrune.revisionsMayRemain || revisionPrune.prunedRevisions > 0
+						? ("obsolete_revisions" as const)
+						: ("complete" as const),
+				skippedChunkPruneDueToJobs: false,
+				skippedRevisionPruneDueToJobs: false,
+			}
+		}, "IMMEDIATE")
+		const phase: MetadataFootprintPrunePhase = pruned.phase ?? "complete"
+		const pageInfoAfter = this.getOperationalPageInfo()
+		const rowCountsAfter = this.getFootprintRowCounts()
+		const summary: MetadataFootprintPruneSummary = {
+			markerKey,
+			markerState: useMarker ? "completed" : "skipped",
+			phase,
+			phaseLabel: this.getFootprintPhaseLabel(phase),
+			passElapsedMs: Date.now() - passStartedAt,
+			prunedJobs: pruned.prunedJobs,
+			prunedChunks: pruned.prunedChunks,
+			prunedChunkVariants: pruned.prunedChunkVariants,
+			prunedFtsRows: pruned.prunedFtsRows,
+			prunedRevisions: pruned.prunedRevisions,
+			hasMore: pruned.jobsMayRemain || pruned.chunksMayRemain || pruned.revisionsMayRemain,
+			skippedChunkPruneDueToJobs: pruned.skippedChunkPruneDueToJobs,
+			skippedRevisionPruneDueToJobs: pruned.skippedRevisionPruneDueToJobs,
+			prunedJobBatchLimit: SqliteMetadataRepository.FOOTPRINT_JOB_PRUNE_BATCH_SIZE,
+			prunedChunkBatchLimit: SqliteMetadataRepository.FOOTPRINT_PRUNE_BATCH_SIZE * maxPruneBatches,
+			prunedRevisionBatchLimit: SqliteMetadataRepository.FOOTPRINT_REVISION_PRUNE_BATCH_SIZE,
+			phaseBatchLimit: this.getFootprintPhaseBatchLimit(phase, maxPruneBatches),
+			jobsBefore: rowCountsBefore.jobs,
+			jobsAfter: rowCountsAfter.jobs,
+			chunksBefore: rowCountsBefore.chunks,
+			chunksAfter: rowCountsAfter.chunks,
+			chunkVariantsBefore: rowCountsBefore.chunkVariants,
+			chunkVariantsAfter: rowCountsAfter.chunkVariants,
+			ftsRowsBefore: rowCountsBefore.ftsRows,
+			ftsRowsAfter: rowCountsAfter.ftsRows,
+			revisionsBefore: rowCountsBefore.revisions,
+			revisionsAfter: rowCountsAfter.revisions,
+			freelistPagesBefore: pageInfoBefore.freelistPages,
+			freelistPagesAfter: pageInfoAfter.freelistPages,
+			pageSizeBytes: pageInfoAfter.pageSizeBytes,
+			estimatedReclaimableBytesBefore: pageInfoBefore.freelistPages * pageInfoBefore.pageSizeBytes,
+			estimatedReclaimableBytesAfter: pageInfoAfter.freelistPages * pageInfoAfter.pageSizeBytes,
+		}
+		summary.totalRowsPruned = this.getFootprintTotalRowsPruned(summary)
+		if (useMarker && summary.hasMore) {
+			summary.markerState = "partial"
+		}
+
+		return summary
+	}
+
+	private getFootprintRowCounts(): {
+		jobs: number
+		chunks: number
+		chunkVariants: number
+		ftsRows: number
+		revisions: number
+	} {
+		return {
+			jobs: this.readCount(this.db(), `SELECT COUNT(*) AS count FROM jobs`, []),
+			chunks: this.readCount(this.db(), `SELECT COUNT(*) AS count FROM chunks`, []),
+			chunkVariants: this.readCount(this.db(), `SELECT COUNT(*) AS count FROM chunk_variants`, []),
+			ftsRows: this.readCount(this.db(), `SELECT COUNT(*) AS count FROM chunk_lexical_fts`, []),
+			revisions: this.readCount(this.db(), `SELECT COUNT(*) AS count FROM file_revisions`, []),
+		}
+	}
+
+	private pruneFinalizedJobsInTransaction(maxRows: number): { prunedJobs: number; jobsMayRemain: boolean } {
+		const startedAt = this.logMaintenanceSubphaseStart("finalized_job_prune", {
+			phase: "finalized_jobs",
+			batchLimit: maxRows,
+		})
+		const result = this.db()
+			.prepare(
+				`DELETE FROM jobs
+				WHERE rowid IN (
+					SELECT j.rowid
+					FROM jobs j
+					WHERE j.workspace_id = ?
+						AND j.state IN ('done', 'abandoned')
+						AND EXISTS (
+							SELECT 1
+							FROM index_runs r
+							WHERE r.run_id = j.run_id
+								AND r.workspace_id = ?
+								AND r.state IN ('complete', 'failed', 'stopped')
+						)
+						AND NOT EXISTS (
+							SELECT 1
+							FROM chunks c
+							INNER JOIN file_revisions fr ON fr.revision_id = c.revision_id
+							WHERE c.chunk_id = j.entity_id
+								AND fr.state IN ('hashed', 'parsed', 'planned')
+						)
+					LIMIT ?
+				)`,
+			)
+			.run(this.workspaceHash, this.workspaceHash, maxRows) as { changes?: number }
+		const prunedJobs = result.changes ?? 0
+		this.logMaintenanceSubphaseComplete("finalized_job_prune", startedAt, {
+			phase: "finalized_jobs",
+			selectedRows: prunedJobs,
+			deletedRows: prunedJobs,
+			batchLimit: maxRows,
+			hasMore: prunedJobs >= maxRows,
+		})
+		return {
+			prunedJobs,
+			jobsMayRemain: prunedJobs >= maxRows,
+		}
+	}
+
+	private pruneNonActionableChunkMetadataInTransaction(maxBatches: number): {
+		prunedChunks: number
+		prunedChunkVariants: number
+		prunedFtsRows: number
+		chunksMayRemain: boolean
+		phase?: MetadataFootprintPrunePhase
+	} {
+		this.db().exec(
+			`CREATE TEMP TABLE IF NOT EXISTS footprint_prune_chunk_ids (
+				chunk_id TEXT PRIMARY KEY
+			)`,
+		)
+
+		let prunedChunks = 0
+		let prunedChunkVariants = 0
+		let prunedFtsRows = 0
+		let chunksMayRemain = false
+		let phase: MetadataFootprintPrunePhase | undefined
+		let batches = 0
+
+		for (;;) {
+			if (batches >= maxBatches) {
+				chunksMayRemain = true
+				break
+			}
+			this.db().prepare(`DELETE FROM footprint_prune_chunk_ids`).run()
+			const deletedSelection = this.selectDeletedChunkIdsForFootprintPrune(
+				SqliteMetadataRepository.FOOTPRINT_PRUNE_BATCH_SIZE,
+			)
+			let selectedPhase: MetadataFootprintPrunePhase | undefined =
+				deletedSelection > 0 ? "deleted_chunks" : undefined
+			if (deletedSelection === 0) {
+				const supersededSelection = this.selectSupersededChunkIdsForFootprintPrune(
+					SqliteMetadataRepository.FOOTPRINT_PRUNE_BATCH_SIZE,
+				)
+				selectedPhase = supersededSelection > 0 ? "superseded_chunks" : undefined
+			}
+
+			const selectedChunks = this.readCount(
+				this.db(),
+				`SELECT COUNT(*) AS count FROM footprint_prune_chunk_ids`,
+				[],
+			)
+			if (selectedChunks === 0) {
+				chunksMayRemain = false
+				break
+			}
+			if (!selectedPhase) {
+				chunksMayRemain = false
+				break
+			}
+			phase = selectedPhase
+			batches += 1
+
+			const deleteStartedAt = this.logMaintenanceSubphaseStart(`${selectedPhase}_delete`, {
+				phase: selectedPhase,
+				selectedRows: selectedChunks,
+				batchLimit: SqliteMetadataRepository.FOOTPRINT_PRUNE_BATCH_SIZE,
+			})
+			const ftsResult = this.db()
+				.prepare(
+					`DELETE FROM chunk_lexical_fts
+					WHERE chunk_id IN (SELECT chunk_id FROM footprint_prune_chunk_ids)`,
+				)
+				.run() as { changes?: number }
+			const variantResult = this.db()
+				.prepare(
+					`DELETE FROM chunk_variants
+					WHERE chunk_id IN (SELECT chunk_id FROM footprint_prune_chunk_ids)`,
+				)
+				.run() as { changes?: number }
+			const chunkResult = this.db()
+				.prepare(
+					`DELETE FROM chunks
+					WHERE chunk_id IN (SELECT chunk_id FROM footprint_prune_chunk_ids)`,
+				)
+				.run() as { changes?: number }
+
+			prunedFtsRows += ftsResult.changes ?? 0
+			prunedChunkVariants += variantResult.changes ?? 0
+			prunedChunks += chunkResult.changes ?? 0
+			this.logMaintenanceSubphaseComplete(`${selectedPhase}_delete`, deleteStartedAt, {
+				phase: selectedPhase,
+				selectedRows: selectedChunks,
+				deletedRows: chunkResult.changes ?? 0,
+				deletedVariantRows: variantResult.changes ?? 0,
+				deletedFtsRows: ftsResult.changes ?? 0,
+				batchLimit: SqliteMetadataRepository.FOOTPRINT_PRUNE_BATCH_SIZE,
+				hasMore: true,
+			})
+
+			if ((chunkResult.changes ?? 0) === 0) {
+				break
+			}
+			// One bounded cleanup pass handles at most one chunk phase/batch. The next idle pass
+			// cheaply rechecks whether deleted chunks remain before moving to superseded chunks.
+			chunksMayRemain = true
+		}
+
+		this.db().prepare(`DELETE FROM footprint_prune_chunk_ids`).run()
+		return {
+			prunedChunks,
+			prunedChunkVariants,
+			prunedFtsRows,
+			chunksMayRemain,
+			phase,
+		}
+	}
+
+	private selectDeletedChunkIdsForFootprintPrune(maxRows: number): number {
+		const startedAt = this.logMaintenanceSubphaseStart("deleted_chunk_selection", {
+			phase: "deleted_chunks",
+			batchLimit: maxRows,
+		})
+		this.db()
+			.prepare(
+				`INSERT OR IGNORE INTO footprint_prune_chunk_ids (chunk_id)
+				SELECT c.chunk_id
+				FROM chunks c
+				INNER JOIN file_revisions fr ON fr.revision_id = c.revision_id
+				WHERE c.state = 'deleted'
+					AND NOT EXISTS (
+						SELECT 1
+						FROM files active_file
+						WHERE active_file.workspace_id = ?
+							AND active_file.active_revision_id = fr.revision_id
+							AND active_file.ignore_state = 'included'
+							AND active_file.tombstoned = 0
+					)
+					AND NOT EXISTS (
+						SELECT 1
+						FROM jobs j
+						WHERE j.entity_id = c.chunk_id
+					)
+				LIMIT ?`,
+			)
+			.run(this.workspaceHash, maxRows)
+		const selectedRows = this.readCount(this.db(), `SELECT COUNT(*) AS count FROM footprint_prune_chunk_ids`, [])
+		this.logMaintenanceSubphaseComplete("deleted_chunk_selection", startedAt, {
+			phase: "deleted_chunks",
+			selectedRows,
+			batchLimit: maxRows,
+		})
+		return selectedRows
+	}
+
+	private selectSupersededChunkIdsForFootprintPrune(maxRows: number): number {
+		const startedAt = this.logMaintenanceSubphaseStart("superseded_chunk_selection", {
+			phase: "superseded_chunks",
+			batchLimit: maxRows,
+		})
+		this.db()
+			.prepare(
+				`INSERT OR IGNORE INTO footprint_prune_chunk_ids (chunk_id)
+				SELECT c.chunk_id
+				FROM file_revisions fr
+				INNER JOIN chunks c ON c.revision_id = fr.revision_id
+				WHERE fr.state = 'superseded'
+					AND NOT EXISTS (
+						SELECT 1
+						FROM files active_file
+						WHERE active_file.workspace_id = ?
+							AND active_file.active_revision_id = fr.revision_id
+							AND active_file.ignore_state = 'included'
+							AND active_file.tombstoned = 0
+					)
+					AND NOT EXISTS (
+						SELECT 1
+						FROM jobs j
+						WHERE j.entity_id = c.chunk_id
+					)
+				LIMIT ?`,
+			)
+			.run(this.workspaceHash, maxRows)
+		const selectedRows = this.readCount(this.db(), `SELECT COUNT(*) AS count FROM footprint_prune_chunk_ids`, [])
+		this.logMaintenanceSubphaseComplete("superseded_chunk_selection", startedAt, {
+			phase: "superseded_chunks",
+			selectedRows,
+			batchLimit: maxRows,
+		})
+		return selectedRows
+	}
+
+	private pruneObsoleteNonActionableRevisionsInTransaction(maxRows: number): {
+		prunedRevisions: number
+		revisionsMayRemain: boolean
+	} {
+		const startedAt = this.logMaintenanceSubphaseStart("obsolete_revision_prune", {
+			phase: "obsolete_revisions",
+			batchLimit: maxRows,
+		})
+		const result = this.db()
+			.prepare(
+				`DELETE FROM file_revisions
+				WHERE rowid IN (
+					SELECT fr.rowid
+					FROM file_revisions fr
+					INNER JOIN files f ON f.file_id = fr.file_id
+					INNER JOIN file_revisions active_fr ON active_fr.revision_id = f.active_revision_id
+					WHERE f.workspace_id = ?
+						AND f.ignore_state = 'included'
+						AND f.tombstoned = 0
+						AND active_fr.state = 'committed'
+						AND fr.revision_id != f.active_revision_id
+						AND fr.state IN ('failed', 'terminal_failed', 'superseded')
+						AND (
+							active_fr.discovered_at > fr.discovered_at
+							OR (
+								active_fr.discovered_at = fr.discovered_at
+								AND active_fr.revision_id > fr.revision_id
+							)
+						)
+						AND NOT EXISTS (
+							SELECT 1
+							FROM chunks c
+							WHERE c.revision_id = fr.revision_id
+						)
+						AND NOT EXISTS (
+							SELECT 1
+							FROM jobs j
+							WHERE j.entity_id = fr.revision_id
+						)
+					LIMIT ?
+				)`,
+			)
+			.run(this.workspaceHash, maxRows) as { changes?: number }
+		const prunedRevisions = result.changes ?? 0
+		this.logMaintenanceSubphaseComplete("obsolete_revision_prune", startedAt, {
+			phase: "obsolete_revisions",
+			selectedRows: prunedRevisions,
+			deletedRows: prunedRevisions,
+			batchLimit: maxRows,
+			hasMore: prunedRevisions >= maxRows,
+		})
+		return {
+			prunedRevisions,
+			revisionsMayRemain: prunedRevisions >= maxRows,
+		}
+	}
+
+	private getOperationalPageInfo(): { pageSizeBytes: number; freelistPages: number } {
+		const pageSizeBytes = this.readPragma<number>(this.db(), "page_size", "page_size") ?? 4096
+		const freelistPages = this.readPragma<number>(this.db(), "freelist_count", "freelist_count") ?? 0
+		return { pageSizeBytes, freelistPages }
+	}
+
+	private getSchemaMetaValue(key: string): string | undefined {
+		const row = this.db().prepare(`SELECT value FROM schema_meta WHERE key = ?`).get(key) as
+			| { value?: string }
+			| undefined
+		return row?.value
+	}
+
+	private setSchemaMetaValueInTransaction(key: string, value: string): void {
+		this.db()
+			.prepare(
+				`INSERT INTO schema_meta (key, value)
+				VALUES (?, ?)
+				ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			)
+			.run(key, value)
 	}
 
 	async getRunProgressRecord(runId: string): Promise<RunProgressRecord | undefined> {
@@ -1146,14 +1775,27 @@ export class SqliteMetadataRepository {
 	}
 
 	async cleanupStaleRuns(): Promise<StaleRunCleanupSummary> {
+		await this.normalizeRestartInterruptedFailedRuns()
+
 		const staleRuns = this.db()
 			.prepare(
-				`SELECT run_id AS runId
+				`SELECT
+					run_id AS runId,
+					trigger_type AS triggerType,
+					started_at AS startedAt,
+					progress_json AS progressJson,
+					blocking_reason AS blockingReason
 				FROM index_runs
 				WHERE workspace_id = ?
 					AND state NOT IN ('complete', 'failed', 'stopped')`,
 			)
-			.all(this.workspaceHash) as Array<{ runId: string }>
+			.all(this.workspaceHash) as Array<{
+			runId: string
+			triggerType: string
+			startedAt: number
+			progressJson: string | null
+			blockingReason: string | null
+		}>
 
 		if (staleRuns.length === 0) {
 			const garbageCollection = this.garbageCollectExpiredPendingRuns()
@@ -1174,7 +1816,7 @@ export class SqliteMetadataRepository {
 		const staleRunIds = staleRuns.map(({ runId }) => runId)
 		const placeholders = staleRunIds.map(() => "?").join(", ")
 		const now = Date.now()
-		const errorMessage = "Marked stale after restart before the V2 run completed."
+		const errorMessage = SqliteMetadataRepository.INTERRUPTED_STALE_RUN_ERROR_MESSAGE
 		const resumableJobs = this.db()
 			.prepare(
 				`SELECT job_id AS jobId
@@ -1188,11 +1830,11 @@ export class SqliteMetadataRepository {
 
 		const updateRuns = this.db().prepare(
 			`UPDATE index_runs
-			 SET state = 'failed', completed_at = ?, error_message = ?
+			 SET state = 'stopped', completed_at = ?, last_heartbeat_at = ?, error_message = ?
 			 WHERE workspace_id = ?
 				AND state NOT IN ('complete', 'failed', 'stopped')`,
 		)
-		updateRuns.run(now, errorMessage, this.workspaceHash)
+		updateRuns.run(now, now, errorMessage, this.workspaceHash)
 
 		const updateJobs = this.db().prepare(
 			`UPDATE jobs
@@ -1269,6 +1911,7 @@ export class SqliteMetadataRepository {
 			runId: staleRunIds.join(","),
 			jobId: `${jobsResult.changes ?? 0}:${revisionsResult.changes ?? 0}:${chunksResult.changes ?? 0}`,
 		})
+		await this.writeInterruptedRunSummaries(staleRuns, now, errorMessage)
 		const garbageCollection = this.garbageCollectExpiredPendingRuns()
 		this.invalidateRunBacklogMetricsCache()
 
@@ -1284,6 +1927,114 @@ export class SqliteMetadataRepository {
 			expiredRevisionsGarbageCollected: garbageCollection.expiredRevisionsGarbageCollected,
 			expiredChunksGarbageCollected: garbageCollection.expiredChunksGarbageCollected,
 		}
+	}
+
+	private async writeInterruptedRunSummaries(
+		staleRuns: Array<{
+			runId: string
+			triggerType: string
+			startedAt: number
+			completedAt?: number | null
+			progressJson: string | null
+			blockingReason: string | null
+		}>,
+		completedAt: number,
+		errorMessage: string,
+	): Promise<void> {
+		for (const staleRun of staleRuns) {
+			const progress = this.parseProgressSnapshot(staleRun.progressJson)
+			const summaryCompletedAt = staleRun.completedAt ?? completedAt
+			await this.writeRunSummary({
+				runId: staleRun.runId,
+				workspaceId: this.workspaceHash,
+				triggerType: staleRun.triggerType,
+				state: "stopped",
+				startedAt: staleRun.startedAt,
+				completedAt: summaryCompletedAt,
+				totalRunMs: Math.max(0, summaryCompletedAt - staleRun.startedAt),
+				discoveredFiles: progress?.filesDiscovered ?? null,
+				filesScanned: progress?.filesHashed ?? progress?.filesDiscovered ?? null,
+				plannedRevisions: progress?.filesPlanned ?? null,
+				committedRevisions: progress?.filesCommitted ?? null,
+				retryingParseRevisions: progress?.retryingParseRevisions ?? null,
+				terminalFailedParseRevisions: progress?.terminalFailedParseRevisions ?? null,
+				retryingChunks: progress?.retryingChunks ?? null,
+				terminalFailedChunks: progress?.terminalFailedChunks ?? null,
+				degradedRevisions: progress?.degradedRevisions ?? null,
+				terminalFailedRevisions: progress?.terminalFailedRevisions ?? null,
+				parseThrottleMs: progress?.parseThrottleMs ?? null,
+				peakStagedChunks: progress?.peakStagedChunks ?? progress?.stagedChunks ?? null,
+				peakQueuedJobs:
+					progress?.peakQueuedJobs ??
+					Math.max(progress?.queuedUpsertJobs ?? 0, progress?.queuedDeleteJobs ?? 0),
+				lastBlockingReason: staleRun.blockingReason ?? progress?.blockingReason ?? null,
+				errorMessage,
+			})
+		}
+	}
+
+	private async normalizeRestartInterruptedFailedRuns(): Promise<number> {
+		const interruptedRuns = this.db()
+			.prepare(
+				`SELECT
+					run_id AS runId,
+					trigger_type AS triggerType,
+					started_at AS startedAt,
+					completed_at AS completedAt,
+					progress_json AS progressJson,
+					blocking_reason AS blockingReason
+				FROM index_runs
+				WHERE workspace_id = ?
+					AND state = 'failed'
+					AND error_message = ?`,
+			)
+			.all(this.workspaceHash, SqliteMetadataRepository.LEGACY_STALE_RUN_ERROR_MESSAGE) as Array<{
+			runId: string
+			triggerType: string
+			startedAt: number
+			completedAt: number | null
+			progressJson: string | null
+			blockingReason: string | null
+		}>
+
+		if (interruptedRuns.length === 0) {
+			return 0
+		}
+
+		const now = Date.now()
+		const result = this.db()
+			.prepare(
+				`UPDATE index_runs
+				 SET state = 'stopped',
+					 completed_at = COALESCE(completed_at, ?),
+					 last_heartbeat_at = COALESCE(last_heartbeat_at, ?),
+					 error_message = ?
+				 WHERE workspace_id = ?
+					AND state = 'failed'
+					AND error_message = ?`,
+			)
+			.run(
+				now,
+				now,
+				SqliteMetadataRepository.INTERRUPTED_STALE_RUN_ERROR_MESSAGE,
+				this.workspaceHash,
+				SqliteMetadataRepository.LEGACY_STALE_RUN_ERROR_MESSAGE,
+			) as { changes?: number }
+
+		await this.writeInterruptedRunSummaries(
+			interruptedRuns.map((run) => ({ ...run, completedAt: run.completedAt ?? now })),
+			now,
+			SqliteMetadataRepository.INTERRUPTED_STALE_RUN_ERROR_MESSAGE,
+		)
+		IndexDebugLoggerV2.log("basic", "MetadataStore", "stale-run-failures-normalized", {
+			component: "MetadataStore",
+			workspacePath: this.workspacePath,
+			runId: interruptedRuns.map((run) => run.runId).join(","),
+			jobId: `${result.changes ?? 0}`,
+		})
+		this.invalidateRunBacklogMetricsCache()
+
+		return result.changes ?? 0
 	}
 
 	async adoptRetryableJobsFromStaleRuns(targetRunId: string, staleRunIds: string[]): Promise<number> {
@@ -1687,7 +2438,13 @@ export class SqliteMetadataRepository {
 
 	async countTrackedFilesForWorkspace(workspaceId: string): Promise<number> {
 		const row = this.db()
-			.prepare(`SELECT COUNT(*) AS count FROM files WHERE workspace_id = ? AND ignore_state = 'included'`)
+			.prepare(
+				`SELECT COUNT(*) AS count
+				FROM files
+				WHERE workspace_id = ?
+					AND ignore_state = 'included'
+					AND tombstoned = 0`,
+			)
 			.get(workspaceId) as { count?: number } | undefined
 		return row?.count ?? 0
 	}
@@ -2144,48 +2901,29 @@ export class SqliteMetadataRepository {
 		filter: WarningDetailsFilter = "all",
 		sort: WarningDetailsSort = "severity",
 	): Promise<PaginatedRevisionWarningDetails> {
-		let filterClause = ""
+		let categoryFilterClause = ""
 		if (filter === "degraded") {
-			filterClause = `AND fr.state = 'degraded'`
+			categoryFilterClause = `AND category = 'degraded'`
 		} else if (filter === "parser_failed") {
-			filterClause = `AND fr.state = 'terminal_failed'
-				AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.revision_id = fr.revision_id)`
+			categoryFilterClause = `AND category = 'parser_failed'`
 		} else if (filter === "failed") {
-			filterClause = `AND (
-				fr.state = 'failed'
-				OR (fr.state = 'terminal_failed' AND EXISTS (SELECT 1 FROM chunks c WHERE c.revision_id = fr.revision_id))
-			)`
+			categoryFilterClause = `AND category = 'failed'`
 		}
 		const orderClause =
 			sort === "path"
-				? `f.relative_path COLLATE NOCASE ASC, fr.discovered_at DESC`
+				? `relativePath COLLATE NOCASE ASC, discoveredAt DESC`
 				: sort === "recent"
-					? `fr.discovered_at DESC, f.relative_path COLLATE NOCASE ASC`
+					? `discoveredAt DESC, relativePath COLLATE NOCASE ASC`
 					: `CASE
-						WHEN fr.state = 'terminal_failed' AND NOT EXISTS (
-							SELECT 1 FROM chunks c WHERE c.revision_id = fr.revision_id
-						) THEN 0
-						WHEN fr.state IN ('terminal_failed', 'failed') THEN 1
-						WHEN fr.state = 'degraded' THEN 2
+						WHEN category = 'parser_failed' THEN 0
+						WHEN category = 'failed' THEN 1
+						WHEN category = 'degraded' THEN 2
 						ELSE 3
 					END,
-					fr.discovered_at DESC,
-					f.relative_path COLLATE NOCASE ASC`
-		const totalRow = this.db()
-			.prepare(
-				`SELECT COUNT(*) AS count
-				FROM file_revisions fr
-				INNER JOIN files f ON f.file_id = fr.file_id
-				WHERE f.workspace_id = ?
-					AND f.ignore_state = 'included'
-					AND f.tombstoned = 0
-					AND fr.state IN ('degraded', 'terminal_failed', 'failed')
-					${filterClause}`,
-			)
-			.get(workspaceId) as { count?: number } | undefined
-		const items = this.db()
-			.prepare(
-				`SELECT
+					discoveredAt DESC,
+					relativePath COLLATE NOCASE ASC`
+		const latestRevisionWarningsCte = `WITH latest_revisions AS (
+				SELECT
 					fr.revision_id AS revisionId,
 					fr.file_id AS fileId,
 					f.relative_path AS relativePath,
@@ -2198,14 +2936,42 @@ export class SqliteMetadataRepository {
 						ELSE 'failed'
 					END AS category,
 					fr.failure_reason AS failureReason,
-					fr.discovered_at AS discoveredAt
+					fr.discovered_at AS discoveredAt,
+					ROW_NUMBER() OVER (
+						PARTITION BY fr.file_id
+						ORDER BY fr.discovered_at DESC, fr.revision_id DESC
+					) AS revisionRank
 				FROM file_revisions fr
 				INNER JOIN files f ON f.file_id = fr.file_id
 				WHERE f.workspace_id = ?
 					AND f.ignore_state = 'included'
 					AND f.tombstoned = 0
-					AND fr.state IN ('degraded', 'terminal_failed', 'failed')
-					${filterClause}
+			)`
+		const totalRow = this.db()
+			.prepare(
+				`${latestRevisionWarningsCte}
+				SELECT COUNT(*) AS count
+				FROM latest_revisions
+				WHERE revisionRank = 1
+					AND state IN ('degraded', 'terminal_failed', 'failed')
+					${categoryFilterClause}`,
+			)
+			.get(workspaceId) as { count?: number } | undefined
+		const items = this.db()
+			.prepare(
+				`${latestRevisionWarningsCte}
+				SELECT
+					revisionId,
+					fileId,
+					relativePath,
+					state,
+					category,
+					failureReason,
+					discoveredAt
+				FROM latest_revisions
+				WHERE revisionRank = 1
+					AND state IN ('degraded', 'terminal_failed', 'failed')
+					${categoryFilterClause}
 				ORDER BY ${orderClause}
 				LIMIT ? OFFSET ?`,
 			)
@@ -2218,30 +2984,44 @@ export class SqliteMetadataRepository {
 	}
 
 	async listWarningRelativePaths(workspaceId: string, filter: WarningDetailsFilter = "all"): Promise<string[]> {
-		let filterClause = ""
+		let categoryFilterClause = ""
 		if (filter === "degraded") {
-			filterClause = `AND fr.state = 'degraded'`
+			categoryFilterClause = `AND category = 'degraded'`
 		} else if (filter === "parser_failed") {
-			filterClause = `AND fr.state = 'terminal_failed'
-				AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.revision_id = fr.revision_id)`
+			categoryFilterClause = `AND category = 'parser_failed'`
 		} else if (filter === "failed") {
-			filterClause = `AND (
-				fr.state = 'failed'
-				OR (fr.state = 'terminal_failed' AND EXISTS (SELECT 1 FROM chunks c WHERE c.revision_id = fr.revision_id))
-			)`
+			categoryFilterClause = `AND category = 'failed'`
 		}
 
 		const rows = this.db()
 			.prepare(
-				`SELECT DISTINCT f.relative_path AS relativePath
-				FROM file_revisions fr
-				INNER JOIN files f ON f.file_id = fr.file_id
-				WHERE f.workspace_id = ?
-					AND f.ignore_state = 'included'
-					AND f.tombstoned = 0
-					AND fr.state IN ('degraded', 'terminal_failed', 'failed')
-					${filterClause}
-				ORDER BY f.relative_path COLLATE NOCASE ASC`,
+				`WITH latest_revisions AS (
+					SELECT
+						f.relative_path AS relativePath,
+						fr.state,
+						CASE
+							WHEN fr.state = 'degraded' THEN 'degraded'
+							WHEN fr.state = 'terminal_failed' AND NOT EXISTS (
+								SELECT 1 FROM chunks c WHERE c.revision_id = fr.revision_id
+							) THEN 'parser_failed'
+							ELSE 'failed'
+						END AS category,
+						ROW_NUMBER() OVER (
+							PARTITION BY fr.file_id
+							ORDER BY fr.discovered_at DESC, fr.revision_id DESC
+						) AS revisionRank
+					FROM file_revisions fr
+					INNER JOIN files f ON f.file_id = fr.file_id
+					WHERE f.workspace_id = ?
+						AND f.ignore_state = 'included'
+						AND f.tombstoned = 0
+				)
+				SELECT relativePath
+				FROM latest_revisions
+				WHERE revisionRank = 1
+					AND state IN ('degraded', 'terminal_failed', 'failed')
+					${categoryFilterClause}
+				ORDER BY relativePath COLLATE NOCASE ASC`,
 			)
 			.all(workspaceId) as Array<{ relativePath: string }>
 
@@ -4186,6 +4966,38 @@ export class SqliteMetadataRepository {
 			.all(runId) as PlannedRevisionResolution[]
 	}
 
+	async listReadyRevisionResolutions(runId: string, limit: number): Promise<PlannedRevisionResolution[]> {
+		return this.db()
+			.prepare(
+				`SELECT
+					fr.revision_id AS revisionId,
+					fr.file_id AS fileId,
+					(
+						SELECT active_revision_id
+						FROM files f
+						WHERE f.file_id = fr.file_id
+							AND f.active_revision_id != fr.revision_id
+					) AS previousRevisionId,
+					COALESCE(SUM(CASE WHEN j.state = 'done' THEN 1 ELSE 0 END), 0) AS doneJobs,
+					COALESCE(SUM(CASE WHEN j.state = 'queued' THEN 1 ELSE 0 END), 0) AS queuedJobs,
+					COALESCE(SUM(CASE WHEN j.state = 'running' THEN 1 ELSE 0 END), 0) AS runningJobs,
+					COALESCE(SUM(CASE WHEN j.state = 'terminal_failed' THEN 1 ELSE 0 END), 0) AS terminalFailedJobs,
+					COUNT(j.job_id) AS totalJobs
+				FROM file_revisions fr
+				LEFT JOIN chunks c ON c.revision_id = fr.revision_id
+				LEFT JOIN jobs j ON j.entity_id = c.chunk_id AND j.run_id = fr.run_id AND j.job_type = 'upsert'
+				WHERE fr.run_id = ?
+					AND fr.state = 'planned'
+				GROUP BY fr.revision_id, fr.file_id
+				HAVING
+					COALESCE(SUM(CASE WHEN j.state = 'queued' THEN 1 ELSE 0 END), 0) = 0
+					AND COALESCE(SUM(CASE WHEN j.state = 'running' THEN 1 ELSE 0 END), 0) = 0
+				ORDER BY fr.discovered_at ASC
+				LIMIT ?`,
+			)
+			.all(runId, Math.max(1, limit)) as PlannedRevisionResolution[]
+	}
+
 	async getRevisionJobResolution(revisionId: string, runId: string, jobType: string): Promise<RevisionJobResolution> {
 		const rows = this.db()
 			.prepare(
@@ -4631,6 +5443,79 @@ export class SqliteMetadataRepository {
 		return typeof value === "number" && Number.isFinite(value) ? value : null
 	}
 
+	private async compactOperationalDatabase(): Promise<MetadataCompactionSummary> {
+		const operationalDbBytesBefore = await this.getFileSize(this.dbPath)
+		const operationalWalBytesBefore = await this.getFileSize(`${this.dbPath}-wal`)
+		const requiredFreeBytes = Math.ceil(operationalDbBytesBefore * 1.1)
+		const availableFreeBytesBefore = await this.getAvailableDiskBytes(this.dbPath)
+
+		if (availableFreeBytesBefore == null) {
+			throw new Error("Unable to determine free disk space for metadata DB compaction.")
+		}
+		if (availableFreeBytesBefore < requiredFreeBytes) {
+			throw new Error(
+				`Insufficient free disk space to compact metadata DB. Need at least ${this.formatBytesForError(requiredFreeBytes)} free; available ${this.formatBytesForError(availableFreeBytesBefore)}.`,
+			)
+		}
+
+		const startedAt = Date.now()
+		this.db().exec("VACUUM")
+		await this.checkpointWal("TRUNCATE")
+		const operationalDbBytesAfter = await this.getFileSize(this.dbPath)
+		const operationalWalBytesAfter = await this.getFileSize(`${this.dbPath}-wal`)
+		const availableFreeBytesAfter = await this.getAvailableDiskBytes(this.dbPath)
+
+		return {
+			operationalDbBytesBefore,
+			operationalDbBytesAfter,
+			operationalWalBytesBefore,
+			operationalWalBytesAfter,
+			reclaimedBytes: Math.max(0, operationalDbBytesBefore - operationalDbBytesAfter),
+			requiredFreeBytes,
+			availableFreeBytesBefore,
+			availableFreeBytesAfter,
+			elapsedMs: Date.now() - startedAt,
+		}
+	}
+
+	private async getAvailableDiskBytes(filePath: string): Promise<number | null> {
+		const statfs = (
+			fs as typeof fs & {
+				statfs?: (
+					path: string,
+				) => Promise<{ bavail?: number | bigint; bfree?: number | bigint; bsize?: number | bigint }>
+			}
+		).statfs
+		if (!statfs) {
+			return null
+		}
+		try {
+			const stats = await statfs(path.dirname(filePath))
+			const availableBlocks = stats.bavail ?? stats.bfree
+			const blockSize = stats.bsize
+			if (availableBlocks == null || blockSize == null) {
+				return null
+			}
+			return Number(availableBlocks) * Number(blockSize)
+		} catch {
+			return null
+		}
+	}
+
+	private formatBytesForError(bytes: number): string {
+		if (!Number.isFinite(bytes) || bytes <= 0) {
+			return "0 B"
+		}
+		const units = ["B", "KB", "MB", "GB", "TB"]
+		let value = bytes
+		let unitIndex = 0
+		while (value >= 1024 && unitIndex < units.length - 1) {
+			value /= 1024
+			unitIndex += 1
+		}
+		return `${unitIndex === 0 ? Math.round(value) : value.toFixed(1)} ${units[unitIndex]}`
+	}
+
 	private async getFileSize(filePath: string): Promise<number> {
 		try {
 			const stat = await fs.stat(filePath)
@@ -4642,14 +5527,14 @@ export class SqliteMetadataRepository {
 
 	private _openDatabase(): void {
 		if (!this._db) {
-			this._db = new DatabaseSync(this.dbPath)
+			this._db = new DatabaseSync(this.dbPath, { readOnly: this.mode === "reader" })
 			this.applyPragmas(this._db)
 		}
 	}
 
 	private _openTelemetryDatabase(): void {
 		if (!this._telemetryDb) {
-			this._telemetryDb = new DatabaseSync(this.telemetryDbPath)
+			this._telemetryDb = new DatabaseSync(this.telemetryDbPath, { readOnly: this.mode === "reader" })
 			this.applyPragmas(this._telemetryDb)
 		}
 	}
@@ -4708,6 +5593,7 @@ export class SqliteMetadataRepository {
 	}
 
 	async trimRunSamples(runId: string, maxSamples = MAX_PERSISTED_RUN_SAMPLES_PER_RUN): Promise<void> {
+		this.assertWritable("trimRunSamples")
 		this.telemetryDb()
 			.prepare(
 				`DELETE FROM index_run_samples
@@ -4753,26 +5639,33 @@ export class SqliteMetadataRepository {
 	}
 
 	private applyPragmas(database: SqliteDatabaseSync): void {
-		database.exec("PRAGMA journal_mode = WAL")
-		database.exec("PRAGMA synchronous = NORMAL")
 		database.exec("PRAGMA busy_timeout = 5000")
-		database.exec("PRAGMA temp_store = MEMORY")
 		database.exec("PRAGMA foreign_keys = ON")
+		if (this.mode === "reader") {
+			database.exec("PRAGMA query_only = ON")
+		} else {
+			database.exec("PRAGMA journal_mode = WAL")
+			database.exec("PRAGMA synchronous = NORMAL")
+			database.exec("PRAGMA temp_store = MEMORY")
+		}
 
 		const journalMode = this.readPragma<string>(database, "journal_mode", "journal_mode")
 		const synchronous = this.readPragma<number>(database, "synchronous", "synchronous")
 		const busyTimeout = this.readPragma<number>(database, "busy_timeout", "timeout")
 		const tempStore = this.readPragma<number>(database, "temp_store", "temp_store")
 		const foreignKeys = this.readPragma<number>(database, "foreign_keys", "foreign_keys")
+		const queryOnly = this.readPragma<number>(database, "query_only", "query_only")
 
 		IndexDebugLoggerV2.log("basic", "MetadataStore", "sqlite-open-settings", {
 			component: "MetadataStore",
 			workspacePath: this.workspacePath,
+			mode: this.mode,
 			journalMode,
 			synchronous,
 			busyTimeoutMs: busyTimeout,
 			tempStore,
 			foreignKeysEnabled: foreignKeys === 1,
+			queryOnlyEnabled: queryOnly === 1,
 		})
 	}
 
@@ -4786,6 +5679,7 @@ export class SqliteMetadataRepository {
 	}
 
 	private withTransaction<T>(callback: () => T, mode: TransactionMode = "DEFERRED"): T {
+		this.assertWritable("transaction")
 		this.db().exec(`BEGIN ${mode}`)
 		try {
 			const result = callback()
@@ -4823,6 +5717,12 @@ export class SqliteMetadataRepository {
 			return
 		}
 		this._runBacklogMetricsCache.clear()
+	}
+
+	private assertWritable(operation: string): void {
+		if (this.mode === "reader") {
+			throw new Error(`Metadata repository is read-only; cannot perform ${operation}.`)
+		}
 	}
 
 	private getBlockingReason(metrics: RunBacklogMetrics): string {

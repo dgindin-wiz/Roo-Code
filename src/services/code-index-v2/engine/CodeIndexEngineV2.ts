@@ -2,11 +2,19 @@ import * as vscode from "vscode"
 import * as fs from "fs/promises"
 import * as path from "path"
 import type {
+	IndexingCodebaseProgressSnapshot,
 	IndexingHealthState,
+	IndexingPhaseTimingSnapshot,
+	IndexingPipelineOverallState,
 	IndexingPipelineRunMode,
+	IndexingPipelineSnapshot,
+	IndexingRuntimeSnapshot,
+	IndexingRuntimeTaskSnapshot,
+	IndexingRuntimeTaskState,
 	IndexingServiceMetric,
 	IndexingServiceSnapshot,
 	IndexingServiceState,
+	IndexingSidecarSnapshot,
 } from "@roo-code/types"
 import { CodeIndexStateManager } from "../../code-index/state-manager"
 import { VectorStoreSearchResult } from "../../code-index/interfaces"
@@ -31,8 +39,9 @@ import {
 import { ReconciliationService } from "../reconciliation/ReconciliationService"
 import { EmbeddingRuntimeProfileStore } from "../store/EmbeddingRuntimeProfileStore"
 import { type MetadataGateway } from "../store/MetadataGateway"
-import { resolveMetadataStorePaths } from "../store/MetadataPathResolver"
-import { MetadataSidecarClient } from "../sidecar/MetadataSidecarClient"
+import { resolveMetadataStorePaths, type ResolvedMetadataStorePaths } from "../store/MetadataPathResolver"
+import type { IndexRunSummaryRecord, MetadataMaintenanceSummary, RunProgressRecord } from "../store/types"
+import { MetadataSidecarClient, type MetadataSidecarClientDiagnostics } from "../sidecar/MetadataSidecarClient"
 import { CODE_INDEX_V2_ENGINE_ID } from "../shared/constants"
 import {
 	AdaptiveEmbeddingControllerState,
@@ -45,6 +54,7 @@ import {
 	CodeIndexDebugLexicalMode,
 	CodeIndexDebugLexicalStatus,
 	CodeIndexDebugSearchTrace,
+	CodeIndexMetadataCompactionResult,
 	CodeIndexStatus,
 	ICodeIndexEngine,
 } from "./interfaces"
@@ -116,10 +126,69 @@ type SearchSurfaceCategories = {
 
 type ActiveChunkByFingerprint = Awaited<ReturnType<MetadataGateway["getActiveChunksByFingerprints"]>>[number]
 type ActiveChunkByRelativePath = Awaited<ReturnType<MetadataGateway["getActiveChunksByRelativePaths"]>>[number]
+
+type StandbyRunContext = {
+	runId: string
+	source: "operational" | "summary"
+	state: "started" | "discovery_complete" | "complete" | "failed" | "stopped"
+	triggerType: string
+	startedAt: number
+	completedAt: number | null
+	lastHeartbeatAt?: number | null
+	errorMessage?: string | null
+	totalRunMs?: number | null
+	discoveryMs?: number | null
+	statHashMs?: number | null
+	parseChunkMs?: number | null
+	diffPlanningMs?: number | null
+	embedUpsertMs?: number | null
+	discoveredFiles?: number | null
+	filesScanned?: number | null
+	filesChanged?: number | null
+	parsedChunks?: number | null
+	plannedRevisions?: number | null
+	syncedChunks?: number | null
+	upsertedChunks?: number | null
+	deletedChunks?: number | null
+	committedRevisions?: number | null
+	retryingParseRevisions?: number | null
+	terminalFailedParseRevisions?: number | null
+	retryingChunks?: number | null
+	terminalFailedChunks?: number | null
+	degradedRevisions?: number | null
+	terminalFailedRevisions?: number | null
+	progress?: RunProgressRecord["progress"]
+}
 type LexicalSearchChunk = Awaited<
 	ReturnType<MetadataGateway["searchActiveChunksLexicallyWithStatus"]>
 >["results"][number]
 type RunBacklogMetricsRecord = Awaited<ReturnType<MetadataGateway["getRunBacklogMetrics"]>>
+type PipelineSnapshotPatch = Partial<Omit<IndexingPipelineSnapshot, "services">> & {
+	services?: IndexingServiceSnapshot[]
+}
+type TrackedProcessGroupSummary = {
+	count?: number
+	totalRssMB?: number
+	peakRssMB?: number
+	totalCpuPercent?: number
+	totalHeapUsedMB?: number
+	totalExternalMB?: number
+	totalArrayBuffersMB?: number
+	labels?: string[]
+}
+
+function healthToMetricTone(health: IndexingHealthState): IndexingServiceMetric["tone"] {
+	if (health === "critical") {
+		return "critical"
+	}
+	if (health === "watch") {
+		return "warning"
+	}
+	if (health === "healthy") {
+		return "good"
+	}
+	return "neutral"
+}
 
 export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private static readonly REVISION_BATCH_SIZE = 20
@@ -134,7 +203,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private static readonly PLANNER_JOB_BUDGET = 1_500
 	private static readonly RUN_HEARTBEAT_INTERVAL_MS = 5_000
 	private static readonly PIPELINE_POLL_INTERVAL_MS = 250
+	private static readonly ACTIVATION_BACKLOG_REUSE_WINDOW_MS = 2_000
 	private static readonly HEARTBEAT_INTERVAL_MS = 2_000
+	private static readonly IDLE_FOOTPRINT_CLEANUP_DELAY_MS = 15_000
 	private static readonly PREFLIGHT_QDRANT_TIMEOUT_MS = 10_000
 	private static readonly PREFLIGHT_EMBEDDER_TIMEOUT_MS = 15_000
 	public readonly engine = CODE_INDEX_V2_ENGINE_ID
@@ -142,7 +213,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		engine: CODE_INDEX_V2_ENGINE_ID,
 		state: "idle",
 	}
+	private readonly metadataWriterClient: MetadataSidecarClient
+	private readonly metadataReaderClient: MetadataSidecarClient
 	private readonly metadataStore: MetadataGateway
+	private readonly metadataReadStore: MetadataGateway
+	private readonly metadataStorePaths: ResolvedMetadataStorePaths
 	private readonly embeddingRuntimeProfileStore: EmbeddingRuntimeProfileStore
 	private _indexEmbeddingAdapter: ExistingEmbedderAdapter | undefined
 	private _indexVectorStore: QdrantRestVectorStoreAdapter | undefined
@@ -165,6 +240,20 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	private _stopRequested = false
 	private _operationChain: Promise<void> = Promise.resolve()
 	private _metadataMaintenancePromise: Promise<unknown> | undefined
+	private _metadataFootprintCleanupTimer: NodeJS.Timeout | undefined
+	private _idleMetadataFootprintCleanupInFlight = false
+	private _metadataCleanupTaskState: IndexingRuntimeTaskState = "idle"
+	private _metadataCleanupTaskUpdatedAt = Date.now()
+	private _metadataCleanupTaskDetail: string | undefined
+	private _metadataCleanupTaskSummaryOverride: string | undefined
+	private _metadataCleanupLastSummary: MetadataMaintenanceSummary | undefined
+	private _metadataCleanupLastError: string | undefined
+	private _metadataCleanupSessionRowsPruned = 0
+	private _metadataCleanupSessionLastRowsPruned = 0
+	private _metadataCleanupSessionLastPassElapsedMs: number | undefined
+	private _metadataCleanupSessionRateRowsPerSecond: number | undefined
+	private _metadataCompactionInFlight = false
+	private _standbyHasResumableWork = false
 	private _staleRunIdsToResume: string[] = []
 	private _resumedRetryJobsCount = 0
 	private _resumedPendingJobsCount = 0
@@ -175,10 +264,746 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		private readonly configManager: CodeIndexConfigManager,
 		private readonly stateManager: CodeIndexStateManager,
 	) {
-		this.metadataStore = new MetadataSidecarClient(
-			resolveMetadataStorePaths(context, workspacePath),
-		) as unknown as MetadataGateway
+		this.metadataStorePaths = resolveMetadataStorePaths(context, workspacePath)
+		this.metadataWriterClient = new MetadataSidecarClient(this.metadataStorePaths, {
+			role: "writer",
+		})
+		this.metadataReaderClient = new MetadataSidecarClient(this.metadataStorePaths, {
+			role: "reader",
+		})
+		this.metadataStore = this.metadataWriterClient as unknown as MetadataGateway
+		this.metadataReadStore = this.metadataReaderClient as unknown as MetadataGateway
 		this.embeddingRuntimeProfileStore = new EmbeddingRuntimeProfileStore(context)
+	}
+
+	private setPipelineSnapshot(snapshot: PipelineSnapshotPatch, options?: { forceImmediate?: boolean }): void {
+		this.stateManager.setPipelineSnapshot(
+			{
+				...snapshot,
+				runtime: this.buildRuntimeSnapshot(),
+			},
+			options,
+		)
+	}
+
+	private publishRuntimeSnapshot(): void {
+		this.stateManager.setPipelineRuntimeSnapshot(this.buildRuntimeSnapshot())
+	}
+
+	private buildRuntimeSnapshot(): IndexingRuntimeSnapshot {
+		const trackedProcesses = IndexDebugLoggerV2.getTrackedProcessSummary(this.workspacePath)
+		return {
+			updatedAt: Date.now(),
+			sidecars: [
+				this.buildRuntimeSidecarSnapshot(
+					"metadata_writer",
+					"Metadata writer",
+					"Indexing metadata writes",
+					this.metadataWriterClient.getDiagnosticsSnapshot(),
+					this.getTrackedProcessGroupSummary(trackedProcesses, "metadataWriterSidecar"),
+				),
+				this.buildRuntimeSidecarSnapshot(
+					"metadata_reader",
+					"Metadata reader",
+					"Search and UI metadata reads",
+					this.metadataReaderClient.getDiagnosticsSnapshot(),
+					this.getTrackedProcessGroupSummary(trackedProcesses, "metadataReaderSidecar"),
+				),
+			],
+			tasks: [this.buildMetadataCleanupTaskSnapshot()],
+		}
+	}
+
+	private buildMetadataCleanupTaskSnapshot(): IndexingRuntimeTaskSnapshot {
+		const summary = this._metadataCleanupLastSummary
+		const footprint = summary?.footprintPrune
+		const compaction = summary?.compaction
+		const state = this._metadataCleanupTaskState
+		const health: IndexingHealthState = state === "failed" ? "watch" : state === "idle" ? "unknown" : "healthy"
+		const compactionRunning = this._metadataCompactionInFlight
+		const compactionComplete = !compactionRunning && state === "complete" && Boolean(compaction)
+		const reclaimableBytes =
+			footprint?.estimatedReclaimableBytesAfter ?? footprint?.estimatedReclaimableBytesBefore ?? null
+		const phaseLabel = compactionRunning
+			? "Compacting DB file"
+			: compactionComplete
+				? "Compaction complete"
+				: (footprint?.phaseLabel ?? (state === "running" ? "Starting cleanup" : undefined))
+		const phaseRows = compactionRunning ? 0 : this.getMetadataCleanupPhaseRows(footprint)
+		const phaseBatchLimit = compactionRunning ? null : (footprint?.phaseBatchLimit ?? null)
+		const progressCurrent =
+			phaseBatchLimit && phaseBatchLimit > 0 ? Math.min(phaseRows, phaseBatchLimit) : undefined
+		const progressTotal = phaseBatchLimit && phaseBatchLimit > 0 ? phaseBatchLimit : undefined
+		const progressPercent =
+			progressCurrent != null && progressTotal != null && progressTotal > 0
+				? Math.min(100, Math.round((progressCurrent / progressTotal) * 100))
+				: null
+		const rateLabel =
+			!compactionRunning && this._metadataCleanupSessionRateRowsPerSecond
+				? `${Math.round(this._metadataCleanupSessionRateRowsPerSecond).toLocaleString()} rows/sec`
+				: undefined
+		const etaLabel = compactionRunning
+			? "finish DB rewrite, then resume metadata reads"
+			: state === "complete"
+				? "done"
+				: footprint?.hasMore
+					? "next idle pass"
+					: state === "running" || state === "scheduled"
+						? "estimating"
+						: undefined
+		const metrics: IndexingServiceMetric[] = [
+			this.createServiceMetric(
+				"state",
+				"State",
+				this.formatMetadataCleanupState(state),
+				healthToMetricTone(health),
+			),
+			this.createServiceMetric("phase", "Phase", phaseLabel ?? "n/a"),
+			this.createServiceMetric("rate", "Cleanup rate", rateLabel ?? "n/a"),
+			this.createServiceMetric(
+				"session_rows_pruned",
+				"Rows cleaned this session",
+				this._metadataCleanupSessionRowsPruned.toLocaleString(),
+			),
+			this.createServiceMetric("reclaimable", "Reclaimable", this.formatCompactBytes(reclaimableBytes)),
+			this.createServiceMetric(
+				"marker",
+				"Marker",
+				this.formatMetadataCleanupMarker(footprint?.markerState),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"last_pass",
+				"Last pass",
+				this.formatMetadataCleanupLastPass(),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric("jobs_pruned", "Jobs pruned", footprint?.prunedJobs ?? 0, "neutral", "detail"),
+			this.createServiceMetric(
+				"chunks_pruned",
+				"Chunks pruned",
+				footprint?.prunedChunks ?? 0,
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"revisions_pruned",
+				"Revisions pruned",
+				footprint?.prunedRevisions ?? 0,
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"variants_pruned",
+				"Variants pruned",
+				footprint?.prunedChunkVariants ?? 0,
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"fts_pruned",
+				"FTS rows pruned",
+				footprint?.prunedFtsRows ?? 0,
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"db_bytes",
+				"DB size",
+				this.formatCompactBytes(summary?.operationalDbBytes),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"wal_bytes",
+				"WAL size",
+				this.formatCompactBytes(summary?.operationalWalBytes),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"db_before",
+				"DB before",
+				this.formatCompactBytes(compaction?.operationalDbBytesBefore),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"db_after",
+				"DB after",
+				this.formatCompactBytes(compaction?.operationalDbBytesAfter),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"db_reclaimed",
+				"DB reclaimed",
+				this.formatCompactBytes(compaction?.reclaimedBytes),
+				compaction?.reclaimedBytes ? "good" : "neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"compaction_elapsed",
+				"Compaction time",
+				this.formatCompactDuration(compaction?.elapsedMs),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"free_required",
+				"Free space needed",
+				this.formatCompactBytes(compaction?.requiredFreeBytes),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"free_available",
+				"Free space available",
+				this.formatCompactBytes(compaction?.availableFreeBytesBefore),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric("has_more", "Has more", footprint?.hasMore ? "yes" : "no", "neutral", "detail"),
+			this.createServiceMetric(
+				"job_batch_limit",
+				"Job batch limit",
+				footprint?.prunedJobBatchLimit?.toLocaleString(),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"chunk_batch_limit",
+				"Chunk batch limit",
+				footprint?.prunedChunkBatchLimit?.toLocaleString(),
+				"neutral",
+				"detail",
+			),
+			this.createServiceMetric(
+				"revision_batch_limit",
+				"Revision batch limit",
+				footprint?.prunedRevisionBatchLimit?.toLocaleString(),
+				"neutral",
+				"detail",
+			),
+		]
+		if (this._metadataCleanupLastError) {
+			metrics.push(
+				this.createServiceMetric(
+					"last_error",
+					"Last error",
+					this._metadataCleanupLastError,
+					"critical",
+					"detail",
+				),
+			)
+		}
+
+		return {
+			id: "metadata_cleanup",
+			title: "Metadata cleanup",
+			state,
+			health,
+			summary:
+				this._metadataCleanupTaskSummaryOverride ?? this.getMetadataCleanupSummary(state, footprint?.hasMore),
+			detail: this._metadataCleanupTaskDetail,
+			progressCurrent,
+			progressTotal,
+			progressUnit: compactionRunning ? "DB rewrite" : progressTotal != null ? "phase rows" : undefined,
+			progressPercent,
+			indeterminate: compactionRunning || (state === "running" && progressTotal == null),
+			rateLabel,
+			etaLabel,
+			phaseLabel,
+			metrics,
+			actions: this.buildMetadataCleanupTaskActions(),
+			updatedAt: this._metadataCleanupTaskUpdatedAt,
+		}
+	}
+
+	private getMetadataCleanupPhaseRows(footprint?: MetadataMaintenanceSummary["footprintPrune"]): number {
+		switch (footprint?.phase) {
+			case "finalized_jobs":
+				return footprint.prunedJobs ?? 0
+			case "deleted_chunks":
+			case "superseded_chunks":
+				return footprint.prunedChunks ?? 0
+			case "obsolete_revisions":
+				return footprint.prunedRevisions ?? 0
+			case "complete":
+			default:
+				return footprint?.totalRowsPruned ?? 0
+		}
+	}
+
+	private formatMetadataCleanupLastPass(): string {
+		if (this._metadataCleanupSessionLastPassElapsedMs == null) {
+			return "n/a"
+		}
+		const rows = this._metadataCleanupSessionLastRowsPruned.toLocaleString()
+		const elapsed = this.formatCompactDuration(this._metadataCleanupSessionLastPassElapsedMs)
+		return `${rows} rows in ${elapsed}`
+	}
+
+	private recordMetadataCleanupProgress(summary?: MetadataMaintenanceSummary): void {
+		const footprint = summary?.footprintPrune
+		if (!footprint) {
+			return
+		}
+		const rowsPruned =
+			footprint.totalRowsPruned ??
+			(footprint.prunedJobs ?? 0) +
+				(footprint.prunedChunks ?? 0) +
+				(footprint.prunedChunkVariants ?? 0) +
+				(footprint.prunedFtsRows ?? 0) +
+				(footprint.prunedRevisions ?? 0)
+		const elapsedMs = footprint.passElapsedMs
+		this._metadataCleanupSessionLastRowsPruned = rowsPruned
+		this._metadataCleanupSessionLastPassElapsedMs = elapsedMs
+		if (rowsPruned > 0) {
+			this._metadataCleanupSessionRowsPruned += rowsPruned
+		}
+		if (elapsedMs && elapsedMs > 0 && rowsPruned > 0) {
+			this._metadataCleanupSessionRateRowsPerSecond = (rowsPruned / elapsedMs) * 1000
+		}
+	}
+
+	private buildMetadataCleanupTaskActions(): IndexingRuntimeTaskSnapshot["actions"] {
+		const availability = this.getMetadataCompactionAvailability()
+		if (!availability.visible) {
+			return undefined
+		}
+		return [
+			{
+				id: "compact_metadata_db",
+				label: "Compact DB file",
+				enabled: availability.enabled,
+				reason: availability.reason,
+				tone: availability.enabled ? "warning" : "neutral",
+			},
+		]
+	}
+
+	private getMetadataCompactionAvailability(): { visible: boolean; enabled: boolean; reason?: string } {
+		if (this._metadataCompactionInFlight) {
+			return { visible: true, enabled: false, reason: "Metadata DB compaction is already running." }
+		}
+
+		const summary = this._metadataCleanupLastSummary
+		const footprint = summary?.footprintPrune
+		const markerComplete = footprint?.markerState === "completed" || footprint?.markerState === "already_completed"
+		const cleanupComplete =
+			this._metadataCleanupTaskState === "complete" && markerComplete && footprint?.hasMore === false
+		if (!cleanupComplete) {
+			return {
+				visible: false,
+				enabled: false,
+				reason: "Metadata cleanup must complete before compaction is available.",
+			}
+		}
+
+		if (this._started || this._status.state !== "idle") {
+			return { visible: true, enabled: false, reason: "Compaction is available only while indexing is idle." }
+		}
+		if (this._standbyHasResumableWork) {
+			return {
+				visible: true,
+				enabled: false,
+				reason: "Resume or clear unfinished indexing work before compacting.",
+			}
+		}
+		if (this._idleMetadataFootprintCleanupInFlight) {
+			return { visible: true, enabled: false, reason: "Metadata cleanup is still running." }
+		}
+		if (this._metadataMaintenancePromise) {
+			return { visible: true, enabled: false, reason: "Metadata maintenance is already running." }
+		}
+
+		const writerDiagnostics = this.metadataWriterClient.getDiagnosticsSnapshot()
+		if (writerDiagnostics.state === "busy" || writerDiagnostics.pendingRequestCount > 0) {
+			return { visible: true, enabled: false, reason: "Metadata writer is busy." }
+		}
+
+		const reclaimableBytes =
+			footprint?.estimatedReclaimableBytesAfter ?? footprint?.estimatedReclaimableBytesBefore ?? 0
+		if (reclaimableBytes <= 0) {
+			return { visible: true, enabled: false, reason: "No reclaimable DB space is currently reported." }
+		}
+
+		return { visible: true, enabled: true }
+	}
+
+	private buildRuntimeSidecarSnapshot(
+		id: IndexingSidecarSnapshot["id"],
+		title: string,
+		summary: string,
+		diagnostics: MetadataSidecarClientDiagnostics,
+		processGroup?: TrackedProcessGroupSummary,
+	): IndexingSidecarSnapshot {
+		const health = diagnostics.state === "failed" ? (id === "metadata_writer" ? "critical" : "watch") : "healthy"
+		const metrics: IndexingServiceMetric[] = [
+			this.createServiceMetric(
+				"state",
+				"State",
+				this.formatRuntimeSidecarState(diagnostics.state),
+				healthToMetricTone(health),
+			),
+			this.createServiceMetric("pending", "Pending", diagnostics.pendingRequestCount.toLocaleString()),
+		]
+
+		if ((processGroup?.totalRssMB ?? 0) > 0) {
+			metrics.push(this.createServiceMetric("rss", "RSS", `${Math.round(processGroup?.totalRssMB ?? 0)} MB`))
+		}
+		if ((processGroup?.totalCpuPercent ?? 0) > 0) {
+			metrics.push(this.createServiceMetric("cpu", "CPU", `${(processGroup?.totalCpuPercent ?? 0).toFixed(1)}%`))
+		}
+		if (diagnostics.lastOperation) {
+			metrics.push(this.createServiceMetric("last_operation", "Last op", diagnostics.lastOperation))
+		}
+		if (diagnostics.lastElapsedMs != null) {
+			metrics.push(
+				this.createServiceMetric(
+					"last_latency",
+					"Latency",
+					this.formatCompactDuration(diagnostics.lastElapsedMs),
+					diagnostics.state === "failed" ? "critical" : "neutral",
+				),
+			)
+		}
+		if (diagnostics.pid != null) {
+			metrics.push(this.createServiceMetric("pid", "PID", diagnostics.pid, "neutral", "detail"))
+		}
+		if ((processGroup?.totalHeapUsedMB ?? 0) > 0) {
+			metrics.push(
+				this.createServiceMetric(
+					"heap",
+					"Heap",
+					`${Math.round(processGroup?.totalHeapUsedMB ?? 0)} MB`,
+					"neutral",
+					"detail",
+				),
+			)
+		}
+		if ((processGroup?.totalExternalMB ?? 0) > 0) {
+			metrics.push(
+				this.createServiceMetric(
+					"external",
+					"External",
+					`${Math.round(processGroup?.totalExternalMB ?? 0)} MB`,
+					"neutral",
+					"detail",
+				),
+			)
+		}
+		if ((processGroup?.totalArrayBuffersMB ?? 0) > 0) {
+			metrics.push(
+				this.createServiceMetric(
+					"array_buffers",
+					"Array buffers",
+					`${Math.round(processGroup?.totalArrayBuffersMB ?? 0)} MB`,
+					"neutral",
+					"detail",
+				),
+			)
+		}
+		if (diagnostics.lastError) {
+			metrics.push(
+				this.createServiceMetric("last_error", "Last error", diagnostics.lastError, "critical", "detail"),
+			)
+		}
+
+		return {
+			id,
+			title,
+			state: diagnostics.state,
+			health,
+			summary: this.getRuntimeSidecarSummary(id, diagnostics.state, summary),
+			detail: diagnostics.lastError ?? undefined,
+			pid: diagnostics.pid,
+			pendingRequestCount: diagnostics.pendingRequestCount,
+			lastOperation: diagnostics.lastOperation,
+			lastElapsedMs: diagnostics.lastElapsedMs,
+			lastError: diagnostics.lastError,
+			metrics,
+			updatedAt: diagnostics.updatedAt,
+		}
+	}
+
+	private getTrackedProcessGroupSummary(
+		trackedProcesses: Record<string, unknown> | undefined,
+		groupName: string,
+	): TrackedProcessGroupSummary | undefined {
+		const byGroup = (trackedProcesses as { byGroup?: Record<string, unknown> } | undefined)?.byGroup
+		const group = byGroup?.[groupName]
+		if (!group || typeof group !== "object") {
+			return undefined
+		}
+		return group as TrackedProcessGroupSummary
+	}
+
+	private getRuntimeSidecarSummary(
+		id: IndexingSidecarSnapshot["id"],
+		state: IndexingSidecarSnapshot["state"],
+		defaultSummary: string,
+	): string {
+		if (state === "standby") {
+			return id === "metadata_reader" ? "Starts lazily for search and UI reads" : "Not started yet"
+		}
+		if (state === "busy") {
+			return defaultSummary
+		}
+		if (state === "failed") {
+			return id === "metadata_writer" ? "Writer sidecar failed" : "Reader sidecar failed"
+		}
+		return "Ready"
+	}
+
+	private formatRuntimeSidecarState(state: IndexingSidecarSnapshot["state"]): string {
+		switch (state) {
+			case "standby":
+				return "Standby"
+			case "online":
+				return "Online"
+			case "busy":
+				return "Busy"
+			case "failed":
+				return "Failed"
+		}
+	}
+
+	private setMetadataCleanupTaskState(
+		state: IndexingRuntimeTaskState,
+		options?: {
+			detail?: string
+			summaryText?: string
+			summary?: MetadataMaintenanceSummary
+			errorMessage?: string
+		},
+	): void {
+		this._metadataCleanupTaskState = state
+		this._metadataCleanupTaskUpdatedAt = Date.now()
+		this._metadataCleanupTaskDetail = options?.detail
+		this._metadataCleanupTaskSummaryOverride = options?.summaryText
+		if (options?.summary) {
+			this._metadataCleanupLastSummary = options.summary
+			this.recordMetadataCleanupProgress(options.summary)
+		}
+		if (options?.errorMessage !== undefined) {
+			this._metadataCleanupLastError = options.errorMessage
+		} else if (state !== "failed") {
+			this._metadataCleanupLastError = undefined
+		}
+		this.publishRuntimeSnapshot()
+	}
+
+	private formatMetadataCleanupState(state: IndexingRuntimeTaskState): string {
+		switch (state) {
+			case "scheduled":
+				return "Scheduled"
+			case "running":
+				return "Running"
+			case "partial":
+				return "Partial"
+			case "complete":
+				return "Complete"
+			case "failed":
+				return "Failed"
+			case "skipped":
+				return "Skipped"
+			case "idle":
+			default:
+				return "Idle"
+		}
+	}
+
+	private formatMetadataCleanupMarker(markerState?: string): string {
+		if (!markerState) {
+			return "n/a"
+		}
+		return markerState.replace(/_/g, " ")
+	}
+
+	private getMetadataCleanupSummary(state: IndexingRuntimeTaskState, hasMore?: boolean): string {
+		switch (state) {
+			case "scheduled":
+				return "Cleanup queued for idle metadata pruning"
+			case "running":
+				return "Pruning safe metadata footprint"
+			case "partial":
+				return hasMore ? "Cleanup made progress and will continue" : "Cleanup made partial progress"
+			case "complete":
+				return "Cleanup complete"
+			case "failed":
+				return "Cleanup failed; indexing is unaffected"
+			case "skipped":
+				return "Cleanup skipped for now"
+			case "idle":
+			default:
+				return "Waiting for idle cleanup"
+		}
+	}
+
+	async hydrateStandbyStatus(): Promise<boolean> {
+		if (this._started || this._status.state === "running" || this._status.state === "starting") {
+			return false
+		}
+
+		IndexDebugLoggerV2.configureDiagnosticsDirectory(
+			this.metadataReadStore.getDiagnosticsDirectoryPath(),
+			this.workspacePath,
+		)
+		IndexDebugLoggerV2.setContext({
+			engine: this.engine,
+			component: "CodeIndexEngineV2",
+			workspacePath: this.workspacePath,
+		})
+
+		try {
+			await this.metadataReadStore.initialize()
+			const workspaceId = this.metadataReadStore.getWorkspaceId()
+			const [indexedFiles, indexedChunks, trackedFiles, runSummaries, recentRuns, warningPage] =
+				await Promise.all([
+					this.metadataReadStore.countActiveIndexedFilesForWorkspace(workspaceId),
+					this.metadataReadStore.countActiveChunksForWorkspace(workspaceId),
+					this.metadataReadStore.countTrackedFilesForWorkspace(workspaceId),
+					this.metadataReadStore.listRunSummaries(1),
+					this.metadataReadStore.listRecentRunProgress(1),
+					this.metadataReadStore.listRevisionWarnings(workspaceId, 8, 0),
+				])
+			const latestRun = this.selectStandbyRunContext(runSummaries[0], recentRuns[0])
+			const currentOperationalStateAvailable =
+				indexedFiles > 0 || indexedChunks > 0 || trackedFiles > 0 || (warningPage.total ?? 0) > 0
+			if (!currentOperationalStateAvailable) {
+				IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "standby-status-hydrate-empty", {
+					component: "CodeIndexEngineV2",
+					workspacePath: this.workspacePath,
+					latestRunId: latestRun?.runId,
+				})
+				return false
+			}
+
+			const latestRunIncomplete = latestRun != null && latestRun.state !== "complete"
+			const triggerRunMode = this.getStandbyRunMode(latestRun, indexedFiles, indexedChunks)
+			const currentTotalFiles = Math.max(indexedFiles, trackedFiles, 0)
+			const historicalRunTotalFiles = Math.max(
+				latestRun?.filesScanned ?? 0,
+				latestRun?.discoveredFiles ?? 0,
+				latestRun?.progress?.filesDiscovered ?? 0,
+				latestRun?.progress?.filesHashed ?? 0,
+				0,
+			)
+			const totalFiles = currentTotalFiles > 0 ? currentTotalFiles : historicalRunTotalFiles
+			const outstandingVectorChunks = this.getStandbyOutstandingVectorChunks(latestRun)
+			const hasResumableStandbyWork =
+				latestRunIncomplete && (indexedFiles > 0 || indexedChunks > 0 || outstandingVectorChunks > 0)
+			this._standbyHasResumableWork = hasResumableStandbyWork
+			const knownTotalChunks = latestRunIncomplete
+				? outstandingVectorChunks > 0
+					? indexedChunks + outstandingVectorChunks
+					: 0
+				: Math.max(
+						indexedChunks,
+						latestRun?.syncedChunks ?? 0,
+						latestRun?.upsertedChunks ?? 0,
+						latestRun?.parsedChunks ?? 0,
+						0,
+					)
+			const warningItems = warningPage.items ?? []
+			const parserFailureCount = warningItems.filter((item) => item.category === "parser_failed").length
+			const failedRevisionCount = warningItems.filter((item) => item.category === "failed").length
+			const degradedRevisionCount = warningItems.filter((item) => item.category === "degraded").length
+			const latestRunInterrupted = latestRunIncomplete
+			const phaseTimingMs = this.buildPhaseTimingSnapshot({
+				discoveryMs: latestRun?.discoveryMs ?? undefined,
+				fileChecksMs: latestRun?.statHashMs ?? undefined,
+				parseMs: latestRun?.parseChunkMs ?? undefined,
+				planMs: latestRun?.diffPlanningMs ?? undefined,
+				embedSyncMs: latestRun?.embedUpsertMs ?? undefined,
+				cleanupMs: latestRun?.deletedChunks && latestRun.deletedChunks > 0 ? (latestRun.embedUpsertMs ?? 0) : 0,
+			})
+			const snapshot = this.buildStandbyPipelineSnapshot({
+				runMode: triggerRunMode,
+				indexedFiles,
+				totalFiles,
+				syncedChunks: indexedChunks,
+				knownTotalChunks,
+				latestRun,
+				latestRunInterrupted,
+				outstandingVectorChunks,
+				warningCount: warningPage.total ?? warningItems.length,
+				parserFailureCount,
+				failedRevisionCount,
+				degradedRevisionCount,
+				phaseTimingMs,
+			})
+			snapshot.runtime = this.buildRuntimeSnapshot()
+
+			this.stateManager.setResilienceStats({
+				retryingParseRevisions: latestRun?.retryingParseRevisions ?? 0,
+				terminalFailedParseRevisions: Math.max(
+					latestRun?.terminalFailedParseRevisions ?? 0,
+					parserFailureCount,
+				),
+				degradedRevisions: Math.max(latestRun?.degradedRevisions ?? 0, degradedRevisionCount),
+				terminalFailedRevisions: Math.max(latestRun?.terminalFailedRevisions ?? 0, failedRevisionCount),
+				retryingChunks: latestRun?.retryingChunks ?? 0,
+				terminallyFailedChunks: latestRun?.terminalFailedChunks ?? 0,
+				warningDetails: warningItems,
+			})
+			const message =
+				latestRunIncomplete && (indexedFiles > 0 || indexedChunks > 0)
+					? `V2 index has resumable progress across ${indexedFiles.toLocaleString()} files`
+					: indexedFiles > 0
+						? `V2 index ready across ${indexedFiles.toLocaleString()} files`
+						: "Code Index V2 is ready to start."
+			this.stateManager.setStandbyPipelineSnapshot(snapshot, message)
+			if (hasResumableStandbyWork) {
+				this.setMetadataCleanupTaskState("skipped", {
+					detail: "Resumable indexing work exists, so metadata cleanup is deferred.",
+				})
+				IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-footprint-cleanup-deferred", {
+					component: "CodeIndexEngineV2",
+					workspacePath: this.workspacePath,
+					reason: "resumable-work",
+					latestRunId: latestRun?.runId,
+					latestRunState: latestRun?.state,
+					indexedFiles,
+					indexedChunks,
+					outstandingVectorChunks,
+				})
+			} else {
+				this.scheduleIdleMetadataFootprintCleanup()
+			}
+			this._status = {
+				engine: this.engine,
+				state: "idle",
+				message,
+			}
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "standby-status-hydrated", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				indexedFiles,
+				totalFiles,
+				syncedChunks: indexedChunks,
+				knownTotalChunks,
+				latestRunId: latestRun?.runId,
+				latestRunState: latestRun?.state,
+				latestRunSource: latestRun?.source,
+				runMode: triggerRunMode,
+				outstandingVectorChunks,
+				warningCount: warningPage.total ?? warningItems.length,
+			})
+			return true
+		} catch (error) {
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "standby-status-hydrate-failed", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				errorMessage: error instanceof Error ? error.message : String(error),
+			})
+			await this.metadataReadStore.dispose().catch(() => undefined)
+			return false
+		}
 	}
 
 	async start(): Promise<void> {
@@ -186,6 +1011,20 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			return
 		}
 
+		this.cancelIdleMetadataFootprintCleanup()
+		if (this._idleMetadataFootprintCleanupInFlight) {
+			this.setMetadataCleanupTaskState("skipped", {
+				detail: "Manual indexing start preempted idle metadata cleanup.",
+			})
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-footprint-cleanup-preempted", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				reason: "manual-start",
+			})
+			const maintenancePromise = this._metadataMaintenancePromise
+			await this.metadataStore.dispose().catch(() => undefined)
+			await maintenancePromise?.catch(() => undefined)
+		}
 		this._stopRequested = false
 		this._started = true
 		this._status = {
@@ -213,9 +1052,6 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			this._staleRunIdsToResume = staleRunCleanup.staleRunIds
 			this._resumedRetryJobsCount = 0
 			this._resumedPendingJobsCount = 0
-			if (staleRunCleanup.staleRunIds.length > 0) {
-				this.stateManager.setRecoveryContext("stale_recovery", "reusable_revisions")
-			}
 			if (staleRunCleanup.staleRunsMarkedFailed > 0) {
 				IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "stale-v2-runs-cleaned", {
 					component: "CodeIndexEngineV2",
@@ -229,6 +1065,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				message: "Preparing the workspace map",
 			}
 			this.stateManager.startIndexingTimer()
+			if (staleRunCleanup.staleRunIds.length > 0) {
+				this.stateManager.setRecoveryContext("stale_recovery", "reusable_revisions")
+			}
 			this.stateManager.reportCustomProgress("Preparing the workspace map", 0, 1, {
 				currentItemUnit: "phases",
 				phase: "scanning",
@@ -271,7 +1110,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				)
 			}
 			if (this.isMetadataSidecarRuntimeError(error)) {
-				await this.metadataStore.dispose().catch(() => undefined)
+				await Promise.allSettled([
+					this.metadataStore.dispose().catch(() => undefined),
+					this.metadataReadStore.dispose().catch(() => undefined),
+				])
 			}
 			if (this.isAbortError(error) && this._stopRequested) {
 				return
@@ -301,6 +1143,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 	}
 
 	async stop(): Promise<void> {
+		this.cancelIdleMetadataFootprintCleanup()
 		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "stop-requested", {
 			engine: this.engine,
 			workspacePath: this.workspacePath,
@@ -352,8 +1195,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		await this.performMetadataMaintenance({
 			checkpointMode: "TRUNCATE",
 			shrinkMemory: true,
+			pruneFootprint: false,
 		}).catch(() => undefined)
-		await this.metadataStore.dispose()
+		await Promise.allSettled([this.metadataStore.dispose(), this.metadataReadStore.dispose()])
 		this._started = false
 		this._activeAbortController = undefined
 		this._status = {
@@ -376,8 +1220,156 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		await this.performClear(true)
 	}
 
+	async compactMetadataDatabase(): Promise<CodeIndexMetadataCompactionResult> {
+		let result: CodeIndexMetadataCompactionResult | undefined
+		await this.runSerialized(async () => {
+			result = await this.performMetadataCompaction()
+		})
+		if (!result) {
+			throw new Error("Metadata compaction did not produce a result.")
+		}
+		return result
+	}
+
+	private async performMetadataCompaction(): Promise<CodeIndexMetadataCompactionResult> {
+		const availability = this.getMetadataCompactionAvailability()
+		if (!availability.visible || !availability.enabled) {
+			throw new Error(availability.reason ?? "Metadata DB compaction is not available yet.")
+		}
+
+		this.cancelIdleMetadataFootprintCleanup()
+		const previousSummary = this._metadataCleanupLastSummary
+		const writerDiagnostics = this.metadataWriterClient.getDiagnosticsSnapshot()
+		const estimatedReclaimableBytes =
+			previousSummary?.footprintPrune?.estimatedReclaimableBytesAfter ??
+			previousSummary?.footprintPrune?.estimatedReclaimableBytesBefore ??
+			0
+
+		this._metadataCompactionInFlight = true
+		this.setMetadataCleanupTaskState("running", {
+			summaryText: "Compacting metadata DB file",
+			detail: "Compacting the metadata DB file. Search and UI metadata reads are paused until compaction finishes.",
+		})
+		IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-compaction-start", {
+			component: "CodeIndexEngineV2",
+			workspacePath: this.workspacePath,
+			estimatedReclaimableBytes,
+			writerPid: writerDiagnostics.pid ?? null,
+			sidecarRole: "writer",
+			sidecarLabel: writerDiagnostics.label,
+		})
+
+		try {
+			await this.metadataReadStore.dispose().catch(() => undefined)
+			const maintenanceSummary = (await this.performMetadataMaintenance({
+				checkpointMode: "TRUNCATE",
+				shrinkMemory: true,
+				pruneFootprint: false,
+				vacuumMode: "full",
+			})) as MetadataMaintenanceSummary | undefined
+			const compaction = maintenanceSummary?.compaction
+			if (!compaction) {
+				throw new Error("Metadata compaction completed without a compaction summary.")
+			}
+			const summary = this.mergeCompactionSummary(previousSummary, maintenanceSummary)
+			this.setMetadataCleanupTaskState("complete", {
+				summary,
+				summaryText: "Metadata DB file compacted",
+				detail: `Metadata DB compaction complete. Reclaimed ${this.formatCompactBytes(compaction.reclaimedBytes)}.`,
+			})
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-compaction-complete", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				estimatedReclaimableBytes,
+				operationalDbBytesBefore: compaction.operationalDbBytesBefore,
+				operationalDbBytesAfter: compaction.operationalDbBytesAfter,
+				operationalWalBytesBefore: compaction.operationalWalBytesBefore,
+				operationalWalBytesAfter: compaction.operationalWalBytesAfter,
+				reclaimedBytes: compaction.reclaimedBytes,
+				requiredFreeBytes: compaction.requiredFreeBytes,
+				availableFreeBytesBefore: compaction.availableFreeBytesBefore,
+				availableFreeBytesAfter: compaction.availableFreeBytesAfter,
+				elapsedMs: compaction.elapsedMs,
+				writerPid: writerDiagnostics.pid ?? null,
+				sidecarRole: "writer",
+				sidecarLabel: writerDiagnostics.label,
+			})
+			await this.recycleMetadataWriterAfterCompaction(writerDiagnostics)
+			return compaction
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error)
+			this.setMetadataCleanupTaskState("failed", {
+				summaryText: "Metadata DB compaction failed",
+				detail: "Metadata DB compaction failed. Indexing/search state is preserved.",
+				errorMessage,
+			})
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-compaction-failed", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				estimatedReclaimableBytes,
+				errorMessage,
+				writerPid: writerDiagnostics.pid ?? null,
+				sidecarRole: "writer",
+				sidecarLabel: writerDiagnostics.label,
+			})
+			throw error
+		} finally {
+			this._metadataCompactionInFlight = false
+			this.publishRuntimeSnapshot()
+		}
+	}
+
+	private async recycleMetadataWriterAfterCompaction(
+		writerDiagnostics: MetadataSidecarClientDiagnostics,
+	): Promise<void> {
+		try {
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-compaction-recycling-writer", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				writerPid: writerDiagnostics.pid ?? null,
+				sidecarRole: "writer",
+				sidecarLabel: writerDiagnostics.label,
+			})
+			await this.metadataStore.dispose()
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-compaction-writer-recycled", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				writerPid: writerDiagnostics.pid ?? null,
+				sidecarRole: "writer",
+				sidecarLabel: writerDiagnostics.label,
+			})
+		} catch (error) {
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-compaction-writer-recycle-failed", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				writerPid: writerDiagnostics.pid ?? null,
+				sidecarRole: "writer",
+				sidecarLabel: writerDiagnostics.label,
+				errorMessage: error instanceof Error ? error.message : String(error),
+			})
+		}
+	}
+
+	private mergeCompactionSummary(
+		previousSummary: MetadataMaintenanceSummary | undefined,
+		maintenanceSummary: MetadataMaintenanceSummary,
+	): MetadataMaintenanceSummary {
+		if (!previousSummary?.footprintPrune || maintenanceSummary.footprintPrune) {
+			return maintenanceSummary
+		}
+		return {
+			...maintenanceSummary,
+			footprintPrune: {
+				...previousSummary.footprintPrune,
+				freelistPagesAfter: 0,
+				estimatedReclaimableBytesAfter: 0,
+			},
+		}
+	}
+
 	private async performClear(includeTelemetry: boolean): Promise<void> {
 		await this.runSerialized(async () => {
+			this.cancelIdleMetadataFootprintCleanup()
 			IndexDebugLoggerV2.log(
 				"basic",
 				"CodeIndexEngineV2",
@@ -439,10 +1431,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					await this.performMetadataMaintenance({
 						checkpointMode: "TRUNCATE",
 						shrinkMemory: true,
+						pruneFootprint: false,
 					})
 					await this.metadataStore.clearStorage({ includeTelemetry })
 				} finally {
-					await this.metadataStore.dispose()
+					await Promise.allSettled([this.metadataStore.dispose(), this.metadataReadStore.dispose()])
 				}
 				this._workspaceAdapter = undefined
 				this._started = false
@@ -488,74 +1481,89 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return this.buildSearchTrace(query, limit)
 	}
 
+	private assertMetadataReadsAvailable(operation: string): void {
+		if (!this._metadataCompactionInFlight) {
+			return
+		}
+		throw new Error(
+			`Metadata DB compaction is running; ${operation} is temporarily unavailable until compaction completes.`,
+		)
+	}
+
 	private async buildSearchTrace(
 		query: string,
 		limit: number,
 		options?: { directoryPrefix?: string },
 	): Promise<CodeIndexDebugSearchTrace> {
+		this.assertMetadataReadsAvailable("search")
+		this.publishRuntimeSnapshot()
 		const traceStartedAt = Date.now()
-		const { embeddingAdapter, vectorStore } = this.getOrCreateSearchDependencies()
-		await vectorStore.initialize()
-		const embeddingStartedAt = Date.now()
-		const embeddingResponse = await embeddingAdapter.createEmbeddings([query], { isQuery: true })
-		this.maybePersistAdaptiveRuntimeState(embeddingResponse.adaptiveControllerState)
-		const queryEmbeddingMs = Date.now() - embeddingStartedAt
-		const vector = embeddingResponse.embeddings[0]
-		const normalizedDirectoryPrefix = this.normalizeDirectoryPrefix(options?.directoryPrefix)
-		const candidateLimit = this.computeSearchCandidateLimit(limit, normalizedDirectoryPrefix)
-		const queryTokens = this.tokenizeSearchText(query)
-		const queryIntent = this.parseQueryIntent(query)
-		const lexicalQuery = this.buildExpandedLexicalQuery(query, queryIntent)
+		try {
+			const { embeddingAdapter, vectorStore } = this.getOrCreateSearchDependencies()
+			await vectorStore.initialize()
+			const embeddingStartedAt = Date.now()
+			const embeddingResponse = await embeddingAdapter.createEmbeddings([query], { isQuery: true })
+			this.maybePersistAdaptiveRuntimeState(embeddingResponse.adaptiveControllerState)
+			const queryEmbeddingMs = Date.now() - embeddingStartedAt
+			const vector = embeddingResponse.embeddings[0]
+			const normalizedDirectoryPrefix = this.normalizeDirectoryPrefix(options?.directoryPrefix)
+			const candidateLimit = this.computeSearchCandidateLimit(limit, normalizedDirectoryPrefix)
+			const queryTokens = this.tokenizeSearchText(query)
+			const queryIntent = this.parseQueryIntent(query)
+			const lexicalQuery = this.buildExpandedLexicalQuery(query, queryIntent)
 
-		const vectorStartedAt = Date.now()
-		const vectorResults = vector
-			? await vectorStore.search(vector, candidateLimit, this.configManager.currentSearchMinScore)
-			: []
-		const vectorRetrievalMs = Date.now() - vectorStartedAt
-		const lexicalMode = this.determineLexicalSearchMode(queryTokens, queryIntent)
-		const {
-			results: lexicalResults,
-			lexicalFtsMs,
-			lexicalFallbackMs,
-			lexicalRetrievalMs,
-			lexicalStatus,
-		} = await this.runLexicalSearch(lexicalQuery, candidateLimit, lexicalMode)
-		const scopedVectorResults = this.filterResultsByDirectoryPrefix(vectorResults, normalizedDirectoryPrefix)
-		const scopedLexicalResults = this.filterResultsByDirectoryPrefix(lexicalResults, normalizedDirectoryPrefix)
-		const mergeStartedAt = Date.now()
-		const mergedResults = this.mergeSearchCandidates(queryIntent, scopedVectorResults, scopedLexicalResults)
-		const mergeMs = Date.now() - mergeStartedAt
-		const rerankStartedAt = Date.now()
-		const rerankedResults = this.rerankSearchResults(query, queryIntent, mergedResults)
-		const rerankMs = Date.now() - rerankStartedAt
-		const expansionStartedAt = Date.now()
-		const finalResults = await this.expandSearchResultsWithParents(rerankedResults, limit)
-		const expansionMs = Date.now() - expansionStartedAt
-		const totalMs = Date.now() - traceStartedAt
-
-		return {
-			query,
-			limit,
-			candidateLimit,
-			lexicalStatus,
-			lexicalMode,
-			timingsMs: {
-				queryEmbeddingMs,
-				vectorRetrievalMs,
+			const vectorStartedAt = Date.now()
+			const vectorResults = vector
+				? await vectorStore.search(vector, candidateLimit, this.configManager.currentSearchMinScore)
+				: []
+			const vectorRetrievalMs = Date.now() - vectorStartedAt
+			const lexicalMode = this.determineLexicalSearchMode(queryTokens, queryIntent)
+			const {
+				results: lexicalResults,
 				lexicalFtsMs,
 				lexicalFallbackMs,
 				lexicalRetrievalMs,
-				mergeMs,
-				rerankMs,
-				expansionMs,
-				totalMs,
-			},
-			stages: {
-				vector: [...scopedVectorResults],
-				lexical: [...scopedLexicalResults],
-				merged: [...mergedResults],
-				final: [...finalResults],
-			},
+				lexicalStatus,
+			} = await this.runLexicalSearch(lexicalQuery, candidateLimit, lexicalMode)
+			const scopedVectorResults = this.filterResultsByDirectoryPrefix(vectorResults, normalizedDirectoryPrefix)
+			const scopedLexicalResults = this.filterResultsByDirectoryPrefix(lexicalResults, normalizedDirectoryPrefix)
+			const mergeStartedAt = Date.now()
+			const mergedResults = this.mergeSearchCandidates(queryIntent, scopedVectorResults, scopedLexicalResults)
+			const mergeMs = Date.now() - mergeStartedAt
+			const rerankStartedAt = Date.now()
+			const rerankedResults = this.rerankSearchResults(query, queryIntent, mergedResults)
+			const rerankMs = Date.now() - rerankStartedAt
+			const expansionStartedAt = Date.now()
+			const finalResults = await this.expandSearchResultsWithParents(rerankedResults, limit)
+			const expansionMs = Date.now() - expansionStartedAt
+			const totalMs = Date.now() - traceStartedAt
+
+			return {
+				query,
+				limit,
+				candidateLimit,
+				lexicalStatus,
+				lexicalMode,
+				timingsMs: {
+					queryEmbeddingMs,
+					vectorRetrievalMs,
+					lexicalFtsMs,
+					lexicalFallbackMs,
+					lexicalRetrievalMs,
+					mergeMs,
+					rerankMs,
+					expansionMs,
+					totalMs,
+				},
+				stages: {
+					vector: [...scopedVectorResults],
+					lexical: [...scopedLexicalResults],
+					merged: [...mergedResults],
+					final: [...finalResults],
+				},
+			}
+		} finally {
+			this.publishRuntimeSnapshot()
 		}
 	}
 
@@ -580,9 +1588,13 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			}
 		}
 
-		const lexicalResponse = await this.metadataStore.searchActiveChunksLexicallyWithStatus(query, candidateLimit, {
-			allowExactFallback: lexicalMode === "fts_plus_exact_fallback",
-		})
+		const lexicalResponse = await this.metadataReadStore.searchActiveChunksLexicallyWithStatus(
+			query,
+			candidateLimit,
+			{
+				allowExactFallback: lexicalMode === "fts_plus_exact_fallback",
+			},
+		)
 
 		return {
 			results: lexicalResponse.results.map((chunk) => this.createLexicalSearchResult(chunk)),
@@ -1290,8 +2302,8 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			})
 			.filter((reference): reference is { relativePath: string; chunkFingerprint: string } => Boolean(reference))
 
-		const parentChunks = await this.metadataStore.getActiveChunksByFingerprints(parentReferences)
-		const activeFileChunks = await this.metadataStore.getActiveChunksByRelativePaths(
+		const parentChunks = await this.metadataReadStore.getActiveChunksByFingerprints(parentReferences)
+		const activeFileChunks = await this.metadataReadStore.getActiveChunksByRelativePaths(
 			results
 				.map((result) => result.payload?.filePath)
 				.filter((filePath): filePath is string => Boolean(filePath)),
@@ -2001,8 +3013,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			failureReason?: string | null
 		}>
 	}> {
-		const workspaceId = this.metadataStore.getWorkspaceId()
-		const details = await this.metadataStore.listRevisionWarnings(workspaceId, limit, offset, filter, sort)
+		this.assertMetadataReadsAvailable("warning details")
+		const workspaceId = this.metadataReadStore.getWorkspaceId()
+		const details = await this.metadataReadStore.listRevisionWarnings(workspaceId, limit, offset, filter, sort)
 		return {
 			total: details.total,
 			items: details.items.map((detail) => ({
@@ -2032,8 +3045,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			lastEvaluatedAt: number
 		}>
 	}> {
-		const workspaceId = this.metadataStore.getWorkspaceId()
-		const details = (await this.metadataStore.listTrackedOversizedFiles?.(workspaceId, limit, offset)) ?? {
+		this.assertMetadataReadsAvailable("oversized file details")
+		const workspaceId = this.metadataReadStore.getWorkspaceId()
+		const details = (await this.metadataReadStore.listTrackedOversizedFiles?.(workspaceId, limit, offset)) ?? {
 			total: 0,
 			actionable: 0,
 			items: [],
@@ -2297,11 +3311,22 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		const runStartedAt = Date.now()
 		const workspaceAdapter = this.requireWorkspaceAdapter()
 		const isRefresh = mode === "refresh"
+		const progressBaseline = await this.getWorkspaceProgressBaseline()
+		const recoveredTiming = await this.getRecoveredRunTimingContext({
+			hasRecoveredBaseline:
+				progressBaseline.baselineIndexedFiles > 0 || progressBaseline.baselineIndexedChunks > 0,
+		})
+		const resolvedRunMode = this.getEffectivePipelineRunMode({
+			baseRunMode: isRefresh ? "refresh" : "initial-discovery",
+			baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+			baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+			previousRunInterrupted: recoveredTiming.previousRunInterrupted,
+		})
 		let summary: Awaited<ReturnType<DiscoveryService["runWorkspaceDiscoveryWithProgress"]>> | undefined
 		let pipelineSummary: Awaited<ReturnType<CodeIndexEngineV2["runPipelineForRun"]>> | undefined
 
 		try {
-			this.stateManager.beginPipelineRun(isRefresh ? "refresh" : "initial-discovery")
+			this.stateManager.beginPipelineRun(resolvedRunMode)
 			await this.preflightIndexingDependencies(signal)
 			const discoveryService = new DiscoveryService(this.metadataStore, workspaceAdapter)
 			const discoveryMessage = isRefresh ? "Refreshing the workspace map" : "Walking the workspace"
@@ -2351,11 +3376,32 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				)
 			}
 			const updateDiscoveryPipelineSnapshot = (state: "running" | "completed") => {
-				this.stateManager.setPipelineSnapshot(
+				const elapsedMs = Date.now() - runStartedAt
+				this.setPipelineSnapshot(
 					{
-						runMode: isRefresh ? "refresh" : "initial-discovery",
+						runMode: resolvedRunMode,
 						overallState: "running",
 						etaMs: null,
+						elapsedMs,
+						recoveredElapsedMs: recoveredTiming.recoveredElapsedMs,
+						investedElapsedMs: elapsedMs + recoveredTiming.recoveredElapsedMs,
+						baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+						baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+						baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+						phaseTimingMs: this.buildPhaseTimingSnapshot({
+							discoveryMs: state === "completed" ? elapsedMs : Date.now() - runStartedAt,
+						}),
+						codebaseProgress: this.buildCodebaseProgressSnapshot({
+							baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+							baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+							baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+							totalFiles: Math.max(getDiscoveryEstimate(), discoveredFiles, 0),
+							committedFiles: 0,
+							syncedChunks: 0,
+							knownTotalChunks: progressBaseline.baselineIndexedChunks,
+							fileTotalKind: state === "completed" ? "exact" : "estimated",
+							chunkTotalKind: progressBaseline.baselineIndexedChunks > 0 ? "available" : "exact",
+						}),
 						services: this.buildPipelineServicesSnapshot({
 							discovery: {
 								state,
@@ -2387,13 +3433,22 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										"estimate",
 										"Estimate",
 										`~${getDiscoveryEstimate().toLocaleString()}`,
+										"neutral",
+										"detail",
 									),
-									this.createServiceMetric("dirs", "Dirs", processedDirectories.toLocaleString()),
+									this.createServiceMetric(
+										"dirs",
+										"Dirs",
+										processedDirectories.toLocaleString(),
+										"neutral",
+										"detail",
+									),
 									this.createServiceMetric(
 										"confidence",
 										"Confidence",
 										getDiscoveryConfidence(),
 										"neutral",
+										"detail",
 									),
 								],
 							},
@@ -2439,7 +3494,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				summary.runId,
 				summary.discoveredFiles,
 				undefined,
-				{ runMode: isRefresh ? "refresh" : "initial-discovery" },
+				{ runMode: resolvedRunMode, discoveryMs },
 				signal,
 			)
 			const totalRunMs = Date.now() - runStartedAt
@@ -2583,7 +3638,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				errorMessage: this.getStopAwareErrorMessage(error),
 			})
 			if (this.isMetadataSidecarRuntimeError(error)) {
-				await this.metadataStore.dispose().catch(() => undefined)
+				await Promise.allSettled([
+					this.metadataStore.dispose().catch(() => undefined),
+					this.metadataReadStore.dispose().catch(() => undefined),
+				])
 			}
 			throw error
 		}
@@ -2868,7 +3926,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				}).catch(() => undefined)
 			}
 			if (this.isMetadataSidecarRuntimeError(error)) {
-				await this.metadataStore.dispose().catch(() => undefined)
+				await Promise.allSettled([
+					this.metadataStore.dispose().catch(() => undefined),
+					this.metadataReadStore.dispose().catch(() => undefined),
+				])
 			}
 			throw error
 		}
@@ -2880,7 +3941,8 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		relativePaths?: string[],
 		options?: {
 			isBackgroundReconcile?: boolean
-			runMode?: "initial-discovery" | "refresh" | "reconcile"
+			runMode?: IndexingPipelineRunMode
+			discoveryMs?: number
 		},
 		signal?: AbortSignal,
 	): Promise<{
@@ -2954,11 +4016,14 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		const pipelineStartedAt = Date.now()
 		const workspaceAdapter = this.requireWorkspaceAdapter()
 		await this.retireExcludedTrackedFilesBeforeStatHash(workspaceAdapter, relativePaths)
+		const progressBaseline = await this.getWorkspaceProgressBaseline()
+		const recoveredTiming = await this.getRecoveredRunTimingContext({
+			hasRecoveredBaseline:
+				progressBaseline.baselineIndexedFiles > 0 || progressBaseline.baselineIndexedChunks > 0,
+		})
+		let resumedReusableRevisionCount = 0
 		const statHashService = new StatHashService(this.metadataStore, workspaceAdapter)
-		const baselineIndexedFiles = await this.metadataStore.countActiveIndexedFilesForWorkspace(
-			this.metadataStore.getWorkspaceId(),
-		)
-		const hasComparableBaseline = baselineIndexedFiles > 0
+		const hasComparableBaseline = progressBaseline.baselineIndexedFiles > 0
 		const statHashStage = hasComparableBaseline ? "comparing_signatures" : "hashing_initial"
 		const statHashHeadline = hasComparableBaseline ? "Comparing file signatures" : "Preparing files for indexing"
 		this._status = {
@@ -3015,15 +4080,42 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			}
 			return "low"
 		}
+		const getPipelineRunMode = (): IndexingPipelineRunMode =>
+			this.getEffectivePipelineRunMode({
+				baseRunMode: options?.runMode ?? "unknown",
+				baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+				baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+				previousRunInterrupted: recoveredTiming.previousRunInterrupted,
+				reusedParsedRevisionCount: resumedReusableRevisionCount,
+			})
 		const updateStatHashPipelineSnapshot = (state: "running" | "completed", forceImmediate = false) => {
-			this.stateManager.setPipelineSnapshot(
+			const totalFiles = Math.max(knownTotalFiles ?? checkedFiles, checkedFiles, 1)
+			const elapsedMs = Date.now() - pipelineStartedAt
+			this.setPipelineSnapshot(
 				{
-					runMode:
-						this._resumedRetryJobsCount > 0 || this._resumedPendingJobsCount > 0
-							? "resume"
-							: (options?.runMode ?? "unknown"),
+					runMode: getPipelineRunMode(),
 					overallState: state === "completed" ? "running" : "running",
 					etaMs: this.stateManager.getCurrentStatus().estimatedTimeRemainingMs ?? null,
+					elapsedMs,
+					recoveredElapsedMs: recoveredTiming.recoveredElapsedMs,
+					investedElapsedMs: elapsedMs + recoveredTiming.recoveredElapsedMs,
+					baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+					baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+					baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+					phaseTimingMs: this.buildPhaseTimingSnapshot({
+						discoveryMs: options?.discoveryMs,
+						fileChecksMs: Date.now() - pipelineStartedAt,
+					}),
+					codebaseProgress: this.buildCodebaseProgressSnapshot({
+						baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+						baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+						baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+						totalFiles,
+						committedFiles: 0,
+						syncedChunks: 0,
+						knownTotalChunks: progressBaseline.baselineIndexedChunks,
+						chunkTotalKind: progressBaseline.baselineIndexedChunks > 0 ? "available" : "exact",
+					}),
 					services: this.buildPipelineServicesSnapshot({
 						discovery: {
 							state: "completed",
@@ -3048,33 +4140,29 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 							summary: state === "completed" ? "File checks completed" : "Checking file signatures",
 							detail: `${changedFiles.toLocaleString()} changed • ${unchangedFiles.toLocaleString()} unchanged`,
 							progressCurrent: Math.max(checkedFiles, 0),
-							progressTotal: Math.max(knownTotalFiles ?? checkedFiles, checkedFiles, 1),
+							progressTotal: totalFiles,
 							progressUnit: "files",
 							progressPercent:
 								state === "completed"
 									? 100
-									: Math.min(
-											99,
-											Math.round(
-												(checkedFiles /
-													Math.max(knownTotalFiles ?? checkedFiles, checkedFiles, 1)) *
-													100,
-											),
-										),
+									: Math.min(99, Math.round((checkedFiles / totalFiles) * 100)),
 							metrics: [
 								this.createServiceMetric("changed", "Changed", changedFiles.toLocaleString()),
 								this.createServiceMetric("unchanged", "Unchanged", unchangedFiles.toLocaleString()),
+								this.createServiceMetric("elapsed", "Elapsed", this.formatCompactDuration(elapsedMs)),
 								this.createServiceMetric(
 									"oversized",
 									"Oversized",
 									oversizedFiles.toLocaleString(),
 									oversizedFiles > 0 ? "warning" : "neutral",
+									this.getDiagnosticMetricVisibility(oversizedFiles),
 								),
 								this.createServiceMetric(
 									"missing",
 									"Missing",
 									missingFiles.toLocaleString(),
 									missingFiles > 0 ? "warning" : "neutral",
+									this.getDiagnosticMetricVisibility(missingFiles),
 								),
 							],
 						},
@@ -3310,6 +4398,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			updateStatHashPipelineSnapshot("completed", true)
 		}
 		if (statHashSummary.changedFiles === 0 && this._resumedPendingJobsCount === 0) {
+			const elapsedMs = Date.now() - pipelineStartedAt
 			this.setSuccessfulCompletedPipelineSnapshot({
 				runMode:
 					this._resumedRetryJobsCount > 0 || this._resumedPendingJobsCount > 0
@@ -3332,6 +4421,36 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				terminalFailedRevisions: 0,
 				retryingChunks: 0,
 				terminallyFailedChunks: 0,
+				elapsedMs,
+				recoveredElapsedMs: recoveredTiming.recoveredElapsedMs,
+				investedElapsedMs: elapsedMs + recoveredTiming.recoveredElapsedMs,
+				baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+				baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+				baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+				phaseTimingMs: this.buildPhaseTimingSnapshot({
+					discoveryMs: options?.discoveryMs,
+					fileChecksMs: statHashMs,
+					parseMs: 0,
+					planMs: 0,
+					embedSyncMs: 0,
+					cleanupMs: 0,
+				}),
+				codebaseProgress: this.buildCodebaseProgressSnapshot({
+					baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+					baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+					baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+					totalFiles: Math.max(statHashSummary.checkedFiles, 1),
+					committedFiles: 0,
+					syncedChunks: 0,
+					knownTotalChunks: Math.max(
+						progressBaseline.baselineIndexedChunks,
+						progressBaseline.baselineSyncedChunks,
+					),
+					chunkTotalKind:
+						Math.max(progressBaseline.baselineIndexedChunks, progressBaseline.baselineSyncedChunks) > 0
+							? "available"
+							: "exact",
+				}),
 			})
 			await this.metadataStore.markRunComplete(runId)
 			this.logPipelineTerminalEvent("run-complete", runId, {
@@ -3391,6 +4510,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			const runHeartbeatOwner = `engine:${process.pid}:${runId}`
 			let parsedRevisionsCompleted = 0
 			let parsedChunksCompleted = 0
+			let committedRevisionsCompleted = 0
 			let retryingParseRevisions = 0
 			let terminalFailedParseRevisions = 0
 			let syncedChunksCompleted = 0
@@ -3438,6 +4558,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						batchesCompleted?: number
 						retryingChunks?: number
 						terminallyFailedChunks?: number
+						committedRevisions?: number
 						degradedRevisions?: number
 						terminalFailedRevisions?: number
 						laneConcurrency?: number
@@ -3503,15 +4624,16 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 						}
 					>
 				}
+				const metadataSidecarMetrics = this.getTrackedMetadataSidecarMetrics(tracked)
 				return {
 					totalTrackedRssMB: tracked.totalTrackedRssMB ?? 0,
 					parseSidecarRssMB: tracked.byGroup?.parseSidecars?.totalRssMB ?? 0,
 					embedSidecarRssMB: tracked.byGroup?.embedSidecars?.totalRssMB ?? 0,
-					metadataSidecarRssMB: tracked.byGroup?.metadataSidecar?.totalRssMB ?? 0,
-					metadataSidecarCpuPercent: tracked.byGroup?.metadataSidecar?.totalCpuPercent ?? 0,
-					metadataSidecarHeapUsedMB: tracked.byGroup?.metadataSidecar?.totalHeapUsedMB ?? 0,
-					metadataSidecarExternalMB: tracked.byGroup?.metadataSidecar?.totalExternalMB ?? 0,
-					metadataSidecarArrayBuffersMB: tracked.byGroup?.metadataSidecar?.totalArrayBuffersMB ?? 0,
+					metadataSidecarRssMB: metadataSidecarMetrics.totalRssMB,
+					metadataSidecarCpuPercent: metadataSidecarMetrics.totalCpuPercent,
+					metadataSidecarHeapUsedMB: metadataSidecarMetrics.totalHeapUsedMB,
+					metadataSidecarExternalMB: metadataSidecarMetrics.totalExternalMB,
+					metadataSidecarArrayBuffersMB: metadataSidecarMetrics.totalArrayBuffersMB,
 				}
 			}
 			const getDatabaseFootprint = async () => {
@@ -3533,14 +4655,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					telemetryWalBytes: await statBytes(`${telemetryDbPath}-wal`),
 				}
 			}
-			const getPipelineRunMode = (): IndexingPipelineRunMode =>
-				this._resumedRetryJobsCount > 0 || this._resumedPendingJobsCount > 0
-					? "resume"
-					: (options?.runMode ?? "unknown")
 			const syncPipelineSnapshot = (forceImmediate = false) => {
 				const runnableEmbedQueueDepth = this.getRunnableEmbedQueueDepth(latestBacklogMetrics)
 				const currentSyncedChunksCompleted = Math.max(syncedChunksCompleted, liveSyncedChunksCompleted)
 				const currentDeletedChunksCompleted = Math.max(deletedChunksCompleted, liveDeletedChunksCompleted)
+				const elapsedMs = Date.now() - pipelineStartedAt
 				const parseIssueCount =
 					retryingParseRevisions +
 					terminalFailedParseRevisions +
@@ -3591,43 +4710,77 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					? "critical"
 					: latestSyncTelemetry?.pressureState === "hard"
 						? "critical"
-						: latestSyncTelemetry?.pressureState === "soft" ||
-							  (latestSyncTelemetry?.retryingChunks ?? 0) > 0 ||
-							  embeddingUnderfed
+						: (latestSyncTelemetry?.retryingChunks ?? 0) > 0
 							? "watch"
 							: embedObserved
 								? "healthy"
 								: "unknown"
 				const vectorSyncHealth: IndexingHealthState = latestSyncTelemetry?.terminallyFailedChunks
 					? "critical"
-					: parseFinished && vectorSyncOutstandingWork
+					: (latestSyncTelemetry?.retryingChunks ?? 0) > 0 ||
+						  (latestSyncTelemetry?.degradedRevisions ?? 0) > 0 ||
+						  (latestSyncTelemetry?.terminalFailedRevisions ?? 0) > 0
 						? "watch"
 						: embedObserved
 							? "healthy"
 							: "unknown"
-				const cleanupHealth: IndexingHealthState =
-					planHasDeleteWork && currentDeletedChunksCompleted === 0 && parseFinished
-						? "watch"
-						: cleanupHasWork
-							? "healthy"
-							: "unknown"
+				const cleanupHealth: IndexingHealthState = cleanupHasWork ? "healthy" : "unknown"
 				const embedProgressTotal = Math.max(
 					parsedChunksCompleted,
 					currentSyncedChunksCompleted + latestBacklogMetrics.stagedChunks + runnableEmbedQueueDepth,
 					1,
 				)
 				const planProgressTotal = Math.max(parsedRevisionsCompleted, totalChangedFiles, 1)
+				const totalFiles = Math.max(knownTotalFiles ?? checkedFiles, checkedFiles, 1)
+				const committedFilesAvailable =
+					committedRevisionsCompleted + (latestSyncTelemetry?.degradedRevisions ?? 0)
+				const investedElapsedMs = elapsedMs + recoveredTiming.recoveredElapsedMs
+				const phaseTimingSnapshot = this.buildPhaseTimingSnapshot({
+					discoveryMs: options?.discoveryMs,
+					fileChecksMs: statHashMs,
+					parseMs: parseChunkMs,
+					planMs: diffPlanningMs,
+					embedSyncMs: embedUpsertMs,
+					cleanupMs: 0,
+				})
+				const knownTotalChunks = Math.max(
+					progressBaseline.baselineIndexedChunks,
+					progressBaseline.baselineSyncedChunks +
+						currentSyncedChunksCompleted +
+						latestBacklogMetrics.stagedChunks +
+						runnableEmbedQueueDepth,
+					parsedChunksCompleted,
+					currentSyncedChunksCompleted,
+				)
+				const codebaseProgress = this.buildCodebaseProgressSnapshot({
+					baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+					baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+					baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+					totalFiles,
+					committedFiles: committedFilesAvailable,
+					syncedChunks: currentSyncedChunksCompleted,
+					knownTotalChunks,
+					chunkTotalKind: parseFinished ? "exact" : "available",
+				})
 				const overallState =
 					parseFinished &&
 					this._resumedPendingJobsCount === 0 &&
 					this.isRunBacklogDrained(latestBacklogMetrics)
 						? "completed"
 						: "running"
-				this.stateManager.setPipelineSnapshot(
+				this.setPipelineSnapshot(
 					{
 						runMode: getPipelineRunMode(),
 						overallState,
 						etaMs: this.stateManager.getCurrentStatus().estimatedTimeRemainingMs ?? null,
+						elapsedMs,
+						recoveredElapsedMs: recoveredTiming.recoveredElapsedMs,
+						investedElapsedMs,
+						baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+						baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+						baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+						phaseTimingMs: phaseTimingSnapshot,
+						codebaseProgress,
 						services: this.buildPipelineServicesSnapshot({
 							discovery: {
 								state: "completed",
@@ -3644,6 +4797,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										Math.max(knownTotalFiles ?? 0, checkedFiles).toLocaleString(),
 									),
 									this.createServiceMetric("mode", "Mode", getPipelineRunMode()),
+									this.createServiceMetric(
+										"elapsed",
+										"Elapsed",
+										this.formatCompactDuration(phaseTimingSnapshot.discoveryMs),
+									),
 								],
 							},
 							file_checks: {
@@ -3668,16 +4826,23 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 									this.createServiceMetric("changed", "Changed", changedFiles.toLocaleString()),
 									this.createServiceMetric("unchanged", "Unchanged", unchangedFiles.toLocaleString()),
 									this.createServiceMetric(
+										"elapsed",
+										"Elapsed",
+										this.formatCompactDuration(phaseTimingSnapshot.fileChecksMs),
+									),
+									this.createServiceMetric(
 										"oversized",
 										"Oversized",
 										oversizedFiles.toLocaleString(),
 										oversizedFiles > 0 ? "warning" : "neutral",
+										this.getDiagnosticMetricVisibility(oversizedFiles),
 									),
 									this.createServiceMetric(
 										"missing",
 										"Missing",
 										missingFiles.toLocaleString(),
 										missingFiles > 0 ? "warning" : "neutral",
+										this.getDiagnosticMetricVisibility(missingFiles),
 									),
 								],
 							},
@@ -3708,26 +4873,29 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										parsedChunksCompleted.toLocaleString(),
 									),
 									this.createServiceMetric(
+										"elapsed",
+										"Elapsed",
+										this.formatCompactDuration(phaseTimingSnapshot.parseMs),
+									),
+									this.createServiceMetric(
 										"parseRetries",
 										"Retries",
 										retryingParseRevisions.toLocaleString(),
 										retryingParseRevisions > 0 ? "warning" : "neutral",
+										this.getDiagnosticMetricVisibility(retryingParseRevisions),
 									),
 									this.createServiceMetric(
 										"parserFailures",
 										"Parser failures",
 										terminalFailedParseRevisions.toLocaleString(),
 										terminalFailedParseRevisions > 0 ? "critical" : "neutral",
+										this.getDiagnosticMetricVisibility(terminalFailedParseRevisions),
 									),
 								],
 							},
 							plan: {
 								state: planHasWork ? "running" : parseFinished ? "completed" : "pending",
-								health: latestBacklogMetrics.blockingReason
-									? "watch"
-									: planHasWork
-										? "healthy"
-										: "unknown",
+								health: planHasWork || parseFinished ? "healthy" : "unknown",
 								summary: planHasWork ? "Preparing vector workload" : "No planner backlog",
 								detail: latestBacklogMetrics.blockingReason
 									? this.describeBlockingReason(latestBacklogMetrics.blockingReason, {
@@ -3758,6 +4926,14 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										"Parsed backlog",
 										latestBacklogMetrics.parsedRevisions.toLocaleString(),
 										latestBacklogMetrics.parsedRevisions > 0 ? "warning" : "neutral",
+										latestBacklogMetrics.blockingReason === "parsed_revisions_waiting_for_planning"
+											? "primary"
+											: "detail",
+									),
+									this.createServiceMetric(
+										"elapsed",
+										"Elapsed",
+										this.formatCompactDuration(phaseTimingSnapshot.planMs),
 									),
 									this.createServiceMetric(
 										"plannedBacklog",
@@ -3770,12 +4946,18 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										"Staged chunks",
 										latestBacklogMetrics.stagedChunks.toLocaleString(),
 										latestBacklogMetrics.stagedChunks > 0 ? "warning" : "neutral",
+										latestBacklogMetrics.blockingReason === "staged_chunks_waiting_for_upsert"
+											? "primary"
+											: "detail",
 									),
 									this.createServiceMetric(
 										"queuedUpserts",
 										"Queued upserts",
 										latestBacklogMetrics.queuedUpsertJobs.toLocaleString(),
 										latestBacklogMetrics.queuedUpsertJobs > 0 ? "warning" : "neutral",
+										latestBacklogMetrics.blockingReason === "staged_chunks_waiting_for_upsert"
+											? "primary"
+											: "detail",
 									),
 								],
 							},
@@ -3809,6 +4991,13 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										"avgEmbed",
 										"Avg embed",
 										this.formatCompactDuration(latestSyncTelemetry?.averageEmbedLatencyMs),
+										"neutral",
+										"detail",
+									),
+									this.createServiceMetric(
+										"elapsed",
+										"Elapsed",
+										this.formatCompactDuration(phaseTimingSnapshot.embedSyncMs),
 									),
 									this.createServiceMetric(
 										"gpu",
@@ -3821,6 +5010,8 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										"gpuMemory",
 										"GPU memory",
 										this.formatGpuMemoryStatus(latestSyncTelemetry?.gpu),
+										"neutral",
+										"detail",
 									),
 									this.createServiceMetric(
 										"laneOccupancy",
@@ -3841,6 +5032,8 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										"activeLanes",
 										"Active lanes",
 										latestSyncTelemetry?.activeLaneCount ?? 0,
+										"neutral",
+										"detail",
 									),
 									this.createServiceMetric(
 										"pressure",
@@ -3854,6 +5047,10 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 											: embeddingHealth === "watch"
 												? "warning"
 												: "neutral",
+										latestSyncTelemetry?.pressureState &&
+											latestSyncTelemetry.pressureState !== "normal"
+											? "primary"
+											: "detail",
 									),
 								],
 							},
@@ -3900,6 +5097,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										this.formatCompactDuration(latestSyncTelemetry?.averageUpsertLatencyMs),
 									),
 									this.createServiceMetric(
+										"elapsed",
+										"Elapsed",
+										this.formatCompactDuration(phaseTimingSnapshot.embedSyncMs),
+									),
+									this.createServiceMetric(
 										"throughput",
 										"Synced/sec",
 										latestSyncTelemetry?.chunksPerSecond != null
@@ -3912,12 +5114,18 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										"Staged chunks",
 										latestBacklogMetrics.stagedChunks.toLocaleString(),
 										latestBacklogMetrics.stagedChunks > 0 ? "warning" : "neutral",
+										latestBacklogMetrics.blockingReason === "staged_chunks_waiting_for_upsert"
+											? "primary"
+											: "detail",
 									),
 									this.createServiceMetric(
 										"queuedUpserts",
 										"Queued upserts",
 										latestBacklogMetrics.queuedUpsertJobs.toLocaleString(),
 										latestBacklogMetrics.queuedUpsertJobs > 0 ? "warning" : "neutral",
+										latestBacklogMetrics.blockingReason === "staged_chunks_waiting_for_upsert"
+											? "primary"
+											: "detail",
 									),
 									this.createServiceMetric(
 										"runningUpserts",
@@ -3929,11 +5137,9 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 							},
 							cleanup: {
 								state: cleanupHasWork
-									? cleanupHealth === "watch"
-										? "warning"
-										: parseFinished && !planHasDeleteWork
-											? "completed"
-											: "running"
+									? parseFinished && !planHasDeleteWork
+										? "completed"
+										: "running"
 									: parseFinished
 										? "skipped"
 										: "pending",
@@ -3974,16 +5180,23 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 										currentDeletedChunksCompleted.toLocaleString(),
 									),
 									this.createServiceMetric(
+										"elapsed",
+										"Elapsed",
+										this.formatCompactDuration(phaseTimingSnapshot.cleanupMs),
+									),
+									this.createServiceMetric(
 										"queuedDeletes",
 										"Queued deletes",
 										latestBacklogMetrics.queuedDeleteJobs.toLocaleString(),
 										latestBacklogMetrics.queuedDeleteJobs > 0 ? "warning" : "neutral",
+										this.getDiagnosticMetricVisibility(latestBacklogMetrics.queuedDeleteJobs),
 									),
 									this.createServiceMetric(
 										"runningDeletes",
 										"Running deletes",
 										latestBacklogMetrics.runningDeleteJobs.toLocaleString(),
 										latestBacklogMetrics.runningDeleteJobs > 0 ? "warning" : "neutral",
+										this.getDiagnosticMetricVisibility(latestBacklogMetrics.runningDeleteJobs),
 									),
 								],
 							},
@@ -4020,7 +5233,17 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				}
 				const promise = (async () => {
 					const now = Date.now()
-					if (force || now - lastBacklogRefreshAt >= CodeIndexEngineV2.PIPELINE_POLL_INTERVAL_MS) {
+					const workerPhase = latestSyncTelemetry?.workerPhase
+					const shouldReuseActivationBacklog =
+						lastBacklogRefreshAt > 0 &&
+						(workerPhase === "activation" || workerPhase === "claiming") &&
+						now - lastBacklogRefreshAt < CodeIndexEngineV2.ACTIVATION_BACKLOG_REUSE_WINDOW_MS
+					const shouldRefreshMetrics =
+						(force && !shouldReuseActivationBacklog) ||
+						(!force &&
+							!shouldReuseActivationBacklog &&
+							now - lastBacklogRefreshAt >= CodeIndexEngineV2.PIPELINE_POLL_INTERVAL_MS)
+					if (shouldRefreshMetrics) {
 						const elapsed = Math.max(now - lastBlockingReasonAt, 0)
 						if (lastBlockingReason === "parsed_revisions_waiting_for_planning") {
 							blockedOnParsedRevisionsMs += elapsed
@@ -4318,6 +5541,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					({
 						upsertedChunks,
 						deletedChunks,
+						committedRevisions,
 						retryingChunks,
 						terminallyFailedChunks,
 						degradedRevisions,
@@ -4401,6 +5625,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 							peakBatchSize,
 							peakEmbeddingCount,
 							batchesCompleted,
+							committedRevisions,
 							retryingChunks,
 							terminallyFailedChunks,
 							degradedRevisions,
@@ -4458,6 +5683,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				syncedChunksCompleted += syncSummary.upsertedChunks + syncSummary.deletedChunks
 				upsertedChunksCompleted += syncSummary.upsertedChunks
 				deletedChunksCompleted += syncSummary.deletedChunks
+				committedRevisionsCompleted += syncSummary.committedRevisions
 				liveSyncedChunksCompleted = syncedChunksCompleted
 				liveUpsertedChunksCompleted = upsertedChunksCompleted
 				liveDeletedChunksCompleted = deletedChunksCompleted
@@ -4653,6 +5879,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			await persistRunSnapshot(true)
 
 			const reusedParsedRevisionIds = statHashSummary.reusedParsedRevisionIds ?? []
+			resumedReusableRevisionCount = reusedParsedRevisionIds.length
 			if (reusedParsedRevisionIds.length > 0) {
 				const reusedParsedChunks = await countChunksForRevisions(reusedParsedRevisionIds)
 				parsedRevisionsCompleted += reusedParsedRevisionIds.length
@@ -4785,6 +6012,35 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				terminalFailedRevisions: latestSyncTelemetry?.terminalFailedRevisions ?? 0,
 				retryingChunks: latestSyncTelemetry?.retryingChunks ?? 0,
 				terminallyFailedChunks: latestSyncTelemetry?.terminallyFailedChunks ?? 0,
+				elapsedMs: Date.now() - pipelineStartedAt,
+				recoveredElapsedMs: recoveredTiming.recoveredElapsedMs,
+				investedElapsedMs: Date.now() - pipelineStartedAt + recoveredTiming.recoveredElapsedMs,
+				baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+				baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+				baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+				phaseTimingMs: this.buildPhaseTimingSnapshot({
+					discoveryMs: options?.discoveryMs,
+					fileChecksMs: statHashMs,
+					parseMs: parseChunkMs,
+					planMs: diffPlanningMs,
+					embedSyncMs: embedUpsertMs,
+					cleanupMs: 0,
+				}),
+				codebaseProgress: this.buildCodebaseProgressSnapshot({
+					baselineIndexedFiles: progressBaseline.baselineIndexedFiles,
+					baselineIndexedChunks: progressBaseline.baselineIndexedChunks,
+					baselineSyncedChunks: progressBaseline.baselineSyncedChunks,
+					totalFiles: Math.max(statHashSummary.checkedFiles, statHashSummary.changedFiles, 1),
+					committedFiles: committedRevisionsCompleted + (latestSyncTelemetry?.degradedRevisions ?? 0),
+					syncedChunks: syncedChunksCompleted,
+					knownTotalChunks: Math.max(
+						progressBaseline.baselineIndexedChunks,
+						progressBaseline.baselineSyncedChunks + syncedChunksCompleted,
+						parsedChunksCompleted,
+						syncedChunksCompleted,
+					),
+					chunkTotalKind: "exact",
+				}),
 			})
 			await persistRunSnapshot(true)
 			await this.metadataStore.markRunComplete(runId)
@@ -4895,7 +6151,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				})
 			} else {
 				const errorMessage = this.getStopAwareErrorMessage(error)
-				await this.metadataStore.markRunFailed(runId, errorMessage).catch(() => undefined)
+				if (metadataTimeout) {
+					await this.markRunFailedWithRecoveryWriter(runId, errorMessage).catch(() => undefined)
+				} else {
+					await this.metadataStore.markRunFailed(runId, errorMessage).catch(() => undefined)
+				}
 				this.logPipelineTerminalEvent("run-failed", runId, {
 					message: this._status.message,
 					errorMessage,
@@ -4920,6 +6180,412 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		}
 	}
 
+	private getStandbyRunMode(
+		latestRun: StandbyRunContext | undefined,
+		indexedFiles: number,
+		indexedChunks: number,
+	): IndexingPipelineRunMode {
+		const hasRecoveredProgress = indexedFiles > 0 || indexedChunks > 0
+		if (latestRun && latestRun.state !== "complete" && hasRecoveredProgress) {
+			return "resume"
+		}
+		const triggerType = latestRun?.triggerType?.toLowerCase()
+		if (!triggerType) {
+			return hasRecoveredProgress ? "initial-discovery" : "unknown"
+		}
+		if (triggerType.includes("resume")) {
+			return "resume"
+		}
+		if (triggerType.includes("refresh")) {
+			return "refresh"
+		}
+		if (triggerType.includes("reconcile") || triggerType.includes("watcher") || triggerType.includes("manual")) {
+			return "reconcile"
+		}
+		return "initial-discovery"
+	}
+
+	private selectStandbyRunContext(
+		latestSummary: IndexRunSummaryRecord | undefined,
+		latestProgress: RunProgressRecord | undefined,
+	): StandbyRunContext | undefined {
+		if (!latestSummary && !latestProgress) {
+			return undefined
+		}
+
+		const summaryTime = latestSummary ? (latestSummary.completedAt ?? latestSummary.startedAt) : -1
+		const progressTime = latestProgress
+			? (latestProgress.completedAt ?? latestProgress.lastHeartbeatAt ?? latestProgress.startedAt)
+			: -1
+
+		if (latestProgress && progressTime >= summaryTime) {
+			return {
+				runId: latestProgress.runId,
+				source: "operational",
+				state: latestProgress.state,
+				triggerType: latestProgress.triggerType,
+				startedAt: latestProgress.startedAt,
+				completedAt: latestProgress.completedAt,
+				lastHeartbeatAt: latestProgress.lastHeartbeatAt,
+				errorMessage: latestProgress.errorMessage,
+				totalRunMs:
+					latestProgress.completedAt != null
+						? Math.max(0, latestProgress.completedAt - latestProgress.startedAt)
+						: latestProgress.lastHeartbeatAt != null
+							? Math.max(0, latestProgress.lastHeartbeatAt - latestProgress.startedAt)
+							: null,
+				discoveredFiles: latestProgress.progress?.filesDiscovered ?? null,
+				filesScanned: latestProgress.progress?.filesHashed ?? latestProgress.progress?.filesDiscovered ?? null,
+				parsedChunks: null,
+				plannedRevisions: latestProgress.progress?.filesPlanned ?? null,
+				syncedChunks: null,
+				upsertedChunks: null,
+				deletedChunks: null,
+				committedRevisions: latestProgress.progress?.filesCommitted ?? null,
+				retryingParseRevisions: latestProgress.progress?.retryingParseRevisions ?? null,
+				terminalFailedParseRevisions: latestProgress.progress?.terminalFailedParseRevisions ?? null,
+				retryingChunks: latestProgress.progress?.retryingChunks ?? null,
+				terminalFailedChunks: latestProgress.progress?.terminalFailedChunks ?? null,
+				degradedRevisions: latestProgress.progress?.degradedRevisions ?? null,
+				terminalFailedRevisions: latestProgress.progress?.terminalFailedRevisions ?? null,
+				progress: latestProgress.progress,
+			}
+		}
+
+		if (!latestSummary) {
+			return undefined
+		}
+
+		return {
+			...latestSummary,
+			source: "summary",
+			completedAt: latestSummary.completedAt ?? null,
+			progress: null,
+		}
+	}
+
+	private getStandbyOutstandingVectorChunks(latestRun: StandbyRunContext | undefined): number {
+		const progress = latestRun?.progress
+		if (!progress) {
+			return 0
+		}
+		return Math.max(
+			0,
+			(progress.stagedChunks ?? 0) +
+				(progress.queuedUpsertJobs ?? 0) +
+				(progress.runningUpsertJobs ?? 0) +
+				(progress.queuedDeleteJobs ?? 0) +
+				(progress.runningDeleteJobs ?? 0),
+		)
+	}
+
+	private buildStandbyPipelineSnapshot(input: {
+		runMode: IndexingPipelineRunMode
+		indexedFiles: number
+		totalFiles: number
+		syncedChunks: number
+		knownTotalChunks: number
+		latestRun?: StandbyRunContext
+		latestRunInterrupted: boolean
+		outstandingVectorChunks: number
+		warningCount: number
+		parserFailureCount: number
+		failedRevisionCount: number
+		degradedRevisionCount: number
+		phaseTimingMs: IndexingPhaseTimingSnapshot
+	}): IndexingPipelineSnapshot {
+		const lastRunMs = input.latestRun?.totalRunMs ?? null
+		const latestRunIncomplete = input.latestRun != null && input.latestRun.state !== "complete"
+		const overallState: IndexingPipelineOverallState =
+			latestRunIncomplete && input.latestRun?.state === "failed"
+				? "failed"
+				: latestRunIncomplete
+					? "stopped"
+					: "completed"
+		const parseIssueCount = input.parserFailureCount + input.failedRevisionCount + input.degradedRevisionCount
+		const parseHealth: IndexingHealthState =
+			input.parserFailureCount > 0 || input.failedRevisionCount > 0
+				? "critical"
+				: input.degradedRevisionCount > 0
+					? "watch"
+					: "healthy"
+		const interruptedWithRemainingWork =
+			input.latestRunInterrupted &&
+			((input.totalFiles > 0 && input.indexedFiles < input.totalFiles) ||
+				(input.knownTotalChunks > 0 && input.syncedChunks < input.knownTotalChunks))
+		const syncHealth: IndexingHealthState = interruptedWithRemainingWork ? "watch" : "healthy"
+		const totalFiles = Math.max(input.totalFiles, input.indexedFiles, 0)
+		const chunkTotalTrustworthy =
+			!latestRunIncomplete || input.outstandingVectorChunks > 0 || input.knownTotalChunks > input.syncedChunks
+		const knownTotalChunks = chunkTotalTrustworthy ? Math.max(input.knownTotalChunks, input.syncedChunks, 0) : 0
+		const hasAvailableChunks = input.syncedChunks > 0 || knownTotalChunks > 0
+		const discoverySummary =
+			totalFiles > 0 ? `${totalFiles.toLocaleString()} files known` : "No indexed files found yet"
+		const fileCheckDetail =
+			totalFiles > 0
+				? `${input.indexedFiles.toLocaleString()} indexed • ${Math.max(totalFiles - input.indexedFiles, 0).toLocaleString()} pending or unindexed`
+				: "Start indexing to discover workspace files"
+		const vectorDetail = hasAvailableChunks
+			? input.outstandingVectorChunks > 0
+				? `${input.syncedChunks.toLocaleString()} chunks available • ${input.outstandingVectorChunks.toLocaleString()} vector items remaining`
+				: `${input.syncedChunks.toLocaleString()} chunks available`
+			: "No synced chunks found yet"
+		const services = this.buildPipelineServicesSnapshot({
+			discovery: {
+				state: totalFiles > 0 ? "completed" : "skipped",
+				health: totalFiles > 0 ? "healthy" : "unknown",
+				summary: discoverySummary,
+				detail: "Persisted workspace file state",
+				progressCurrent: totalFiles > 0 ? totalFiles : undefined,
+				progressTotal: totalFiles > 0 ? totalFiles : undefined,
+				progressUnit: totalFiles > 0 ? "files" : undefined,
+				progressPercent: totalFiles > 0 ? 100 : null,
+				metrics: [
+					this.createServiceMetric("files", "Files", totalFiles > 0 ? totalFiles.toLocaleString() : "n/a"),
+					this.createServiceMetric("mode", "Mode", input.runMode),
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.discoveryMs),
+					),
+				],
+			},
+			file_checks: {
+				state: totalFiles > 0 ? "completed" : "skipped",
+				health: input.latestRunInterrupted && input.indexedFiles < totalFiles ? "watch" : "healthy",
+				summary: totalFiles > 0 ? "Persisted file state available" : "No file state available",
+				detail: fileCheckDetail,
+				progressCurrent: totalFiles > 0 ? input.indexedFiles : undefined,
+				progressTotal: totalFiles > 0 ? totalFiles : undefined,
+				progressUnit: totalFiles > 0 ? "files" : undefined,
+				progressPercent:
+					totalFiles > 0 ? Math.min(100, Math.round((input.indexedFiles / totalFiles) * 100)) : null,
+				metrics: [
+					this.createServiceMetric("indexed", "Indexed", input.indexedFiles.toLocaleString()),
+					this.createServiceMetric("total", "Known files", totalFiles.toLocaleString()),
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.fileChecksMs),
+					),
+				],
+			},
+			parse: {
+				state: parseIssueCount > 0 ? "warning" : input.indexedFiles > 0 ? "completed" : "skipped",
+				health: parseIssueCount > 0 ? parseHealth : "healthy",
+				summary: parseIssueCount > 0 ? "Parser warnings need review" : "No current parser warnings",
+				detail:
+					parseIssueCount > 0
+						? `${parseIssueCount.toLocaleString()} latest file warnings`
+						: "Latest indexed files are available",
+				issueCount: parseIssueCount > 0 ? parseIssueCount : undefined,
+				metrics: [
+					this.createServiceMetric(
+						"parserFailures",
+						"Parser failures",
+						input.parserFailureCount.toLocaleString(),
+						input.parserFailureCount > 0 ? "critical" : "neutral",
+						this.getDiagnosticMetricVisibility(input.parserFailureCount),
+					),
+					this.createServiceMetric(
+						"failed",
+						"Failed",
+						input.failedRevisionCount.toLocaleString(),
+						input.failedRevisionCount > 0 ? "critical" : "neutral",
+						this.getDiagnosticMetricVisibility(input.failedRevisionCount),
+					),
+					this.createServiceMetric(
+						"degraded",
+						"Degraded",
+						input.degradedRevisionCount.toLocaleString(),
+						input.degradedRevisionCount > 0 ? "warning" : "neutral",
+						this.getDiagnosticMetricVisibility(input.degradedRevisionCount),
+					),
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.parseMs),
+					),
+				],
+			},
+			plan: {
+				state: input.latestRunInterrupted ? "warning" : input.latestRun ? "completed" : "skipped",
+				health: input.latestRunInterrupted ? "watch" : "healthy",
+				summary: input.latestRunInterrupted ? "Previous run did not finish" : "No pending plan work visible",
+				detail: input.latestRunInterrupted
+					? "Start indexing to resume from the current persisted progress"
+					: "No active indexing run is in progress",
+				metrics: [
+					this.createServiceMetric("latestRun", "Latest run", input.latestRun?.state ?? "none"),
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.planMs),
+					),
+				],
+			},
+			embedding: {
+				state: hasAvailableChunks ? (interruptedWithRemainingWork ? "warning" : "completed") : "skipped",
+				health: syncHealth,
+				summary: hasAvailableChunks
+					? interruptedWithRemainingWork
+						? "Embedding can resume"
+						: "Embeddings available"
+					: "No embeddings available yet",
+				detail: vectorDetail,
+				progressCurrent: hasAvailableChunks ? input.syncedChunks : undefined,
+				progressTotal: chunkTotalTrustworthy && knownTotalChunks > 0 ? knownTotalChunks : undefined,
+				progressUnit: hasAvailableChunks ? "chunks" : undefined,
+				progressPercent:
+					chunkTotalTrustworthy && knownTotalChunks > 0
+						? Math.min(100, Math.round((input.syncedChunks / knownTotalChunks) * 100))
+						: null,
+				indeterminate: hasAvailableChunks && !chunkTotalTrustworthy,
+				metrics: [
+					this.createServiceMetric("embedded", "Embedded", input.syncedChunks.toLocaleString()),
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.embedSyncMs),
+					),
+				],
+			},
+			vector_sync: {
+				state: hasAvailableChunks ? (interruptedWithRemainingWork ? "warning" : "completed") : "skipped",
+				health: syncHealth,
+				summary: hasAvailableChunks
+					? interruptedWithRemainingWork
+						? "Vector sync can resume"
+						: "Vectors available"
+					: "No synced vectors available yet",
+				detail: vectorDetail,
+				progressCurrent: hasAvailableChunks ? input.syncedChunks : undefined,
+				progressTotal: chunkTotalTrustworthy && knownTotalChunks > 0 ? knownTotalChunks : undefined,
+				progressUnit: hasAvailableChunks ? "chunks" : undefined,
+				progressPercent:
+					chunkTotalTrustworthy && knownTotalChunks > 0
+						? Math.min(100, Math.round((input.syncedChunks / knownTotalChunks) * 100))
+						: null,
+				indeterminate: hasAvailableChunks && !chunkTotalTrustworthy,
+				metrics: [
+					this.createServiceMetric("synced", "Synced", input.syncedChunks.toLocaleString()),
+					this.createServiceMetric(
+						"knownChunks",
+						chunkTotalTrustworthy ? "Known chunks" : "Chunks available",
+						chunkTotalTrustworthy ? knownTotalChunks.toLocaleString() : input.syncedChunks.toLocaleString(),
+					),
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.embedSyncMs),
+					),
+				],
+			},
+			cleanup: {
+				state: "skipped",
+				health: "healthy",
+				summary: "No active cleanup work",
+				detail: "Start indexing to reconcile deleted or stale files",
+				metrics: [
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.cleanupMs),
+					),
+				],
+			},
+		})
+		const summaryProgressParts: string[] = []
+		if (totalFiles > 0) {
+			summaryProgressParts.push(
+				`${input.indexedFiles.toLocaleString()} / ${totalFiles.toLocaleString()} files indexed`,
+			)
+		}
+		if (hasAvailableChunks) {
+			summaryProgressParts.push(
+				chunkTotalTrustworthy && knownTotalChunks > 0
+					? `${input.syncedChunks.toLocaleString()} / ${knownTotalChunks.toLocaleString()} chunks synced`
+					: `${input.syncedChunks.toLocaleString()} chunks available`,
+			)
+		}
+		const incompleteSecondaryLabel =
+			input.latestRun?.errorMessage != null && input.latestRun.errorMessage.trim().length > 0
+				? `Previous indexing run did not finish: ${input.latestRun.errorMessage}`
+				: "Previous indexing run did not finish. Start indexing to continue."
+		const summary: IndexingPipelineSnapshot["summary"] = latestRunIncomplete
+			? {
+					primaryServiceId: "vector_sync" as const,
+					headline: "Resume available",
+					progressLabel: summaryProgressParts.join(" • ") || undefined,
+					secondaryLabel: incompleteSecondaryLabel,
+					recoveredProgressLabel:
+						input.indexedFiles > 0 || input.syncedChunks > 0
+							? `Recovered progress: ${[
+									input.indexedFiles > 0
+										? `${input.indexedFiles.toLocaleString()} indexed files`
+										: undefined,
+									input.syncedChunks > 0
+										? `${input.syncedChunks.toLocaleString()} synced chunks`
+										: undefined,
+								]
+									.filter(Boolean)
+									.join(" • ")} already available`
+							: undefined,
+					elapsedLabel: undefined,
+					progressCurrent: totalFiles > 0 ? input.indexedFiles : undefined,
+					progressTotal: totalFiles > 0 ? totalFiles : undefined,
+					progressUnit: totalFiles > 0 ? "files" : undefined,
+					progressPercent:
+						totalFiles > 0 ? Math.min(100, Math.round((input.indexedFiles / totalFiles) * 100)) : null,
+					elapsedMs: lastRunMs,
+					recoveredElapsedMs: null,
+					investedElapsedMs: lastRunMs,
+					phaseTimingMs: input.phaseTimingMs,
+					codebaseProgress: {
+						indexedFiles: input.indexedFiles,
+						totalFiles,
+						fileTotalKind: "exact",
+						syncedChunks: input.syncedChunks,
+						chunkTotalKind: chunkTotalTrustworthy ? "exact" : "available",
+						knownTotalChunks: chunkTotalTrustworthy ? knownTotalChunks : undefined,
+					},
+					indeterminate: !chunkTotalTrustworthy,
+				}
+			: undefined
+
+		return {
+			overallState,
+			overallHealth:
+				overallState === "failed"
+					? "critical"
+					: this.getWorstHealthState(services.map((service) => service.health)),
+			runMode: input.runMode,
+			etaMs: null,
+			elapsedMs: lastRunMs,
+			recoveredElapsedMs: null,
+			investedElapsedMs: lastRunMs,
+			baselineIndexedFiles: input.runMode === "resume" ? input.indexedFiles : 0,
+			baselineIndexedChunks: input.runMode === "resume" ? input.syncedChunks : 0,
+			baselineSyncedChunks: input.runMode === "resume" ? input.syncedChunks : 0,
+			phaseTimingMs: input.phaseTimingMs,
+			codebaseProgress: {
+				indexedFiles: input.indexedFiles,
+				totalFiles,
+				fileTotalKind: "exact",
+				syncedChunks: input.syncedChunks,
+				chunkTotalKind: chunkTotalTrustworthy ? "exact" : "available",
+				knownTotalChunks: chunkTotalTrustworthy ? knownTotalChunks : undefined,
+			},
+			services,
+			summary,
+			lastCompletedAt:
+				overallState === "completed"
+					? (input.latestRun?.completedAt ?? input.latestRun?.startedAt ?? undefined)
+					: undefined,
+			preservedFromPreviousRun: true,
+		}
+	}
+
 	private setSuccessfulCompletedPipelineSnapshot(input: {
 		runMode: IndexingPipelineRunMode
 		discoveredFiles: number
@@ -4939,6 +6605,14 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		terminalFailedRevisions: number
 		retryingChunks: number
 		terminallyFailedChunks: number
+		elapsedMs: number
+		recoveredElapsedMs: number
+		investedElapsedMs: number
+		baselineIndexedFiles: number
+		baselineIndexedChunks: number
+		baselineSyncedChunks: number
+		phaseTimingMs: IndexingPhaseTimingSnapshot
+		codebaseProgress: IndexingCodebaseProgressSnapshot
 	}): void {
 		const fileChecksHealth: IndexingHealthState =
 			input.missingFiles > 0 || input.oversizedFiles > 0 ? "watch" : "healthy"
@@ -4989,6 +6663,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				metrics: [
 					this.createServiceMetric("files", "Files", totalFiles.toLocaleString()),
 					this.createServiceMetric("mode", "Mode", input.runMode),
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.discoveryMs),
+					),
 				],
 			},
 			file_checks: {
@@ -5004,16 +6683,23 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					this.createServiceMetric("changed", "Changed", input.changedFiles.toLocaleString()),
 					this.createServiceMetric("unchanged", "Unchanged", input.unchangedFiles.toLocaleString()),
 					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.fileChecksMs),
+					),
+					this.createServiceMetric(
 						"oversized",
 						"Oversized",
 						input.oversizedFiles.toLocaleString(),
 						input.oversizedFiles > 0 ? "warning" : "neutral",
+						this.getDiagnosticMetricVisibility(input.oversizedFiles),
 					),
 					this.createServiceMetric(
 						"missing",
 						"Missing",
 						input.missingFiles.toLocaleString(),
 						input.missingFiles > 0 ? "warning" : "neutral",
+						this.getDiagnosticMetricVisibility(input.missingFiles),
 					),
 				],
 			},
@@ -5033,16 +6719,23 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 					this.createServiceMetric("parsedFiles", "Parsed files", input.parsedFiles.toLocaleString()),
 					this.createServiceMetric("parsedChunks", "Parsed chunks", input.parsedChunks.toLocaleString()),
 					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.parseMs),
+					),
+					this.createServiceMetric(
 						"parseRetries",
 						"Retries",
 						input.retryingParseRevisions.toLocaleString(),
 						input.retryingParseRevisions > 0 ? "warning" : "neutral",
+						this.getDiagnosticMetricVisibility(input.retryingParseRevisions),
 					),
 					this.createServiceMetric(
 						"parserFailures",
 						"Parser failures",
 						input.terminalFailedParseRevisions.toLocaleString(),
 						input.terminalFailedParseRevisions > 0 ? "critical" : "neutral",
+						this.getDiagnosticMetricVisibility(input.terminalFailedParseRevisions),
 					),
 				],
 			},
@@ -5060,8 +6753,13 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				progressPercent: input.changedFiles > 0 ? 100 : null,
 				metrics: [
 					this.createServiceMetric("planned", "Planned", input.changedFiles.toLocaleString()),
-					this.createServiceMetric("stagedChunks", "Staged chunks", "0"),
-					this.createServiceMetric("queuedUpserts", "Queued upserts", "0"),
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.planMs),
+					),
+					this.createServiceMetric("stagedChunks", "Staged chunks", "0", "neutral", "detail"),
+					this.createServiceMetric("queuedUpserts", "Queued upserts", "0", "neutral", "detail"),
 				],
 			},
 			embedding: {
@@ -5082,16 +6780,23 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				metrics: [
 					this.createServiceMetric("embedded", "Embedded", input.upsertedChunks.toLocaleString()),
 					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.embedSyncMs),
+					),
+					this.createServiceMetric(
 						"retrying",
 						"Retrying",
 						input.retryingChunks.toLocaleString(),
 						input.retryingChunks > 0 ? "warning" : "neutral",
+						this.getDiagnosticMetricVisibility(input.retryingChunks),
 					),
 					this.createServiceMetric(
 						"terminalFailed",
 						"Failed",
 						input.terminallyFailedChunks.toLocaleString(),
 						input.terminallyFailedChunks > 0 ? "critical" : "neutral",
+						this.getDiagnosticMetricVisibility(input.terminallyFailedChunks),
 					),
 				],
 			},
@@ -5113,16 +6818,23 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				metrics: [
 					this.createServiceMetric("synced", "Synced", input.syncedChunks.toLocaleString()),
 					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.embedSyncMs),
+					),
+					this.createServiceMetric(
 						"retrying",
 						"Retrying",
 						input.retryingChunks.toLocaleString(),
 						input.retryingChunks > 0 ? "warning" : "neutral",
+						this.getDiagnosticMetricVisibility(input.retryingChunks),
 					),
 					this.createServiceMetric(
 						"failed",
 						"Failed",
 						input.terminallyFailedChunks.toLocaleString(),
 						input.terminallyFailedChunks > 0 ? "critical" : "neutral",
+						this.getDiagnosticMetricVisibility(input.terminallyFailedChunks),
 					),
 				],
 			},
@@ -5137,14 +6849,29 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				progressTotal: cleanupDidWork ? input.deletedChunks : undefined,
 				progressUnit: cleanupDidWork ? "vectors" : undefined,
 				progressPercent: cleanupDidWork ? 100 : null,
-				metrics: [this.createServiceMetric("deleted", "Removed", input.deletedChunks.toLocaleString())],
+				metrics: [
+					this.createServiceMetric("deleted", "Removed", input.deletedChunks.toLocaleString()),
+					this.createServiceMetric(
+						"elapsed",
+						"Elapsed",
+						this.formatCompactDuration(input.phaseTimingMs.cleanupMs),
+					),
+				],
 			},
 		})
-		this.stateManager.setPipelineSnapshot(
+		this.setPipelineSnapshot(
 			{
 				runMode: input.runMode,
 				overallState: "completed",
 				etaMs: null,
+				elapsedMs: input.elapsedMs,
+				recoveredElapsedMs: input.recoveredElapsedMs,
+				investedElapsedMs: input.investedElapsedMs,
+				baselineIndexedFiles: input.baselineIndexedFiles,
+				baselineIndexedChunks: input.baselineIndexedChunks,
+				baselineSyncedChunks: input.baselineSyncedChunks,
+				phaseTimingMs: input.phaseTimingMs,
+				codebaseProgress: input.codebaseProgress,
 				services: completedServices,
 			},
 			{ forceImmediate: true },
@@ -5156,13 +6883,19 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		label: string,
 		value: string | number | undefined | null,
 		tone: IndexingServiceMetric["tone"] = "neutral",
+		visibility: IndexingServiceMetric["visibility"] = "primary",
 	): IndexingServiceMetric {
 		return {
 			key,
 			label,
 			value: value == null ? "n/a" : String(value),
 			tone,
+			visibility,
 		}
+	}
+
+	private getDiagnosticMetricVisibility(count: number): IndexingServiceMetric["visibility"] {
+		return count > 0 ? "primary" : "detail"
 	}
 
 	private buildPipelineServicesSnapshot(
@@ -5364,6 +7097,143 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return metrics.stagedChunks + this.getRunnableEmbedQueueDepth(metrics)
 	}
 
+	private async getWorkspaceProgressBaseline(): Promise<{
+		baselineIndexedFiles: number
+		baselineIndexedChunks: number
+		baselineSyncedChunks: number
+	}> {
+		const workspaceId = this.metadataStore.getWorkspaceId()
+		const [baselineIndexedFiles, baselineIndexedChunks] = await Promise.all([
+			this.metadataStore.countActiveIndexedFilesForWorkspace(workspaceId),
+			this.metadataStore.countActiveChunksForWorkspace(workspaceId),
+		])
+		return {
+			baselineIndexedFiles,
+			baselineIndexedChunks,
+			baselineSyncedChunks: baselineIndexedChunks,
+		}
+	}
+
+	private async getRecoveredRunTimingContext(input: { hasRecoveredBaseline: boolean }): Promise<{
+		recoveredElapsedMs: number
+		previousRunInterrupted: boolean
+	}> {
+		const historyGateway = this.metadataReadStore as MetadataGateway & {
+			listRunSummaries?: (limit?: number) => Promise<Array<{ state?: string; totalRunMs?: number | null }>>
+			getRunSummary?: (runId: string) => Promise<{ totalRunMs?: number | null } | undefined>
+		}
+
+		let previousRunInterrupted = false
+		let previousRunElapsedMs = 0
+		let previousRunSummary: Array<{ state?: string; totalRunMs?: number | null }> | undefined
+		try {
+			previousRunSummary = await historyGateway.listRunSummaries?.(5)
+		} catch (error) {
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "recovered-run-timing-read-failed", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				errorMessage: error instanceof Error ? error.message : String(error),
+			})
+		}
+		const latestPriorRun = previousRunSummary?.[0]
+		if (latestPriorRun) {
+			previousRunInterrupted = latestPriorRun.state === "stopped" || latestPriorRun.state === "failed"
+			previousRunElapsedMs = latestPriorRun.totalRunMs ?? 0
+		}
+
+		if (this._staleRunIdsToResume.length > 0 && historyGateway.getRunSummary) {
+			let recoveredElapsedMs = 0
+			for (const staleRunId of this._staleRunIdsToResume) {
+				const runSummary = await historyGateway.getRunSummary(staleRunId).catch((error) => {
+					IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "recovered-run-summary-read-failed", {
+						component: "CodeIndexEngineV2",
+						workspacePath: this.workspacePath,
+						runId: staleRunId,
+						errorMessage: error instanceof Error ? error.message : String(error),
+					})
+					return undefined
+				})
+				recoveredElapsedMs += runSummary?.totalRunMs ?? 0
+			}
+			return {
+				recoveredElapsedMs,
+				previousRunInterrupted: previousRunInterrupted || recoveredElapsedMs > 0,
+			}
+		}
+
+		return {
+			recoveredElapsedMs: input.hasRecoveredBaseline && previousRunInterrupted ? previousRunElapsedMs : 0,
+			previousRunInterrupted,
+		}
+	}
+
+	private getEffectivePipelineRunMode(input: {
+		baseRunMode: IndexingPipelineRunMode
+		baselineIndexedFiles: number
+		baselineIndexedChunks: number
+		previousRunInterrupted: boolean
+		reusedParsedRevisionCount?: number
+	}): IndexingPipelineRunMode {
+		const hasRecoveredBaseline = input.baselineIndexedFiles > 0 || input.baselineIndexedChunks > 0
+		if (
+			this._staleRunIdsToResume.length > 0 ||
+			this._resumedRetryJobsCount > 0 ||
+			this._resumedPendingJobsCount > 0 ||
+			(input.reusedParsedRevisionCount ?? 0) > 0 ||
+			(input.previousRunInterrupted && hasRecoveredBaseline)
+		) {
+			return "resume"
+		}
+		return input.baseRunMode
+	}
+
+	private buildPhaseTimingSnapshot(input: {
+		discoveryMs?: number
+		fileChecksMs?: number
+		parseMs?: number
+		planMs?: number
+		embedSyncMs?: number
+		cleanupMs?: number
+	}): IndexingPhaseTimingSnapshot {
+		return {
+			discoveryMs: input.discoveryMs ?? 0,
+			fileChecksMs: input.fileChecksMs ?? 0,
+			parseMs: input.parseMs ?? 0,
+			planMs: input.planMs ?? 0,
+			embedSyncMs: input.embedSyncMs ?? 0,
+			cleanupMs: input.cleanupMs ?? 0,
+		}
+	}
+
+	private buildCodebaseProgressSnapshot(input: {
+		baselineIndexedFiles: number
+		baselineIndexedChunks: number
+		baselineSyncedChunks: number
+		totalFiles: number
+		committedFiles: number
+		syncedChunks: number
+		knownTotalChunks: number
+		fileTotalKind?: IndexingCodebaseProgressSnapshot["fileTotalKind"]
+		chunkTotalKind?: IndexingCodebaseProgressSnapshot["chunkTotalKind"]
+		historicalTombstonedFiles?: number
+	}): IndexingCodebaseProgressSnapshot {
+		return {
+			indexedFiles: Math.min(
+				Math.max(input.totalFiles, 0),
+				Math.max(0, input.baselineIndexedFiles + input.committedFiles),
+			),
+			totalFiles: Math.max(input.totalFiles, 0),
+			fileTotalKind: input.fileTotalKind ?? "exact",
+			syncedChunks: Math.min(
+				Math.max(input.knownTotalChunks, 0),
+				Math.max(0, input.baselineSyncedChunks + input.syncedChunks),
+			),
+			knownTotalChunks: Math.max(input.knownTotalChunks, 0),
+			chunkTotalKind: input.chunkTotalKind ?? "exact",
+			historicalTombstonedFiles: input.historicalTombstonedFiles,
+		}
+	}
+
 	private getParseThrottleReason(
 		metrics: RunBacklogMetricsRecord,
 		profile: ReturnType<CodeIndexEngineV2["getSchedulerProfile"]>,
@@ -5542,6 +7412,14 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		await this.performMetadataMaintenance({
 			checkpointMode: "TRUNCATE",
 			shrinkMemory: true,
+			pruneFootprint: false,
+		}).catch((error) => {
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "terminal-metadata-maintenance-failed", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				runId,
+				errorMessage: error instanceof Error ? error.message : String(error),
+			})
 		})
 		const hostMemory = IndexDebugLoggerV2.getMemorySnapshot()
 		const hostCpu = IndexDebugLoggerV2.getCpuSnapshot()
@@ -5573,6 +7451,7 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 				}
 			>
 		}
+		const metadataSidecarMetrics = this.getTrackedMetadataSidecarMetrics(tracked)
 		const statBytes = async (filePath: string) => {
 			try {
 				const stat = await fs.stat(filePath)
@@ -5659,11 +7538,11 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 			trackedSidecarRssMB: tracked.totalTrackedRssMB ?? 0,
 			parseSidecarRssMB: tracked.byGroup?.parseSidecars?.totalRssMB ?? 0,
 			embedSidecarRssMB: tracked.byGroup?.embedSidecars?.totalRssMB ?? 0,
-			metadataSidecarRssMB: tracked.byGroup?.metadataSidecar?.totalRssMB ?? 0,
-			metadataSidecarCpuPercent: tracked.byGroup?.metadataSidecar?.totalCpuPercent ?? 0,
-			metadataSidecarHeapUsedMB: tracked.byGroup?.metadataSidecar?.totalHeapUsedMB ?? 0,
-			metadataSidecarExternalMB: tracked.byGroup?.metadataSidecar?.totalExternalMB ?? 0,
-			metadataSidecarArrayBuffersMB: tracked.byGroup?.metadataSidecar?.totalArrayBuffersMB ?? 0,
+			metadataSidecarRssMB: metadataSidecarMetrics.totalRssMB,
+			metadataSidecarCpuPercent: metadataSidecarMetrics.totalCpuPercent,
+			metadataSidecarHeapUsedMB: metadataSidecarMetrics.totalHeapUsedMB,
+			metadataSidecarExternalMB: metadataSidecarMetrics.totalExternalMB,
+			metadataSidecarArrayBuffersMB: metadataSidecarMetrics.totalArrayBuffersMB,
 			metadataDbBytes: await statBytes(metadataDbPath),
 			metadataWalBytes: await statBytes(`${metadataDbPath}-wal`),
 			telemetryDbBytes: await statBytes(telemetryDbPath),
@@ -5956,15 +7835,87 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		return `Code Index V2 stopped because the metadata sidecar stalled: ${message}`
 	}
 
+	private async markRunFailedWithRecoveryWriter(runId: string, errorMessage: string): Promise<void> {
+		const recoveryStore = new MetadataSidecarClient(this.metadataStorePaths, {
+			role: "writer",
+		}) as unknown as MetadataGateway
+		try {
+			await recoveryStore.initialize()
+			await recoveryStore.markRunFailed(runId, errorMessage)
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-timeout-recovery-failure-persisted", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				runId,
+			})
+		} catch (recoveryError) {
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-timeout-recovery-failure-persist-failed", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				runId,
+				errorMessage: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+			})
+			throw recoveryError
+		} finally {
+			await recoveryStore.dispose().catch(() => undefined)
+		}
+	}
+
+	private getTrackedMetadataSidecarMetrics(tracked: {
+		byGroup?: Record<
+			string,
+			{
+				totalRssMB?: number
+				totalCpuPercent?: number
+				totalHeapUsedMB?: number
+				totalExternalMB?: number
+				totalArrayBuffersMB?: number
+			}
+		>
+	}): {
+		totalRssMB: number
+		totalCpuPercent: number
+		totalHeapUsedMB: number
+		totalExternalMB: number
+		totalArrayBuffersMB: number
+	} {
+		const groupNames = ["metadataSidecar", "metadataWriterSidecar", "metadataReaderSidecar"]
+		return groupNames.reduce(
+			(total, groupName) => {
+				const group = tracked.byGroup?.[groupName]
+				total.totalRssMB += group?.totalRssMB ?? 0
+				total.totalCpuPercent += group?.totalCpuPercent ?? 0
+				total.totalHeapUsedMB += group?.totalHeapUsedMB ?? 0
+				total.totalExternalMB += group?.totalExternalMB ?? 0
+				total.totalArrayBuffersMB += group?.totalArrayBuffersMB ?? 0
+				return total
+			},
+			{
+				totalRssMB: 0,
+				totalCpuPercent: 0,
+				totalHeapUsedMB: 0,
+				totalExternalMB: 0,
+				totalArrayBuffersMB: 0,
+			},
+		)
+	}
+
 	private async performMetadataMaintenance(input?: {
 		checkpointMode?: "PASSIVE" | "RESTART" | "TRUNCATE"
 		shrinkMemory?: boolean
+		pruneFootprint?: boolean
+		markFootprintCleanup?: boolean
+		maxPruneBatches?: number
+		vacuumMode?: "none" | "full"
 	}): Promise<unknown> {
 		const performMaintenance = (
 			this.metadataStore as MetadataGateway & {
 				performMaintenance?: (input?: {
 					checkpointMode?: "PASSIVE" | "RESTART" | "TRUNCATE"
 					shrinkMemory?: boolean
+					pruneFootprint?: boolean
+					markFootprintCleanup?: boolean
+					maxPruneBatches?: number
+					vacuumMode?: "none" | "full"
 				}) => Promise<unknown>
 			}
 		).performMaintenance
@@ -5974,13 +7925,158 @@ export class CodeIndexEngineV2 implements ICodeIndexEngine {
 		if (this._metadataMaintenancePromise) {
 			return this._metadataMaintenancePromise
 		}
-		const promise = performMaintenance.call(this.metadataStore, input).finally(() => {
+		const maintenanceInput = {
+			pruneFootprint: false,
+			vacuumMode: "none" as const,
+			...input,
+		}
+		const promise = performMaintenance.call(this.metadataStore, maintenanceInput).finally(() => {
 			if (this._metadataMaintenancePromise === promise) {
 				this._metadataMaintenancePromise = undefined
 			}
 		})
 		this._metadataMaintenancePromise = promise
 		return promise
+	}
+
+	private scheduleIdleMetadataFootprintCleanup(options?: { preserveTaskState?: boolean }): void {
+		if (this._metadataFootprintCleanupTimer) {
+			return
+		}
+		this._metadataFootprintCleanupTimer = setTimeout(() => {
+			this._metadataFootprintCleanupTimer = undefined
+			void this.runIdleMetadataFootprintCleanup()
+		}, CodeIndexEngineV2.IDLE_FOOTPRINT_CLEANUP_DELAY_MS)
+		if (!options?.preserveTaskState) {
+			this.setMetadataCleanupTaskState("scheduled", {
+				detail: "Idle metadata cleanup will run after the workspace stays idle briefly.",
+			})
+		}
+	}
+
+	private cancelIdleMetadataFootprintCleanup(): void {
+		if (!this._metadataFootprintCleanupTimer) {
+			return
+		}
+		clearTimeout(this._metadataFootprintCleanupTimer)
+		this._metadataFootprintCleanupTimer = undefined
+	}
+
+	private async runIdleMetadataFootprintCleanup(): Promise<void> {
+		if (this._started || this._status.state !== "idle") {
+			this.setMetadataCleanupTaskState("skipped", {
+				detail: "Indexing is active; metadata cleanup will wait for idle time.",
+			})
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-footprint-cleanup-skipped", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				reason: "engine-active",
+				statusState: this._status.state,
+			})
+			return
+		}
+
+		if (this._standbyHasResumableWork) {
+			this.setMetadataCleanupTaskState("skipped", {
+				detail: "Resumable indexing work exists, so metadata cleanup is deferred.",
+			})
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-footprint-cleanup-skipped", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				reason: "resumable-work",
+				statusState: this._status.state,
+			})
+			return
+		}
+
+		const writerDiagnostics = this.metadataWriterClient.getDiagnosticsSnapshot()
+		if (writerDiagnostics.state === "busy" || writerDiagnostics.pendingRequestCount > 0) {
+			this.setMetadataCleanupTaskState("skipped", {
+				detail: "Metadata writer is busy; cleanup will be retried shortly.",
+			})
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-footprint-cleanup-delayed", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				sidecarState: writerDiagnostics.state,
+				pendingRequestCount: writerDiagnostics.pendingRequestCount,
+			})
+			this.scheduleIdleMetadataFootprintCleanup({ preserveTaskState: true })
+			return
+		}
+
+		this._idleMetadataFootprintCleanupInFlight = true
+		try {
+			const lastPhaseLabel = this._metadataCleanupLastSummary?.footprintPrune?.phaseLabel
+			this.setMetadataCleanupTaskState("running", {
+				detail: lastPhaseLabel
+					? `Continuing safe metadata cleanup after ${lastPhaseLabel.toLowerCase()}.`
+					: "Pruning finalized jobs and obsolete metadata rows without compacting the DB file.",
+			})
+			const summary = (await this.performMetadataMaintenance({
+				checkpointMode: "TRUNCATE",
+				shrinkMemory: true,
+				pruneFootprint: true,
+				markFootprintCleanup: true,
+				maxPruneBatches: 1,
+				vacuumMode: "none",
+			})) as MetadataMaintenanceSummary | undefined
+			const hasMore = summary?.footprintPrune?.hasMore === true
+			this.setMetadataCleanupTaskState(hasMore ? "partial" : "complete", {
+				summary,
+				detail: hasMore
+					? `Cleanup made progress in ${summary?.footprintPrune?.phaseLabel ?? "the current phase"} and will continue while the workspace stays idle.`
+					: "Metadata cleanup reached a clean marker state.",
+			})
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-footprint-cleanup-complete", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				summary,
+			})
+			if (hasMore && !this._started && this._status.state === "idle") {
+				IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-footprint-cleanup-rescheduled", {
+					component: "CodeIndexEngineV2",
+					workspacePath: this.workspacePath,
+					reason: "more-prunable-data",
+				})
+				this.scheduleIdleMetadataFootprintCleanup({ preserveTaskState: true })
+			}
+		} catch (error) {
+			const phaseLabel = this._metadataCleanupLastSummary?.footprintPrune?.phaseLabel
+			this.setMetadataCleanupTaskState("failed", {
+				detail: phaseLabel
+					? `Metadata cleanup failed after the last completed phase: ${phaseLabel}. Indexing/search state is preserved.`
+					: "Metadata cleanup failed. Indexing/search state is preserved.",
+				errorMessage: error instanceof Error ? error.message : String(error),
+			})
+			IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-footprint-cleanup-failed", {
+				component: "CodeIndexEngineV2",
+				workspacePath: this.workspacePath,
+				errorMessage: error instanceof Error ? error.message : String(error),
+			})
+			if (this.isMetadataSidecarRuntimeError(error)) {
+				IndexDebugLoggerV2.log("basic", "CodeIndexEngineV2", "metadata-footprint-cleanup-resetting-writer", {
+					component: "CodeIndexEngineV2",
+					workspacePath: this.workspacePath,
+					reason: "sidecar-runtime-error",
+				})
+				await this.metadataStore.dispose().catch((disposeError) => {
+					IndexDebugLoggerV2.log(
+						"basic",
+						"CodeIndexEngineV2",
+						"metadata-footprint-cleanup-writer-reset-failed",
+						{
+							component: "CodeIndexEngineV2",
+							workspacePath: this.workspacePath,
+							errorMessage: disposeError instanceof Error ? disposeError.message : String(disposeError),
+						},
+					)
+				})
+				this.publishRuntimeSnapshot()
+			}
+		} finally {
+			this._idleMetadataFootprintCleanupInFlight = false
+			this.publishRuntimeSnapshot()
+		}
 	}
 
 	private startActivityHeartbeat(messageFactory: () => string): void {

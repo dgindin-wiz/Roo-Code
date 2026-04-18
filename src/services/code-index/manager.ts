@@ -18,7 +18,13 @@ import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 import { getConfiguredCodeIndexEngine } from "../code-index-v2/settings"
 import { CODE_INDEX_V2_ENGINE_ID, CodeIndexEngineKind } from "../code-index-v2/shared/constants"
-import { CodeIndexDebugSearchTrace, CodeIndexEngineV2, ICodeIndexEngine, IndexDebugLoggerV2 } from "../code-index-v2"
+import {
+	CodeIndexDebugSearchTrace,
+	CodeIndexEngineV2,
+	CodeIndexMetadataCompactionResult,
+	ICodeIndexEngine,
+	IndexDebugLoggerV2,
+} from "../code-index-v2"
 import { ensureWorkspaceCodeIndexConfig, getWorkspaceCodeIndexConfig } from "./workspace-config"
 import { getCurrentWorkspaceFolder, getWorkspaceFolderForPath } from "../../utils/path"
 
@@ -310,6 +316,7 @@ export class CodeIndexManager {
 
 			this.cancelDeferredV2Start()
 			this._stateManager.setSystemState("Standby", "Code Index V2 is ready to start.")
+			await this._engineV2.hydrateStandbyStatus?.()
 			return { requiresRestart: false }
 		}
 
@@ -592,6 +599,19 @@ export class CodeIndexManager {
 		await this.stopIndexing()
 		await this._orchestrator!.clearIndexData()
 		await this._cacheManager!.clearCacheFile()
+	}
+
+	public async compactIndexMetadataDatabase(): Promise<CodeIndexMetadataCompactionResult> {
+		if (!this.isFeatureEnabled) {
+			throw new Error("Code indexing is disabled.")
+		}
+		this.assertInitialized()
+
+		if (this.selectedEngine !== CODE_INDEX_V2_ENGINE_ID || !this._engineV2?.compactMetadataDatabase) {
+			throw new Error("Metadata DB compaction is only available for Code Index V2.")
+		}
+
+		return this._engineV2.compactMetadataDatabase()
 	}
 
 	// --- Private Helpers ---

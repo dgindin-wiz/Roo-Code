@@ -430,6 +430,34 @@ describe("IndexingStatusBadge", () => {
 		)
 	})
 
+	it("uses a definitive short ETA in pipeline summary tooltips", () => {
+		const text = getIndexingBadgeTooltipText(
+			{
+				systemStatus: "Indexing",
+				processedItems: 99,
+				totalItems: 100,
+				currentItemUnit: "chunks",
+				estimatedTimeRemainingMs: 5_000,
+				pipeline: {
+					overallState: "running",
+					overallHealth: "healthy",
+					runMode: "start",
+					etaMs: 5_000,
+					services: [],
+					summary: {
+						headline: "Building embeddings and syncing vectors",
+						progressLabel: "Synced 99 of 100 chunks",
+					},
+				},
+			},
+			false,
+			(key: string) => key,
+			99,
+		)
+
+		expect(text).toBe("Building embeddings and syncing vectors — Synced 99 of 100 chunks — <10s remaining")
+	})
+
 	it("cleans up event listener on unmount", () => {
 		const { unmount } = renderComponent()
 		const removeEventListenerSpy = vi.spyOn(window, "removeEventListener")

@@ -481,10 +481,16 @@ export interface IndexRunSampleRecord extends IndexRunSampleInput {
 export interface MetadataMaintenanceSummary {
 	checkpointMode: "PASSIVE" | "RESTART" | "TRUNCATE"
 	shrinkMemory: boolean
+	pruneFootprint?: boolean
+	markFootprintCleanup?: boolean
+	maxPruneBatches?: number
+	vacuumMode?: "none" | "full"
 	operationalDbBytes: number
 	operationalWalBytes: number
 	telemetryDbBytes: number
 	telemetryWalBytes: number
+	footprintPrune?: MetadataFootprintPruneSummary
+	compaction?: MetadataCompactionSummary
 	memoryBefore: {
 		rssMB: number
 		heapUsedMB: number
@@ -497,6 +503,61 @@ export interface MetadataMaintenanceSummary {
 		externalMB: number
 		arrayBuffersMB: number
 	}
+}
+
+export type MetadataFootprintPrunePhase =
+	| "finalized_jobs"
+	| "deleted_chunks"
+	| "superseded_chunks"
+	| "obsolete_revisions"
+	| "complete"
+
+export interface MetadataCompactionSummary {
+	operationalDbBytesBefore: number
+	operationalDbBytesAfter: number
+	operationalWalBytesBefore: number
+	operationalWalBytesAfter: number
+	reclaimedBytes: number
+	requiredFreeBytes: number
+	availableFreeBytesBefore: number | null
+	availableFreeBytesAfter: number | null
+	elapsedMs: number
+}
+
+export interface MetadataFootprintPruneSummary {
+	markerKey: string
+	markerState: "already_completed" | "completed" | "partial" | "skipped" | "failed"
+	phase?: MetadataFootprintPrunePhase
+	phaseLabel?: string
+	passElapsedMs?: number
+	totalRowsPruned?: number
+	phaseBatchLimit?: number
+	prunedJobs: number
+	prunedChunks: number
+	prunedChunkVariants: number
+	prunedFtsRows: number
+	prunedRevisions?: number
+	hasMore?: boolean
+	skippedChunkPruneDueToJobs?: boolean
+	skippedRevisionPruneDueToJobs?: boolean
+	prunedJobBatchLimit?: number
+	prunedChunkBatchLimit?: number
+	prunedRevisionBatchLimit?: number
+	jobsBefore?: number
+	jobsAfter?: number
+	chunksBefore?: number
+	chunksAfter?: number
+	chunkVariantsBefore?: number
+	chunkVariantsAfter?: number
+	ftsRowsBefore?: number
+	ftsRowsAfter?: number
+	revisionsBefore?: number
+	revisionsAfter?: number
+	freelistPagesBefore: number
+	freelistPagesAfter: number
+	pageSizeBytes: number
+	estimatedReclaimableBytesBefore: number
+	estimatedReclaimableBytesAfter: number
 }
 
 export interface PlannedRevisionResolution {

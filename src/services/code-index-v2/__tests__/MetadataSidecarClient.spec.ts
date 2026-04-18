@@ -108,7 +108,7 @@ describe("MetadataSidecarClient", () => {
 		).getRunBacklogMetrics("run-1")
 		const requestAssertion = expect(requestPromise).rejects.toBeInstanceOf(MetadataSidecarRequestTimeoutError)
 
-		await vi.advanceTimersByTimeAsync(5_000)
+		await vi.advanceTimersByTimeAsync(10_000)
 
 		await requestAssertion
 		await expect(
@@ -124,7 +124,89 @@ describe("MetadataSidecarClient", () => {
 			"metadata-sidecar-request-timeout",
 			expect.objectContaining({
 				operation: "getRunBacklogMetrics",
-				timeoutMs: 5_000,
+				timeoutMs: 10_000,
+			}),
+		)
+	})
+
+	it("uses an extended timeout for full vacuum maintenance", async () => {
+		const child = new MockChildProcess()
+		testState.fork.mockReturnValue(child as any)
+		const client = new MetadataSidecarClient(createResolvedMetadataPaths("/workspace"))
+
+		await client.initialize()
+
+		const requestPromise = (
+			client as unknown as { performMaintenance: (input: { vacuumMode: "full" }) => Promise<unknown> }
+		).performMaintenance({ vacuumMode: "full" })
+		const requestAssertion = expect(requestPromise).rejects.toBeInstanceOf(MetadataSidecarRequestTimeoutError)
+
+		await vi.advanceTimersByTimeAsync(90_000)
+		expect(child.kill).not.toHaveBeenCalled()
+
+		await vi.advanceTimersByTimeAsync(510_000)
+		await requestAssertion
+		expect(testState.logger.log).toHaveBeenCalledWith(
+			"basic",
+			"MetadataSidecar",
+			"metadata-sidecar-request-timeout",
+			expect.objectContaining({
+				operation: "performMaintenance",
+				timeoutMs: 600_000,
+			}),
+		)
+	})
+
+	it("reports diagnostics for standby, online, busy, and failed states", async () => {
+		const child = new MockChildProcess()
+		testState.fork.mockReturnValue(child as any)
+		const client = new MetadataSidecarClient(createResolvedMetadataPaths("/workspace"))
+
+		expect(client.getDiagnosticsSnapshot()).toEqual(
+			expect.objectContaining({
+				role: "writer",
+				label: "metadata-writer-sidecar",
+				state: "standby",
+				pid: null,
+				pendingRequestCount: 0,
+			}),
+		)
+
+		await client.initialize()
+
+		expect(client.getDiagnosticsSnapshot()).toEqual(
+			expect.objectContaining({
+				state: "online",
+				pid: 4242,
+				pendingRequestCount: 0,
+				lastOperation: "init",
+			}),
+		)
+
+		const requestPromise = (
+			client as unknown as { getRunProgressRecord: (runId: string) => Promise<unknown> }
+		).getRunProgressRecord("run-1")
+		await Promise.resolve()
+		await vi.runAllTicks()
+		expect(client.getDiagnosticsSnapshot()).toEqual(
+			expect.objectContaining({
+				state: "busy",
+				pendingRequestCount: 1,
+				lastOperation: "getRunProgressRecord",
+			}),
+		)
+
+		const requestAssertion = expect(requestPromise).rejects.toBeInstanceOf(MetadataSidecarRequestTimeoutError)
+		await vi.advanceTimersByTimeAsync(5_000)
+		await requestAssertion
+
+		expect(client.getDiagnosticsSnapshot()).toEqual(
+			expect.objectContaining({
+				state: "failed",
+				pendingRequestCount: 0,
+				lastOperation: "getRunProgressRecord",
+				lastTimeoutMs: 5_000,
+				lastError: expect.stringContaining("getRunProgressRecord"),
 			}),
 		)
 	})
@@ -153,6 +235,107 @@ describe("MetadataSidecarClient", () => {
 		expect((progressResult as PromiseRejectedResult).reason).toBeInstanceOf(MetadataSidecarRequestTimeoutError)
 		expect(testState.fork).toHaveBeenCalledTimes(1)
 		expect((progressResult as PromiseRejectedResult).reason).not.toBeInstanceOf(MetadataSidecarUnavailableError)
+	})
+
+	it("uses the dedicated 10s claim timeout for job claims", async () => {
+		const child = new MockChildProcess()
+		testState.fork.mockReturnValue(child as any)
+		const client = new MetadataSidecarClient(createResolvedMetadataPaths("/workspace"))
+
+		await client.initialize()
+
+		const requestPromise = (
+			client as unknown as {
+				claimJobsWithLease: (jobType: string, limit: number, runId: string) => Promise<unknown>
+			}
+		).claimJobsWithLease("upsert", 10, "run-1")
+		const requestAssertion = expect(requestPromise).rejects.toBeInstanceOf(MetadataSidecarRequestTimeoutError)
+
+		await vi.advanceTimersByTimeAsync(9_999)
+		expect(child.kill).not.toHaveBeenCalled()
+
+		await vi.advanceTimersByTimeAsync(1)
+		await requestAssertion
+		expect(child.kill).toHaveBeenCalledWith("SIGTERM")
+		expect(testState.logger.log).toHaveBeenCalledWith(
+			"basic",
+			"MetadataSidecar",
+			"metadata-sidecar-request-timeout",
+			expect.objectContaining({
+				operation: "claimJobsWithLease",
+				timeoutMs: 10_000,
+			}),
+		)
+	})
+
+	it("hard-kills a timed-out sidecar when SIGTERM does not exit", async () => {
+		const child = new MockChildProcess()
+		child.kill.mockImplementation(() => true)
+		testState.fork.mockReturnValue(child as any)
+		const client = new MetadataSidecarClient(createResolvedMetadataPaths("/workspace"))
+
+		await client.initialize()
+
+		const requestPromise = (
+			client as unknown as { getRunBacklogMetrics: (runId: string) => Promise<unknown> }
+		).getRunBacklogMetrics("run-1")
+		const requestAssertion = expect(requestPromise).rejects.toBeInstanceOf(MetadataSidecarRequestTimeoutError)
+
+		await vi.advanceTimersByTimeAsync(10_000)
+		await requestAssertion
+		expect(child.kill).toHaveBeenCalledWith("SIGTERM")
+
+		await vi.advanceTimersByTimeAsync(2_000)
+		expect(child.kill).toHaveBeenCalledWith("SIGKILL")
+	})
+
+	it("lets a reader sidecar restart lazily after a read timeout without staying poisoned", async () => {
+		const firstChild = new MockChildProcess()
+		const secondChild = new MockChildProcess()
+		secondChild.pid = 4343
+		testState.fork.mockReturnValueOnce(firstChild as any).mockReturnValueOnce(secondChild as any)
+		const client = new MetadataSidecarClient(createResolvedMetadataPaths("/workspace"), { role: "reader" })
+
+		await client.initialize()
+
+		const requestPromise = (
+			client as unknown as { getRunBacklogMetrics: (runId: string) => Promise<unknown> }
+		).getRunBacklogMetrics("run-1")
+		const requestAssertion = expect(requestPromise).rejects.toBeInstanceOf(MetadataSidecarRequestTimeoutError)
+
+		await vi.advanceTimersByTimeAsync(10_000)
+		await requestAssertion
+		await vi.runAllTicks()
+		expect(client.getDiagnosticsSnapshot()).toEqual(
+			expect.objectContaining({
+				role: "reader",
+				state: "failed",
+				lastError: expect.stringContaining("getRunBacklogMetrics"),
+			}),
+		)
+
+		await client.initialize()
+
+		expect(testState.fork).toHaveBeenCalledTimes(2)
+		expect(firstChild.kill).toHaveBeenCalledWith("SIGTERM")
+		expect(client.getDiagnosticsSnapshot()).toEqual(
+			expect.objectContaining({
+				role: "reader",
+				state: "online",
+				pid: 4343,
+				lastError: null,
+			}),
+		)
+		expect(testState.logger.log).toHaveBeenCalledWith(
+			"basic",
+			"MetadataSidecar",
+			"metadata-sidecar-request-start",
+			expect.objectContaining({
+				operation: "init",
+				sidecarRole: "reader",
+				sidecarLabel: "metadata-reader-sidecar",
+			}),
+		)
 	})
 
 	it("allows reinitialization after a graceful dispose followed by a clean sidecar exit", async () => {

@@ -29,7 +29,8 @@ vi.mock("vscode", () => {
 	}
 })
 
-import { MetadataStore } from "../store/MetadataStore"
+import { MetadataStore, SqliteMetadataRepository } from "../store/MetadataStore"
+import { resolveMetadataStorePaths } from "../store/MetadataPathResolver"
 import { CODE_INDEX_V2_CHUNKER_VERSION, CODE_INDEX_V2_PARSER_VERSION } from "../shared/chunkSurfaces"
 
 describe("MetadataStore integration", () => {
@@ -108,6 +109,39 @@ describe("MetadataStore integration", () => {
 		await store.dispose()
 	})
 
+	it("opens an initialized metadata store in read-only mode without allowing mutations", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const writer = new MetadataStore(context, workspacePath)
+		await writer.initialize()
+
+		const runId = await writer.beginRun("initial-discovery")
+		await writer.markRunComplete(runId)
+		await writer.writeRunSummary({
+			runId,
+			workspaceId: writer.getWorkspaceId(),
+			triggerType: "initial-discovery",
+			state: "complete",
+			startedAt: Date.now() - 1000,
+			completedAt: Date.now(),
+			totalRunMs: 1000,
+		})
+
+		const reader = new SqliteMetadataRepository(resolveMetadataStorePaths(context, workspacePath), {
+			mode: "reader",
+		})
+		await reader.initialize()
+
+		const summaries = await reader.listRunSummaries(5)
+		expect(summaries.map((summary) => summary.runId)).toContain(runId)
+		await expect(reader.beginRun("refresh")).rejects.toThrow(/read-only/i)
+
+		await reader.dispose()
+		await writer.dispose()
+	})
+
 	it("preserves retryable stale jobs and adopts them into the next run", async () => {
 		const context = {
 			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
@@ -172,12 +206,57 @@ describe("MetadataStore integration", () => {
 				state: "running",
 			},
 		])
+		await store.heartbeatRun(staleRunId, "test-worker", {
+			filesDiscovered: 10,
+			filesHashed: 9,
+			filesParsed: 8,
+			filesPlanned: 7,
+			filesCommitted: 6,
+			stagedChunks: 5,
+			stagedChunkBytes: 4_096,
+			queuedUpsertJobs: 1,
+			runningUpsertJobs: 1,
+			queuedDeleteJobs: 0,
+			runningDeleteJobs: 0,
+			retryingParseRevisions: 2,
+			terminalFailedParseRevisions: 1,
+			retryingChunks: 3,
+			terminalFailedChunks: 0,
+			degradedRevisions: 1,
+			terminalFailedRevisions: 0,
+			parseThrottleMs: 250,
+			peakStagedChunks: 5,
+			peakQueuedJobs: 2,
+			blockingReason: "staged_chunks_waiting_for_upsert",
+		})
 
 		const cleanup = await store.cleanupStaleRuns()
 		expect(cleanup.staleRunIds).toEqual([staleRunId])
 		expect(cleanup.staleJobsPreservedForResume).toBe(1)
 		expect(cleanup.staleJobsAbandoned).toBe(0)
 		expect(cleanup.expiredRunsDeleted).toBe(0)
+		const interruptedRun = await store.getRunProgressRecord(staleRunId)
+		expect(interruptedRun?.state).toBe("stopped")
+		expect(interruptedRun?.errorMessage).toContain("Interrupted by restart")
+		const interruptedSummary = await store.getRunSummary(staleRunId)
+		expect(interruptedSummary).toEqual(
+			expect.objectContaining({
+				runId: staleRunId,
+				triggerType: "initial-discovery",
+				state: "stopped",
+				discoveredFiles: 10,
+				filesScanned: 9,
+				plannedRevisions: 7,
+				committedRevisions: 6,
+				retryingParseRevisions: 2,
+				terminalFailedParseRevisions: 1,
+				retryingChunks: 3,
+				degradedRevisions: 1,
+				lastBlockingReason: "staged_chunks_waiting_for_upsert",
+			}),
+		)
+		expect(interruptedSummary?.errorMessage).toContain("Interrupted by restart")
+		expect(interruptedSummary?.totalRunMs).toBeGreaterThanOrEqual(0)
 
 		const preservedRevision = await store.getFileRevision(revision.revisionId)
 		expect(preservedRevision.state).toBe("planned")
@@ -193,6 +272,111 @@ describe("MetadataStore integration", () => {
 
 		const adoptedRevision = await store.getFileRevision(revision.revisionId)
 		expect(adoptedRevision.runId).toBe(resumedRunId)
+
+		await store.dispose()
+	})
+
+	it("lists only ready planned revisions in discovered order with a limit", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const runId = await store.beginRun("initial-discovery")
+		let chunkCounter = 0
+
+		const createRevisionWithJobs = async (
+			relativePath: string,
+			discoveredAt: number,
+			jobStates: Array<"done" | "queued" | "running" | "terminal_failed">,
+		) => {
+			const file = await store.upsertFileRecord({
+				workspaceId,
+				relativePath,
+				normalizedPath: path.join(workspacePath, relativePath),
+				lastSeenMtimeMs: discoveredAt,
+				lastSeenSize: 100 + discoveredAt,
+				ignoreState: "included",
+			})
+			const revision = await store.createFileRevision({
+				fileId: file.fileId,
+				runId,
+				contentHash: `content-${relativePath}`,
+				fastFingerprint: `fp:${discoveredAt}`,
+				parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+				chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+				state: "planned",
+				discoveredAt,
+			})
+			await store.upsertChunks(
+				jobStates.map((state, index) => {
+					chunkCounter += 1
+					return {
+						revisionId: revision.revisionId,
+						chunkFingerprint: `chunk-fp-${chunkCounter}`,
+						startLine: index + 1,
+						endLine: index + 2,
+						language: "ts",
+						chunkKind: "function",
+						symbolName: `fn${chunkCounter}`,
+						symbolQualifiedName: `Example.fn${chunkCounter}`,
+						parentSymbolName: "Example",
+						parentChunkFingerprint: null,
+						summary: `chunk ${chunkCounter}`,
+						searchText: `chunk ${chunkCounter}`,
+						content: `export const value${chunkCounter} = ${chunkCounter}`,
+						contentHash: `chunk-hash-${chunkCounter}`,
+						state: "parsed" as const,
+					}
+				}),
+			)
+			const chunks = await store.getChunksForRevision(revision.revisionId)
+			await store.enqueueJobs(
+				chunks.map((chunk, index) => ({
+					workspaceId,
+					runId,
+					jobType: "upsert" as const,
+					entityId: chunk.chunkId,
+					state: jobStates[index] ?? "done",
+				})),
+			)
+			return revision
+		}
+
+		const readyCommitted = await createRevisionWithJobs("src/ready-a.ts", 10, ["done"])
+		await createRevisionWithJobs("src/not-ready-queued.ts", 20, ["done", "queued"])
+		const readyMixed = await createRevisionWithJobs("src/ready-b.ts", 30, ["done", "terminal_failed"])
+		await createRevisionWithJobs("src/not-ready-running.ts", 40, ["running"])
+		await createRevisionWithJobs("src/ready-c.ts", 50, ["done"])
+
+		const readyResolutions = await store.listReadyRevisionResolutions(runId, 2)
+
+		expect(readyResolutions).toHaveLength(2)
+		expect(readyResolutions.map((resolution) => resolution.revisionId)).toEqual([
+			readyCommitted.revisionId,
+			readyMixed.revisionId,
+		])
+		expect(readyResolutions[0]).toEqual(
+			expect.objectContaining({
+				doneJobs: 1,
+				queuedJobs: 0,
+				runningJobs: 0,
+				terminalFailedJobs: 0,
+				totalJobs: 1,
+			}),
+		)
+		expect(readyResolutions[1]).toEqual(
+			expect.objectContaining({
+				doneJobs: 1,
+				queuedJobs: 0,
+				runningJobs: 0,
+				terminalFailedJobs: 1,
+				totalJobs: 2,
+			}),
+		)
 
 		await store.dispose()
 	})
@@ -407,6 +591,382 @@ describe("MetadataStore integration", () => {
 		)
 
 		await store.dispose()
+	})
+
+	it("runs full metadata DB compaction only after free-space preflight passes", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-compact") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-compact")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+		const freeSpaceSpy = vi.spyOn(store as any, "getAvailableDiskBytes").mockResolvedValue(4_096_000_000)
+
+		const summary = await store.performMaintenance({
+			checkpointMode: "TRUNCATE",
+			shrinkMemory: true,
+			pruneFootprint: false,
+			vacuumMode: "full",
+		})
+
+		expect(summary.vacuumMode).toBe("full")
+		expect(summary.compaction).toEqual(
+			expect.objectContaining({
+				operationalDbBytesBefore: expect.any(Number),
+				operationalDbBytesAfter: expect.any(Number),
+				reclaimedBytes: expect.any(Number),
+				requiredFreeBytes: expect.any(Number),
+				availableFreeBytesBefore: expect.any(Number),
+				elapsedMs: expect.any(Number),
+			}),
+		)
+		expect(summary.footprintPrune).toBeUndefined()
+
+		freeSpaceSpy.mockRestore()
+		await store.dispose()
+	})
+
+	it("rejects full metadata DB compaction when free-space preflight fails", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-compact-nospace") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-compact-nospace")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+		const freeSpaceSpy = vi.spyOn(store as any, "getAvailableDiskBytes").mockResolvedValue(0)
+
+		await expect(
+			store.performMaintenance({
+				checkpointMode: "TRUNCATE",
+				shrinkMemory: true,
+				pruneFootprint: false,
+				vacuumMode: "full",
+			}),
+		).rejects.toThrow(/Insufficient free disk space/)
+
+		freeSpaceSpy.mockRestore()
+		await store.dispose()
+	})
+
+	it("safe-prunes finalized jobs and superseded chunk metadata behind an idempotent cleanup marker", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-footprint") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-footprint")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const db = (store as any).db() as {
+			prepare(sql: string): {
+				get(...params: unknown[]): Record<string, unknown> | undefined
+				run(...params: unknown[]): unknown
+			}
+		}
+		const countRows = (tableName: string) =>
+			(db.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).get() as { count: number }).count
+		const createParsedRevision = async (input: {
+			runId: string
+			relativePath: string
+			contentHash: string
+			chunkId: string
+		}) => {
+			const file = await store.upsertFileRecord({
+				workspaceId,
+				relativePath: input.relativePath,
+				normalizedPath: path.join(workspacePath, input.relativePath),
+				lastSeenMtimeMs: 123,
+				lastSeenSize: 456,
+				ignoreState: "included",
+			})
+			const revision = await store.createFileRevision({
+				fileId: file.fileId,
+				runId: input.runId,
+				contentHash: input.contentHash,
+				fastFingerprint: `${input.contentHash}:fp`,
+				parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+				chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+				state: "hashed",
+			})
+			await store.persistParsedRevision({
+				revisionId: revision.revisionId,
+				relativePath: input.relativePath,
+				chunks: [
+					{
+						chunkId: input.chunkId,
+						chunkFingerprint: `${input.chunkId}:fp`,
+						startLine: 1,
+						endLine: 1,
+						language: "ts",
+						chunkKind: "function",
+						symbolName: input.chunkId,
+						symbolQualifiedName: input.chunkId,
+						parentSymbolName: null,
+						parentChunkFingerprint: null,
+						summary: `${input.chunkId} summary`,
+						searchText: `export function ${input.chunkId.replace(/-/g, "_")}() {}`,
+						content: `export function ${input.chunkId.replace(/-/g, "_")}() {}`,
+						contentHash: createHash("sha256").update(input.chunkId).digest("hex"),
+						state: "parsed",
+						variants: [
+							{
+								variantType: "raw_code",
+								content: `export function ${input.chunkId.replace(/-/g, "_")}() {}`,
+								contentHash: createHash("sha256").update(`${input.chunkId}:variant`).digest("hex"),
+								vectorEligible: true,
+								vectorPriority: 1000,
+								vectorEligibilityReason: "canonical_grounding_surface",
+								noveltyScore: 1,
+								state: "parsed",
+							},
+						],
+					},
+				],
+			})
+			return revision
+		}
+
+		const oldRunId = await store.beginRun("initial-discovery")
+		const oldRevision = await createParsedRevision({
+			runId: oldRunId,
+			relativePath: "src/example.ts",
+			contentHash: "old-content",
+			chunkId: "old-chunk",
+		})
+		await store.markRevisionCommitted(oldRevision.revisionId)
+		await store.markRevisionSuperseded(oldRevision.revisionId)
+		await store.enqueueJobs([
+			{ workspaceId, runId: oldRunId, jobType: "upsert", entityId: "old-chunk", state: "done" },
+		])
+		db.prepare(
+			`INSERT OR IGNORE INTO chunk_lexical_fts (
+				chunk_id, relative_path, symbol_qualified_name, symbol_name, parent_symbol_name, summary, search_text
+			)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		).run("old-chunk", "src/example.ts", "old", "old", null, "old summary", "stale lexical row")
+		await store.markRunComplete(oldRunId)
+
+		const activeRunId = await store.beginRun("initial-discovery")
+		const activeRevision = await createParsedRevision({
+			runId: activeRunId,
+			relativePath: "src/example.ts",
+			contentHash: "active-content",
+			chunkId: "active-chunk",
+		})
+		await store.markRevisionCommitted(activeRevision.revisionId)
+		await store.markRunComplete(activeRunId)
+
+		const resumableRunId = await store.beginRun("initial-discovery")
+		const plannedRevision = await createParsedRevision({
+			runId: resumableRunId,
+			relativePath: "src/planned.ts",
+			contentHash: "planned-content",
+			chunkId: "planned-chunk",
+		})
+		await store.markRevisionState(plannedRevision.revisionId, "planned")
+		await store.enqueueJobs([
+			{ workspaceId, runId: resumableRunId, jobType: "upsert", entityId: "planned-chunk", state: "done" },
+		])
+		await store.markRunStopped(resumableRunId, "Stopped by user.")
+
+		expect(countRows("jobs")).toBe(2)
+		expect(countRows("chunks")).toBe(3)
+		expect(countRows("chunk_variants")).toBe(3)
+		expect(countRows("chunk_lexical_fts")).toBeGreaterThanOrEqual(2)
+
+		const summary = await store.performMaintenance({
+			checkpointMode: "PASSIVE",
+			shrinkMemory: true,
+			pruneFootprint: true,
+			markFootprintCleanup: true,
+			vacuumMode: "none",
+		})
+
+		expect(summary.vacuumMode).toBe("none")
+		expect(summary.footprintPrune).toEqual(
+			expect.objectContaining({
+				markerState: "completed",
+				prunedJobs: 1,
+				prunedChunks: 1,
+				prunedChunkVariants: 1,
+				prunedFtsRows: 1,
+				prunedRevisions: 1,
+				jobsBefore: 2,
+				jobsAfter: 1,
+				chunksBefore: 3,
+				chunksAfter: 2,
+			}),
+		)
+		expect(db.prepare(`SELECT value FROM schema_meta WHERE key = ?`).get("metadataFootprintCleanupV1")).toEqual({
+			value: "completed",
+		})
+		expect(await store.getChunksByIds(["old-chunk"])).toEqual([])
+		expect(await store.getChunksByIds(["active-chunk", "planned-chunk"])).toHaveLength(2)
+		expect(countRows("jobs")).toBe(1)
+
+		const secondSummary = await store.performMaintenance({
+			pruneFootprint: true,
+			markFootprintCleanup: true,
+			vacuumMode: "none",
+		})
+		expect(secondSummary.footprintPrune).toEqual(
+			expect.objectContaining({
+				markerState: "already_completed",
+				prunedJobs: 0,
+				prunedChunks: 0,
+			}),
+		)
+
+		const laterRunId = await store.beginRun("initial-discovery")
+		const laterRevision = await createParsedRevision({
+			runId: laterRunId,
+			relativePath: "src/later.ts",
+			contentHash: "later-content",
+			chunkId: "later-chunk",
+		})
+		await store.markRevisionCommitted(laterRevision.revisionId)
+		await store.markRevisionSuperseded(laterRevision.revisionId)
+		await store.enqueueJobs([
+			{ workspaceId, runId: laterRunId, jobType: "upsert", entityId: "later-chunk", state: "done" },
+		])
+		await store.markRunComplete(laterRunId)
+
+		const routineSummary = await store.performMaintenance({ pruneFootprint: true, vacuumMode: "none" })
+		expect(routineSummary.footprintPrune).toEqual(
+			expect.objectContaining({
+				markerState: "skipped",
+				prunedJobs: 1,
+			}),
+		)
+
+		await store.dispose()
+	})
+
+	it("keeps footprint cleanup incremental by draining finalized jobs before chunk pruning", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-footprint-bounded") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-footprint-bounded")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const db = (store as any).db() as {
+			prepare(sql: string): {
+				get(...params: unknown[]): Record<string, unknown> | undefined
+				run(...params: unknown[]): unknown
+			}
+		}
+		const originalJobBatchSize = (SqliteMetadataRepository as any).FOOTPRINT_JOB_PRUNE_BATCH_SIZE
+		;(SqliteMetadataRepository as any).FOOTPRINT_JOB_PRUNE_BATCH_SIZE = 1
+
+		try {
+			const file = await store.upsertFileRecord({
+				workspaceId,
+				relativePath: "src/example.ts",
+				normalizedPath: path.join(workspacePath, "src/example.ts"),
+				lastSeenMtimeMs: 1,
+				lastSeenSize: 1,
+				ignoreState: "included",
+			})
+			const oldRunId = await store.beginRun("initial-discovery")
+			const oldRevision = await store.createFileRevision({
+				fileId: file.fileId,
+				runId: oldRunId,
+				contentHash: "old",
+				fastFingerprint: "old-fp",
+				parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+				chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+				state: "hashed",
+			})
+			await store.persistParsedRevision({
+				revisionId: oldRevision.revisionId,
+				relativePath: "src/example.ts",
+				chunks: [
+					{
+						chunkId: "old-chunk",
+						chunkFingerprint: "old-chunk-fp",
+						startLine: 1,
+						endLine: 1,
+						language: "ts",
+						chunkKind: "function",
+						symbolName: "oldChunk",
+						symbolQualifiedName: "oldChunk",
+						parentSymbolName: null,
+						parentChunkFingerprint: null,
+						summary: "old summary",
+						searchText: "old chunk",
+						content: "old chunk",
+						contentHash: createHash("sha256").update("old chunk").digest("hex"),
+						state: "parsed",
+						variants: [],
+					},
+				],
+			})
+			await store.markRevisionCommitted(oldRevision.revisionId)
+			await store.markRevisionSuperseded(oldRevision.revisionId)
+			await store.enqueueJobs([
+				{ workspaceId, runId: oldRunId, jobType: "upsert", entityId: "old-chunk", state: "done" },
+				{ workspaceId, runId: oldRunId, jobType: "delete", entityId: "other-chunk", state: "done" },
+			])
+			await store.markRunComplete(oldRunId)
+
+			const activeRunId = await store.beginRun("initial-discovery")
+			const activeRevision = await store.createFileRevision({
+				fileId: file.fileId,
+				runId: activeRunId,
+				contentHash: "active",
+				fastFingerprint: "active-fp",
+				parserVersion: CODE_INDEX_V2_PARSER_VERSION,
+				chunkerVersion: CODE_INDEX_V2_CHUNKER_VERSION,
+				state: "committed",
+			})
+			db.prepare(`UPDATE files SET active_revision_id = ? WHERE file_id = ?`).run(
+				activeRevision.revisionId,
+				file.fileId,
+			)
+			await store.markRunComplete(activeRunId)
+
+			const firstSummary = await store.performMaintenance({
+				pruneFootprint: true,
+				markFootprintCleanup: true,
+				vacuumMode: "none",
+			})
+			expect(firstSummary.footprintPrune).toEqual(
+				expect.objectContaining({
+					markerState: "partial",
+					prunedJobs: 1,
+					prunedChunks: 0,
+					prunedRevisions: 0,
+					hasMore: true,
+					skippedChunkPruneDueToJobs: true,
+					skippedRevisionPruneDueToJobs: true,
+				}),
+			)
+			expect(await store.getChunksByIds(["old-chunk"])).toHaveLength(1)
+			expect(
+				db.prepare(`SELECT value FROM schema_meta WHERE key = ?`).get("metadataFootprintCleanupV1"),
+			).toBeUndefined()
+			;(SqliteMetadataRepository as any).FOOTPRINT_JOB_PRUNE_BATCH_SIZE = originalJobBatchSize
+			const secondSummary = await store.performMaintenance({
+				pruneFootprint: true,
+				markFootprintCleanup: true,
+				vacuumMode: "none",
+			})
+			expect(secondSummary.footprintPrune).toEqual(
+				expect.objectContaining({
+					markerState: "completed",
+					prunedJobs: 1,
+					prunedChunks: 1,
+					prunedRevisions: 1,
+					hasMore: false,
+				}),
+			)
+			expect(await store.getChunksByIds(["old-chunk"])).toEqual([])
+		} finally {
+			;(SqliteMetadataRepository as any).FOOTPRINT_JOB_PRUNE_BATCH_SIZE = originalJobBatchSize
+			await store.dispose()
+		}
 	})
 
 	it("preserves persistent telemetry history when clearing operational index storage", async () => {
@@ -1645,6 +2205,232 @@ describe("MetadataStore integration", () => {
 		await store.dispose()
 	})
 
+	it("returns only the latest actionable warning revision per file", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-5b") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-5b")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const oldRunId = await store.beginRun("initial-discovery")
+		const currentRunId = await store.beginRun("initial-discovery")
+		const setDiscoveredAt = (revisionId: string, discoveredAt: number) => {
+			;(store as any)
+				.db()
+				.prepare(`UPDATE file_revisions SET discovered_at = ? WHERE revision_id = ?`)
+				.run(discoveredAt, revisionId)
+		}
+		const createRevision = async (
+			relativePath: string,
+			runId: string,
+			contentHash: string,
+			discoveredAt: number,
+			state: "committed" | "failed" | "degraded" | "terminal_failed",
+			failureReason: string,
+		) => {
+			const file = await store.upsertFileRecord({
+				workspaceId,
+				relativePath,
+				normalizedPath: path.join(workspacePath, relativePath),
+				lastSeenMtimeMs: discoveredAt,
+				lastSeenSize: discoveredAt + 10,
+				ignoreState: "included",
+			})
+			const revision = await store.createFileRevision({
+				fileId: file.fileId,
+				runId,
+				contentHash,
+				fastFingerprint: `${discoveredAt + 10}:${discoveredAt}`,
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+				state: state === "committed" ? "committed" : "hashed",
+			})
+			setDiscoveredAt(revision.revisionId, discoveredAt)
+
+			if (state === "failed") {
+				await store.markRevisionFailed(revision.revisionId, failureReason)
+			} else if (state === "degraded") {
+				await store.markRevisionDegraded(revision.revisionId, failureReason)
+			} else if (state === "terminal_failed") {
+				await store.markRevisionTerminalFailure(revision.revisionId, failureReason)
+			}
+
+			return revision
+		}
+
+		await createRevision("src/generated.pb.go", oldRunId, "old-generated", 100, "failed", "Stopped by user.")
+		await createRevision(
+			"src/generated.pb.go",
+			currentRunId,
+			"new-generated",
+			200,
+			"terminal_failed",
+			"Maximum call stack size exceeded",
+		)
+		await createRevision("src/recovered.ts", oldRunId, "old-recovered", 110, "failed", "Stopped by user.")
+		await createRevision("src/recovered.ts", currentRunId, "new-recovered", 210, "committed", "")
+		await createRevision("src/degraded.ts", currentRunId, "degraded", 220, "degraded", "partial parse")
+		await createRevision("src/latest-failed.ts", currentRunId, "latest-failed", 230, "failed", "embed failed")
+
+		const allWarnings = await store.listRevisionWarnings(workspaceId, 10, 0, "all", "path")
+		expect(allWarnings.total).toBe(3)
+		expect(allWarnings.items.map((item) => item.relativePath)).toEqual([
+			"src/degraded.ts",
+			"src/generated.pb.go",
+			"src/latest-failed.ts",
+		])
+		expect(allWarnings.items.find((item) => item.relativePath === "src/generated.pb.go")).toMatchObject({
+			category: "parser_failed",
+			failureReason: "Maximum call stack size exceeded",
+		})
+		expect(allWarnings.items.some((item) => item.failureReason === "Stopped by user.")).toBe(false)
+
+		const parserOnly = await store.listRevisionWarnings(workspaceId, 10, 0, "parser_failed")
+		expect(parserOnly.total).toBe(1)
+		expect(parserOnly.items[0]?.relativePath).toBe("src/generated.pb.go")
+
+		const failedOnly = await store.listRevisionWarnings(workspaceId, 10, 0, "failed")
+		expect(failedOnly.total).toBe(1)
+		expect(failedOnly.items[0]?.relativePath).toBe("src/latest-failed.ts")
+
+		const degradedOnly = await store.listRevisionWarnings(workspaceId, 10, 0, "degraded")
+		expect(degradedOnly.total).toBe(1)
+		expect(degradedOnly.items[0]?.relativePath).toBe("src/degraded.ts")
+
+		expect(await store.listWarningRelativePaths(workspaceId, "all")).toEqual([
+			"src/degraded.ts",
+			"src/generated.pb.go",
+			"src/latest-failed.ts",
+		])
+		expect(await store.listWarningRelativePaths(workspaceId, "failed")).toEqual(["src/latest-failed.ts"])
+
+		await store.dispose()
+	})
+
+	it("prunes older non-actionable failed revisions once a newer committed revision exists", async () => {
+		const context = {
+			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-5c") },
+		} as any
+		const workspacePath = path.join(tempRoot, "workspace-5c")
+		const store = new MetadataStore(context, workspacePath)
+		await store.initialize()
+
+		const workspaceId = store.getWorkspaceId()
+		const db = (store as any).db() as {
+			prepare(sql: string): {
+				get(...params: unknown[]): Record<string, unknown> | undefined
+				run(...params: unknown[]): unknown
+			}
+		}
+		const setDiscoveredAt = (revisionId: string, discoveredAt: number) => {
+			db.prepare(`UPDATE file_revisions SET discovered_at = ? WHERE revision_id = ?`).run(
+				discoveredAt,
+				revisionId,
+			)
+		}
+		const createRevision = async (
+			relativePath: string,
+			runId: string,
+			contentHash: string,
+			discoveredAt: number,
+			state: "committed" | "failed" | "terminal_failed",
+			failureReason: string,
+		) => {
+			const file = await store.upsertFileRecord({
+				workspaceId,
+				relativePath,
+				normalizedPath: path.join(workspacePath, relativePath),
+				lastSeenMtimeMs: discoveredAt,
+				lastSeenSize: discoveredAt + 10,
+				ignoreState: "included",
+			})
+			const revision = await store.createFileRevision({
+				fileId: file.fileId,
+				runId,
+				contentHash,
+				fastFingerprint: `${discoveredAt + 10}:${discoveredAt}`,
+				parserVersion: "parser-v1",
+				chunkerVersion: "chunker-v1",
+				state: state === "committed" ? "committed" : "hashed",
+			})
+			setDiscoveredAt(revision.revisionId, discoveredAt)
+
+			if (state === "failed") {
+				await store.markRevisionFailed(revision.revisionId, failureReason)
+			} else if (state === "terminal_failed") {
+				await store.markRevisionTerminalFailure(revision.revisionId, failureReason)
+			}
+
+			return revision
+		}
+
+		const oldRunId = await store.beginRun("initial-discovery")
+		const currentRunId = await store.beginRun("initial-discovery")
+		const oldFailed = await createRevision(
+			"src/recovered.ts",
+			oldRunId,
+			"old-recovered",
+			100,
+			"failed",
+			"Stopped by user.",
+		)
+		const oldTerminal = await createRevision(
+			"src/generated.pb.go",
+			oldRunId,
+			"old-generated",
+			110,
+			"terminal_failed",
+			"Maximum call stack size exceeded",
+		)
+		const latestCommitted = await createRevision(
+			"src/recovered.ts",
+			currentRunId,
+			"new-recovered",
+			200,
+			"committed",
+			"",
+		)
+		await store.markRevisionCommitted(latestCommitted.revisionId)
+		await createRevision("src/current-failed.ts", currentRunId, "current-failed", 210, "failed", "still actionable")
+
+		const summary = await store.performMaintenance({
+			pruneFootprint: true,
+			markFootprintCleanup: true,
+			vacuumMode: "none",
+		})
+
+		expect(summary.footprintPrune).toEqual(
+			expect.objectContaining({
+				markerState: "completed",
+				prunedRevisions: 1,
+				hasMore: false,
+			}),
+		)
+		expect(
+			db
+				.prepare(`SELECT revision_id AS revisionId FROM file_revisions WHERE revision_id = ?`)
+				.get(oldFailed.revisionId),
+		).toBeUndefined()
+		expect(
+			db
+				.prepare(`SELECT revision_id AS revisionId FROM file_revisions WHERE revision_id = ?`)
+				.get(oldTerminal.revisionId),
+		).toEqual({ revisionId: oldTerminal.revisionId })
+		expect(
+			db
+				.prepare(`SELECT revision_id AS revisionId FROM file_revisions WHERE revision_id = ?`)
+				.get(latestCommitted.revisionId),
+		).toEqual({ revisionId: latestCommitted.revisionId })
+		expect(await store.listWarningRelativePaths(workspaceId, "all")).toEqual([
+			"src/current-failed.ts",
+			"src/generated.pb.go",
+		])
+
+		await store.dispose()
+	})
+
 	it("persists and paginates tracked oversized files", async () => {
 		const context = {
 			globalStorageUri: { fsPath: path.join(tempRoot, "global-storage-6") },
@@ -1767,6 +2553,8 @@ describe("MetadataStore integration", () => {
 
 		const recordA = await store.getFileRecordByWorkspacePath(workspaceId, "src/a.ts")
 		const recordB = await store.getFileRecordByWorkspacePath(workspaceId, "src/b.ts")
+
+		await expect(store.countTrackedFilesForWorkspace(workspaceId)).resolves.toBe(1)
 
 		expect(recordA).toEqual(
 			expect.objectContaining({

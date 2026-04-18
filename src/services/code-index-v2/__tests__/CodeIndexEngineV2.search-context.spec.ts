@@ -51,7 +51,9 @@ vi.mock("../store/MetadataStore", () => ({
 }))
 
 vi.mock("../sidecar/MetadataSidecarClient", () => ({
-	MetadataSidecarClient: vi.fn(() => testState.mocks.metadataStore),
+	MetadataSidecarClient: vi.fn((_paths: unknown, options?: { role?: string }) =>
+		options?.role === "reader" ? testState.mocks.metadataReadStore : testState.mocks.metadataStore,
+	),
 }))
 
 vi.mock("../store/MetadataPathResolver", () => ({
@@ -289,6 +291,53 @@ describe("CodeIndexEngineV2 search context", () => {
 		expect(trace.stages.lexical).toHaveLength(0)
 		expect(trace.stages.final[0]?.payload?.filePath).toBe("src/services/code-index-v2/engine/CodeIndexEngineV2.ts")
 		expect(trace.timingsMs.lexicalRetrievalMs).toBeGreaterThanOrEqual(0)
+	})
+
+	it("routes search metadata reads through the reader gateway instead of the writer gateway", async () => {
+		testState.mocks.vectorStore.search.mockResolvedValueOnce([])
+		testState.mocks.metadataStore.searchActiveChunksLexicallyWithStatus = vi.fn().mockResolvedValue({
+			results: [],
+			status: "completed",
+			mode: "fts_only",
+			timingsMs: {
+				ftsMs: 1,
+				fallbackMs: 0,
+				totalMs: 1,
+			},
+		})
+		testState.mocks.metadataReadStore.searchActiveChunksLexicallyWithStatus = vi.fn().mockResolvedValue({
+			results: [
+				createLexicalChunk({
+					chunkId: "reader-lexical",
+					chunkFingerprint: "reader-fp",
+					chunkKind: "method",
+					summary: "Reader side lexical result",
+					searchText: "reader gateway lexical result",
+					content: "function readerGatewayResult() {}",
+					contentHash: "reader-hash",
+					vectorPointId: "reader-vector",
+					relativePath: "src/reader.ts",
+					normalizedPath: "/workspace/src/reader.ts",
+					lexicalScore: 30,
+				}),
+			],
+			status: "completed",
+			mode: "fts_only",
+			timingsMs: {
+				ftsMs: 2,
+				fallbackMs: 0,
+				totalMs: 2,
+			},
+		})
+
+		const engine = createEngine()
+		await engine.start()
+
+		const trace = await engine.searchDebug!("How does Roo route search metadata reads", 5)
+
+		expect(testState.mocks.metadataReadStore.searchActiveChunksLexicallyWithStatus).toHaveBeenCalled()
+		expect(testState.mocks.metadataStore.searchActiveChunksLexicallyWithStatus).not.toHaveBeenCalled()
+		expect(trace.stages.final[0]?.payload?.filePath).toBe("src/reader.ts")
 	})
 
 	it("uses separate dependency instances for indexing and search", async () => {

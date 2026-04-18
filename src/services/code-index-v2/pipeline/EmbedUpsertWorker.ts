@@ -62,6 +62,11 @@ export interface EmbedUpsertSummary {
 	waitingForJobsMs?: number
 	waitingForInFlightCapacityMs?: number
 	waitingForPressureMs?: number
+	vectorWriteQueueDepth?: number
+	queuedVectorWriteBatches?: number
+	queuedVectorWriteEmbeddings?: number
+	vectorWriteBackpressureMs?: number
+	laneReleasedAfterEmbedMs?: number
 	providerBatchUtilization?: number
 	embeddingsPerChunk?: number
 	storedVariantsPerChunk?: number
@@ -133,6 +138,11 @@ export interface EmbedUpsertProgress {
 	waitingForJobsMs?: number
 	waitingForInFlightCapacityMs?: number
 	waitingForPressureMs?: number
+	vectorWriteQueueDepth?: number
+	queuedVectorWriteBatches?: number
+	queuedVectorWriteEmbeddings?: number
+	vectorWriteBackpressureMs?: number
+	laneReleasedAfterEmbedMs?: number
 	providerBatchUtilization?: number
 	embeddingsPerChunk?: number
 	storedVariantsPerChunk?: number
@@ -172,7 +182,25 @@ interface BatchTelemetry {
 	sidecarDeliveryDelayMs?: number
 	hostFinalizeLatencyMs?: number
 	pressureLatencyMs?: number
+	vectorWriteQueueDepth?: number
+	queuedVectorWriteBatches?: number
+	queuedVectorWriteEmbeddings?: number
+	vectorWriteBackpressureMs?: number
+	laneReleasedAfterEmbedMs?: number
 	totalLatencyMs: number
+}
+
+interface EmbedUpsertEmbeddedEvent {
+	embeddingCount: number
+	embedLatencyMs: number
+	pointIds: string[]
+	sidecarRoundTripLatencyMs?: number
+	sidecarDeliveryDelayMs?: number
+	vectorWriteQueueDepth?: number
+	queuedVectorWriteBatches?: number
+	queuedVectorWriteEmbeddings?: number
+	vectorWriteBackpressureMs?: number
+	laneReleasedAfterEmbedMs?: number
 }
 
 interface EmbedUpsertExecutor {
@@ -181,6 +209,9 @@ interface EmbedUpsertExecutor {
 		laneId: number,
 		items: EmbedUpsertBatchItem[],
 		signal?: AbortSignal,
+		options?: {
+			onEmbedded?: (event: EmbedUpsertEmbeddedEvent) => void
+		},
 	): Promise<EmbedUpsertExecutionResult>
 	recycleClients?(reason: "pressure" | "interval" | "shutdown"): Promise<void>
 	dispose?(): Promise<void>
@@ -241,12 +272,16 @@ export class EmbedUpsertWorker {
 	private static readonly SOFT_PRESSURE_MAX_IN_FLIGHT_CHUNKS = 200
 	private static readonly HARD_PRESSURE_MAX_IN_FLIGHT_CHUNKS = 40
 	private static readonly WAIT_ACCUMULATION_MS = 250
+	private static readonly JOB_HEARTBEAT_INTERVAL_MS = 10_000
 	private static readonly ACTIVATION_BURST_LIMIT = 32
 	private static readonly LOCAL_LANE_RAMP_GPU_TARGET_PERCENT = 82
 	private static readonly LOCAL_LANE_RAMP_REQUIRED_WINDOWS = 3
 	private static readonly LOCAL_LANE_RAMP_COOLDOWN_WINDOWS = 2
 	private static readonly LOCAL_LANE_RAMP_EXTERNAL_DELTA_MB = 96
 	private static readonly LOCAL_LANE_RAMP_EXTERNAL_HEADROOM_MB = 120
+	private static readonly LOCAL_LANE_RAMP_WRITE_TAIL_MS = 250
+	private static readonly LOCAL_LANE_RAMP_MAX_WRITE_LATENCY_MS = 750
+	private static readonly LOCAL_LANE_RAMP_MAX_METADATA_COMMIT_LATENCY_MS = 750
 	private readonly batchSize: number
 	private readonly laneConcurrency: number
 	private readonly laneConcurrencyCap: number
@@ -382,6 +417,11 @@ export class EmbedUpsertWorker {
 		let totalWaitingForJobsMs = 0
 		let totalWaitingForInFlightCapacityMs = 0
 		let totalWaitingForPressureMs = 0
+		let totalVectorWriteBackpressureMs = 0
+		let latestVectorWriteQueueDepth: number | undefined
+		let latestQueuedVectorWriteBatches: number | undefined
+		let latestQueuedVectorWriteEmbeddings: number | undefined
+		let latestLaneReleasedAfterEmbedMs: number | undefined
 		let latestPressureReasons: EmbedPressureReason[] = []
 		let pressureSoftTransitions = 0
 		let pressureHardTransitions = 0
@@ -401,8 +441,14 @@ export class EmbedUpsertWorker {
 		let localLaneRampHeadroomWindows = 0
 		let localLaneRampCooldownWindows = 0
 		let lastLaneRampExternalMB: number | undefined
+		let laneRampHardCapLogged = false
+		let laneRampPressureBackoffLogged = false
+		let laneRampLatencyBackoffLogged = false
 		const gpuSampler = this.embeddingAdapter.runtimeKind === "local" ? new MacGpuTelemetrySampler() : undefined
 		const recentBatchLatencies: number[] = []
+		const recentUpsertLatencies: number[] = []
+		const recentMetadataCommitLatencies: number[] = []
+		const recentWriteTailLatencies: number[] = []
 		const workerStartedAt = Date.now()
 		lastPressureDurationAt = workerStartedAt
 		this.lastBatchCompletedAt = workerStartedAt
@@ -411,6 +457,19 @@ export class EmbedUpsertWorker {
 		this.peakInFlightChunkCount = 0
 		this.completedBatchCount = 0
 		this.workerPhase = "idle"
+
+		const recordRecentLatency = (target: number[], latencyMs: number | undefined) => {
+			if (typeof latencyMs !== "number" || !Number.isFinite(latencyMs) || latencyMs < 0) {
+				return
+			}
+			target.push(latencyMs)
+			if (target.length > 4) {
+				target.shift()
+			}
+		}
+
+		const averageRecentLatency = (values: number[]) =>
+			values.length > 0 ? values.reduce((sum, latency) => sum + latency, 0) / values.length : 0
 
 		const updatePressureDurations = (now = Date.now()) => {
 			const elapsed = Math.max(now - lastPressureDurationAt, 0)
@@ -492,16 +551,16 @@ export class EmbedUpsertWorker {
 		} => {
 			const memory = IndexDebugLoggerV2.getMemorySnapshot()
 			const pressureLatencyMs = batchTelemetry?.pressureLatencyMs ?? batchTelemetry?.totalLatencyMs
-			if (pressureLatencyMs) {
-				recentBatchLatencies.push(pressureLatencyMs)
-				if (recentBatchLatencies.length > 4) {
-					recentBatchLatencies.shift()
-				}
-			}
-			const averageRecentLatency =
-				recentBatchLatencies.length > 0
-					? recentBatchLatencies.reduce((sum, latency) => sum + latency, 0) / recentBatchLatencies.length
-					: 0
+			recordRecentLatency(recentBatchLatencies, pressureLatencyMs)
+			recordRecentLatency(recentUpsertLatencies, batchTelemetry?.upsertLatencyMs)
+			recordRecentLatency(recentMetadataCommitLatencies, batchTelemetry?.metadataCommitLatencyMs)
+			const writeTailLatencyMs =
+				(batchTelemetry?.upsertLatencyMs ?? 0) +
+				(batchTelemetry?.metadataCommitLatencyMs ?? 0) +
+				(batchTelemetry?.sidecarDeliveryDelayMs ?? 0) +
+				(batchTelemetry?.hostFinalizeLatencyMs ?? 0)
+			recordRecentLatency(recentWriteTailLatencies, writeTailLatencyMs > 0 ? writeTailLatencyMs : undefined)
+			const averagePressureLatency = averageRecentLatency(recentBatchLatencies)
 			const { laneOccupancyPercent } = computeWorkerUtilizationMetrics()
 			const previousState = pressureState
 			const reasons: EmbedPressureReason[] = []
@@ -512,8 +571,8 @@ export class EmbedUpsertWorker {
 				hardMemoryPressure ||
 				memory.rssMB >= EmbedUpsertWorker.SOFT_PRESSURE_RSS_MB ||
 				memory.externalMB >= EmbedUpsertWorker.SOFT_PRESSURE_EXTERNAL_MB
-			const latencyPressure = averageRecentLatency >= EmbedUpsertWorker.SOFT_PRESSURE_BATCH_LATENCY_MS
-			const hardLatencyPressure = averageRecentLatency >= EmbedUpsertWorker.HARD_PRESSURE_BATCH_LATENCY_MS
+			const latencyPressure = averagePressureLatency >= EmbedUpsertWorker.SOFT_PRESSURE_BATCH_LATENCY_MS
+			const hardLatencyPressure = averagePressureLatency >= EmbedUpsertWorker.HARD_PRESSURE_BATCH_LATENCY_MS
 			const hasActiveEmbedWork =
 				this.inFlightChunkCount > 0 ||
 				this.activeLaneCount > 0 ||
@@ -552,7 +611,7 @@ export class EmbedUpsertWorker {
 			} else if (
 				memory.rssMB < EmbedUpsertWorker.SOFT_PRESSURE_RSS_MB - 100 &&
 				memory.externalMB < EmbedUpsertWorker.SOFT_PRESSURE_EXTERNAL_MB - 100 &&
-				averageRecentLatency < EmbedUpsertWorker.SOFT_PRESSURE_BATCH_LATENCY_MS * 0.85
+				averagePressureLatency < EmbedUpsertWorker.SOFT_PRESSURE_BATCH_LATENCY_MS * 0.85
 			) {
 				updatePressureDurations()
 				pressureState = "normal"
@@ -673,10 +732,6 @@ export class EmbedUpsertWorker {
 				softMemoryPressure: boolean
 			},
 		) => {
-			if (!this.dynamicLocalLaneRampEnabled) {
-				return
-			}
-
 			const externalDeltaMB = lastLaneRampExternalMB != null ? memory.externalMB - lastLaneRampExternalMB : 0
 			const hasStableExternalMemory =
 				lastLaneRampExternalMB == null || externalDeltaMB < EmbedUpsertWorker.LOCAL_LANE_RAMP_EXTERNAL_DELTA_MB
@@ -691,6 +746,63 @@ export class EmbedUpsertWorker {
 			const enoughQueuedWork =
 				this.activeLaneCount >= effectiveLaneConcurrency &&
 				this.inFlightChunkCount >= Math.max(effectiveBatchSize, effectiveLaneConcurrency * effectiveBatchSize)
+			const averageUpsertLatencyMs = averageRecentLatency(recentUpsertLatencies)
+			const averageMetadataCommitLatencyMs = averageRecentLatency(recentMetadataCommitLatencies)
+			const averageWriteTailLatencyMs = averageRecentLatency(recentWriteTailLatencies)
+			const utilizationMetrics = computeWorkerUtilizationMetrics()
+			const writeTailGap =
+				averageWriteTailLatencyMs >= EmbedUpsertWorker.LOCAL_LANE_RAMP_WRITE_TAIL_MS &&
+				utilizationMetrics.embedActivePercent < 95
+			const rampSignals = [
+				hasGpuHeadroom ? "gpu-headroom" : undefined,
+				writeTailGap ? "write-tail-gap" : undefined,
+			].filter((signal): signal is string => Boolean(signal))
+			const hasRampSignal = rampSignals.length > 0
+			const writeLatencyHealthy =
+				averageUpsertLatencyMs === 0 ||
+				averageUpsertLatencyMs <= EmbedUpsertWorker.LOCAL_LANE_RAMP_MAX_WRITE_LATENCY_MS
+			const metadataCommitLatencyHealthy =
+				averageMetadataCommitLatencyMs === 0 ||
+				averageMetadataCommitLatencyMs <= EmbedUpsertWorker.LOCAL_LANE_RAMP_MAX_METADATA_COMMIT_LATENCY_MS
+			const hasRetryOrFailureSignals =
+				retryingChunks > 0 || terminallyFailedChunks > 0 || degradedRevisions > 0 || terminalFailedRevisions > 0
+			const logLaneRampDecision = (message: string, reason: string) => {
+				IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", message, {
+					component: "EmbedUpsertWorker",
+					runId,
+					workspacePath: this.workspacePath,
+					provider: this.embeddingAdapter.provider,
+					modelId: this.embeddingAdapter.modelId,
+					laneConcurrency: effectiveLaneConcurrency,
+					laneConcurrencyCap: this.laneConcurrencyCap,
+					reason,
+					rampSignals,
+					pressureState,
+					activeLaneCount: this.activeLaneCount,
+					inFlightChunkCount: this.inFlightChunkCount,
+					effectiveBatchSize,
+					averageUpsertLatencyMs,
+					averageMetadataCommitLatencyMs,
+					averageWriteTailLatencyMs,
+					externalMB: memory.externalMB,
+					rssMB: memory.rssMB,
+					gpuUtilizationPercent,
+				})
+			}
+
+			if (!this.dynamicLocalLaneRampEnabled) {
+				if (
+					this.embeddingAdapter.runtimeKind === "local" &&
+					!laneRampHardCapLogged &&
+					hasRampSignal &&
+					enoughQueuedWork
+				) {
+					laneRampHardCapLogged = true
+					logLaneRampDecision("embed-upsert-lane-ramp-blocked", "hard-cap")
+				}
+				lastLaneRampExternalMB = memory.externalMB
+				return
+			}
 
 			if (options.hardMemoryPressure) {
 				localLaneRampHeadroomWindows = 0
@@ -719,6 +831,10 @@ export class EmbedUpsertWorker {
 			if (options.softMemoryPressure) {
 				localLaneRampHeadroomWindows = 0
 				localLaneRampCooldownWindows = EmbedUpsertWorker.LOCAL_LANE_RAMP_COOLDOWN_WINDOWS
+				if (!laneRampPressureBackoffLogged && hasRampSignal && enoughQueuedWork) {
+					laneRampPressureBackoffLogged = true
+					logLaneRampDecision("embed-upsert-lane-ramp-blocked", "pressure-backoff")
+				}
 				lastLaneRampExternalMB = memory.externalMB
 				return
 			}
@@ -732,10 +848,13 @@ export class EmbedUpsertWorker {
 
 			if (
 				pressureState === "normal" &&
-				hasGpuHeadroom &&
+				hasRampSignal &&
 				hasExternalHeadroom &&
 				hasStableExternalMemory &&
 				enoughQueuedWork &&
+				writeLatencyHealthy &&
+				metadataCommitLatencyHealthy &&
+				!hasRetryOrFailureSignals &&
 				effectiveLaneConcurrency < this.laneConcurrencyCap
 			) {
 				localLaneRampHeadroomWindows++
@@ -752,13 +871,42 @@ export class EmbedUpsertWorker {
 						modelId: this.embeddingAdapter.modelId,
 						previousLaneConcurrency,
 						laneConcurrency: effectiveLaneConcurrency,
-						reason: "gpu-headroom",
+						reason: rampSignals[0] ?? "gpu-headroom",
+						rampSignals,
 						externalMB: memory.externalMB,
 						rssMB: memory.rssMB,
+						averageUpsertLatencyMs,
+						averageMetadataCommitLatencyMs,
+						averageWriteTailLatencyMs,
 						gpuUtilizationPercent,
 					})
 				}
 			} else {
+				if (
+					hasRampSignal &&
+					enoughQueuedWork &&
+					effectiveLaneConcurrency >= this.laneConcurrencyCap &&
+					!laneRampHardCapLogged
+				) {
+					laneRampHardCapLogged = true
+					logLaneRampDecision("embed-upsert-lane-ramp-blocked", "hard-cap")
+				} else if (
+					hasRampSignal &&
+					enoughQueuedWork &&
+					pressureState !== "normal" &&
+					!laneRampPressureBackoffLogged
+				) {
+					laneRampPressureBackoffLogged = true
+					logLaneRampDecision("embed-upsert-lane-ramp-blocked", "pressure-backoff")
+				} else if (
+					hasRampSignal &&
+					enoughQueuedWork &&
+					(!writeLatencyHealthy || !metadataCommitLatencyHealthy || hasRetryOrFailureSignals) &&
+					!laneRampLatencyBackoffLogged
+				) {
+					laneRampLatencyBackoffLogged = true
+					logLaneRampDecision("embed-upsert-lane-ramp-blocked", "latency-or-retry-backoff")
+				}
 				localLaneRampHeadroomWindows = 0
 			}
 
@@ -777,6 +925,11 @@ export class EmbedUpsertWorker {
 				totalHostFinalizeLatencyMs += batchTelemetry.hostFinalizeLatencyMs ?? 0
 				totalPressureLatencyMs += batchTelemetry.pressureLatencyMs ?? 0
 				totalIdleGapMs += batchTelemetry.idleGapMs ?? 0
+				totalVectorWriteBackpressureMs += batchTelemetry.vectorWriteBackpressureMs ?? 0
+				latestVectorWriteQueueDepth = batchTelemetry.vectorWriteQueueDepth
+				latestQueuedVectorWriteBatches = batchTelemetry.queuedVectorWriteBatches
+				latestQueuedVectorWriteEmbeddings = batchTelemetry.queuedVectorWriteEmbeddings
+				latestLaneReleasedAfterEmbedMs = batchTelemetry.laneReleasedAfterEmbedMs
 				totalEmbeddingCount += batchTelemetry.embeddingCount
 				totalRequestedChunkCount += batchTelemetry.batchSize
 				totalStoredVariantCount += batchTelemetry.storedVariantCount ?? 0
@@ -917,6 +1070,11 @@ export class EmbedUpsertWorker {
 				waitingForJobsMs: totalWaitingForJobsMs,
 				waitingForInFlightCapacityMs: totalWaitingForInFlightCapacityMs,
 				waitingForPressureMs: totalWaitingForPressureMs,
+				vectorWriteQueueDepth: latestVectorWriteQueueDepth,
+				queuedVectorWriteBatches: latestQueuedVectorWriteBatches,
+				queuedVectorWriteEmbeddings: latestQueuedVectorWriteEmbeddings,
+				vectorWriteBackpressureMs: totalVectorWriteBackpressureMs,
+				laneReleasedAfterEmbedMs: latestLaneReleasedAfterEmbedMs,
 				providerBatchUtilization,
 				embeddingsPerChunk: utilizationMetrics.embeddingsPerChunk,
 				storedVariantsPerChunk: utilizationMetrics.storedVariantsPerChunk,
@@ -966,6 +1124,11 @@ export class EmbedUpsertWorker {
 					sidecarDeliveryDelayMs: batchTelemetry.sidecarDeliveryDelayMs,
 					hostFinalizeLatencyMs: batchTelemetry.hostFinalizeLatencyMs,
 					pressureLatencyMs: batchTelemetry.pressureLatencyMs,
+					vectorWriteQueueDepth: batchTelemetry.vectorWriteQueueDepth,
+					queuedVectorWriteBatches: batchTelemetry.queuedVectorWriteBatches,
+					queuedVectorWriteEmbeddings: batchTelemetry.queuedVectorWriteEmbeddings,
+					vectorWriteBackpressureMs: batchTelemetry.vectorWriteBackpressureMs,
+					laneReleasedAfterEmbedMs: batchTelemetry.laneReleasedAfterEmbedMs,
 					idleGapMs: batchTelemetry.idleGapMs,
 					providerBatchUtilization,
 					embeddingsPerChunk: utilizationMetrics.embeddingsPerChunk,
@@ -1064,6 +1227,35 @@ export class EmbedUpsertWorker {
 			)
 		}
 
+		const listReadyRevisionResolutions = async (limit: number): Promise<PlannedRevisionResolution[]> => {
+			const listViaStore = await (
+				this.metadataStore as MetadataGateway & {
+					listReadyRevisionResolutions?: (
+						runId: string,
+						limit: number,
+					) => Promise<PlannedRevisionResolution[]>
+				}
+			).listReadyRevisionResolutions?.(runId, limit)
+			if (listViaStore) {
+				return listViaStore
+			}
+
+			return (await listPlannedRevisionResolutions())
+				.map((resolution) => buildReadyRevisionResolution(resolution))
+				.filter((resolution): resolution is ReadyRevisionResolution => Boolean(resolution))
+				.slice(0, limit)
+				.map((resolution) => ({
+					revisionId: resolution.revisionId,
+					fileId: resolution.fileId,
+					previousRevisionId: resolution.previousRevisionId,
+					doneJobs: resolution.disposition === "terminal_failed" ? 0 : 1,
+					queuedJobs: 0,
+					runningJobs: 0,
+					terminalFailedJobs: resolution.disposition === "committed" ? 0 : 1,
+					totalJobs: 1,
+				}))
+		}
+
 		const buildReadyRevisionResolution = (
 			resolution: PlannedRevisionResolution,
 		): ReadyRevisionResolution | undefined => {
@@ -1151,10 +1343,9 @@ export class EmbedUpsertWorker {
 		}
 
 		const finalizeReadyRevisionBurst = async (): Promise<boolean> => {
-			const readyResolutions = (await listPlannedRevisionResolutions())
+			const readyResolutions = (await listReadyRevisionResolutions(EmbedUpsertWorker.ACTIVATION_BURST_LIMIT))
 				.map((resolution) => buildReadyRevisionResolution(resolution))
 				.filter((resolution): resolution is ReadyRevisionResolution => Boolean(resolution))
-				.slice(0, EmbedUpsertWorker.ACTIVATION_BURST_LIMIT)
 
 			if (readyResolutions.length === 0) {
 				return false
@@ -1352,6 +1543,11 @@ export class EmbedUpsertWorker {
 			waitingForJobsMs: totalWaitingForJobsMs,
 			waitingForInFlightCapacityMs: totalWaitingForInFlightCapacityMs,
 			waitingForPressureMs: totalWaitingForPressureMs,
+			vectorWriteQueueDepth: latestVectorWriteQueueDepth,
+			queuedVectorWriteBatches: latestQueuedVectorWriteBatches,
+			queuedVectorWriteEmbeddings: latestQueuedVectorWriteEmbeddings,
+			vectorWriteBackpressureMs: totalVectorWriteBackpressureMs,
+			laneReleasedAfterEmbedMs: latestLaneReleasedAfterEmbedMs,
 			embeddingsPerChunk: finalUtilizationMetrics.embeddingsPerChunk,
 			storedVariantsPerChunk: finalUtilizationMetrics.storedVariantsPerChunk,
 			embeddedVariantsPerChunk: finalUtilizationMetrics.embeddedVariantsPerChunk,
@@ -1419,6 +1615,11 @@ export class EmbedUpsertWorker {
 			waitingForJobsMs: totalWaitingForJobsMs,
 			waitingForInFlightCapacityMs: totalWaitingForInFlightCapacityMs,
 			waitingForPressureMs: totalWaitingForPressureMs,
+			vectorWriteQueueDepth: latestVectorWriteQueueDepth,
+			queuedVectorWriteBatches: latestQueuedVectorWriteBatches,
+			queuedVectorWriteEmbeddings: latestQueuedVectorWriteEmbeddings,
+			vectorWriteBackpressureMs: totalVectorWriteBackpressureMs,
+			laneReleasedAfterEmbedMs: latestLaneReleasedAfterEmbedMs,
 			embeddingsPerChunk: finalUtilizationMetrics.embeddingsPerChunk,
 			storedVariantsPerChunk: finalUtilizationMetrics.storedVariantsPerChunk,
 			embeddedVariantsPerChunk: finalUtilizationMetrics.embeddedVariantsPerChunk,
@@ -1463,8 +1664,34 @@ export class EmbedUpsertWorker {
 		},
 	): Promise<void> {
 		const activeTasks = new Set<Promise<void>>()
+		const schedulerWakeups = new Set<() => void>()
 		let nextLaneId = 1
 		let nextRecycleAtBatch = EmbedUpsertWorker.V2_CLIENT_RECYCLE_INTERVAL
+		const wakeScheduler = () => {
+			for (const wake of Array.from(schedulerWakeups)) {
+				wake()
+			}
+		}
+		const waitForSchedulerWake = () => {
+			let wake: (() => void) | undefined
+			const promise = new Promise<void>((resolve) => {
+				wake = () => {
+					if (wake) {
+						schedulerWakeups.delete(wake)
+					}
+					resolve()
+				}
+				schedulerWakeups.add(wake)
+			})
+			return {
+				promise,
+				cancel: () => {
+					if (wake) {
+						schedulerWakeups.delete(wake)
+					}
+				},
+			}
+		}
 
 		const launchNextBatch = async (): Promise<"launched" | "no-jobs" | "capacity"> => {
 			if (signal?.aborted) {
@@ -1516,6 +1743,18 @@ export class EmbedUpsertWorker {
 			this.inFlightChunkCount += upsertJobs.length
 			this.peakInFlightChunkCount = Math.max(this.peakInFlightChunkCount, this.inFlightChunkCount)
 			let trackedClaimCount = upsertJobs.length
+			let embeddingLaneReleased = false
+			const releaseEmbeddingLane = () => {
+				if (embeddingLaneReleased) {
+					return
+				}
+				embeddingLaneReleased = true
+				this.activeLaneCount = Math.max(0, this.activeLaneCount - 1)
+				if (this.activeLaneCount === 0 && this.inFlightChunkCount === 0) {
+					this.setWorkerPhase("idle")
+				}
+				wakeScheduler()
+			}
 			this.setWorkerPhase("embedding")
 
 			const task = (async () => {
@@ -1533,9 +1772,10 @@ export class EmbedUpsertWorker {
 							trackedClaimCount = Math.max(0, trackedClaimCount - count)
 							this.inFlightChunkCount = Math.max(0, this.inFlightChunkCount - count)
 						},
+						onEmbeddingLaneReleased: releaseEmbeddingLane,
 					})
 				} finally {
-					this.activeLaneCount = Math.max(0, this.activeLaneCount - 1)
+					releaseEmbeddingLane()
 					this.inFlightChunkCount = Math.max(0, this.inFlightChunkCount - trackedClaimCount)
 					if (this.activeLaneCount === 0 && this.inFlightChunkCount === 0) {
 						this.setWorkerPhase("idle")
@@ -1544,14 +1784,17 @@ export class EmbedUpsertWorker {
 			})()
 
 			activeTasks.add(task)
-			task.finally(() => activeTasks.delete(task)).catch(() => undefined)
+			task.finally(() => {
+				activeTasks.delete(task)
+				wakeScheduler()
+			}).catch(() => undefined)
 			return "launched"
 		}
 
 		for (;;) {
 			const recyclePending = callbacks.shouldRecycleClients() || this.completedBatchCount >= nextRecycleAtBatch
 
-			while (!recyclePending && activeTasks.size < callbacks.getLaneConcurrency()) {
+			while (!recyclePending && this.activeLaneCount < callbacks.getLaneConcurrency()) {
 				this.setWorkerPhase("claiming")
 				const launched = await launchNextBatch()
 				if (launched === "capacity") {
@@ -1594,7 +1837,12 @@ export class EmbedUpsertWorker {
 			}
 
 			this.setWorkerPhase("embedding")
-			await Promise.race(Array.from(activeTasks))
+			const schedulerWake = waitForSchedulerWake()
+			try {
+				await Promise.race([...Array.from(activeTasks), schedulerWake.promise])
+			} finally {
+				schedulerWake.cancel()
+			}
 		}
 	}
 
@@ -1609,6 +1857,7 @@ export class EmbedUpsertWorker {
 			onChunksUpserted: (count: number) => void
 			onConcurrencyPressure: (error: unknown) => void
 			onJobsReleased: (count: number) => void
+			onEmbeddingLaneReleased: () => void
 			getEmbeddingBudget: () => number
 		},
 	): Promise<void> {
@@ -1750,6 +1999,30 @@ export class EmbedUpsertWorker {
 		}
 	}
 
+	private startJobLeaseHeartbeat(jobIds: string[]): () => void {
+		const heartbeatJobs = (
+			this.metadataStore as MetadataGateway & {
+				heartbeatJobs?: (jobIds: string[], leaseOwner: string) => Promise<void>
+			}
+		).heartbeatJobs
+		if (!heartbeatJobs || jobIds.length === 0) {
+			return () => undefined
+		}
+
+		const timer = setInterval(() => {
+			heartbeatJobs.call(this.metadataStore, jobIds, this.leaseOwner).catch((error: unknown) => {
+				IndexDebugLoggerV2.log("basic", "EmbedUpsertWorker", "embed-upsert-job-heartbeat-failed", {
+					component: "EmbedUpsertWorker",
+					workspacePath: this.workspacePath,
+					jobCount: jobIds.length,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			})
+		}, EmbedUpsertWorker.JOB_HEARTBEAT_INTERVAL_MS)
+		timer.unref?.()
+		return () => clearInterval(timer)
+	}
+
 	private async processUpsertJobPairs(
 		jobPairs: Array<{
 			job: ClaimedJob
@@ -1764,6 +2037,7 @@ export class EmbedUpsertWorker {
 			onChunksUpserted: (count: number) => void
 			onConcurrencyPressure: (error: unknown) => void
 			onJobsReleased: (count: number) => void
+			onEmbeddingLaneReleased: () => void
 			getEmbeddingBudget: () => number
 		},
 	): Promise<void> {
@@ -1822,21 +2096,38 @@ export class EmbedUpsertWorker {
 
 			const batchStartedAt = Date.now()
 			const idleGapMs = Math.max(batchStartedAt - this.lastBatchCompletedAt, 0)
-			const execution = this.upsertExecutor
-				? await this.upsertExecutor.executeUpsertBatch(
-						selectedJobPairs[0]?.job.runId ?? "run",
-						laneId,
-						items,
-						signal,
-					)
-				: await executeUpsertBatch(items, this.embeddingAdapter, this.vectorStore, {
-						signal,
-						debugContext: {
-							runId: selectedJobPairs[0]?.job.runId,
-							batchId: `${selectedJobPairs[0]?.job.runId ?? "run"}:${selectedJobPairs[0]?.job.jobId ?? "job"}:${embeddingCount}`,
-							outerBatchSize: embeddingCount,
-						},
-					})
+			const stopLeaseHeartbeat = this.startJobLeaseHeartbeat(selectedJobPairs.map(({ job }) => job.jobId))
+			let embeddingLaneReleased = false
+			const releaseEmbeddingLane = () => {
+				if (embeddingLaneReleased) {
+					return
+				}
+				embeddingLaneReleased = true
+				callbacks.onEmbeddingLaneReleased()
+			}
+			let execution: EmbedUpsertExecutionResult
+			try {
+				execution = this.upsertExecutor
+					? await this.upsertExecutor.executeUpsertBatch(
+							selectedJobPairs[0]?.job.runId ?? "run",
+							laneId,
+							items,
+							signal,
+							{
+								onEmbedded: releaseEmbeddingLane,
+							},
+						)
+					: await executeUpsertBatch(items, this.embeddingAdapter, this.vectorStore, {
+							signal,
+							debugContext: {
+								runId: selectedJobPairs[0]?.job.runId,
+								batchId: `${selectedJobPairs[0]?.job.runId ?? "run"}:${selectedJobPairs[0]?.job.jobId ?? "job"}:${embeddingCount}`,
+								outerBatchSize: embeddingCount,
+							},
+						})
+			} finally {
+				stopLeaseHeartbeat()
+			}
 
 			const metadataCommitStartedAt = Date.now()
 			await this.metadataStore.markChunkVariantStates(
@@ -1917,6 +2208,11 @@ export class EmbedUpsertWorker {
 				sidecarDeliveryDelayMs,
 				hostFinalizeLatencyMs,
 				pressureLatencyMs,
+				vectorWriteQueueDepth: execution.vectorWriteQueueDepth,
+				queuedVectorWriteBatches: execution.queuedVectorWriteBatches,
+				queuedVectorWriteEmbeddings: execution.queuedVectorWriteEmbeddings,
+				vectorWriteBackpressureMs: execution.vectorWriteBackpressureMs,
+				laneReleasedAfterEmbedMs: execution.laneReleasedAfterEmbedMs,
 				totalLatencyMs,
 			})
 		} catch (error) {

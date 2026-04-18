@@ -14,12 +14,18 @@ import { AlertTriangle } from "lucide-react"
 
 import {
 	type IndexingStatus,
+	type IndexingCodebaseProgressSnapshot,
 	type IndexingDetailedStage,
 	type IndexingHealthState,
 	type IndexingPipelineSnapshot,
 	type IndexingServiceId,
 	type IndexingServiceSnapshot,
 	type IndexingServiceState,
+	type IndexingRuntimeTaskSnapshot,
+	type IndexingRuntimeTaskState,
+	type IndexingSidecarSnapshot,
+	type IndexingSidecarState,
+	type IndexMetadataCompactionResultPayload,
 	type EmbedderProvider,
 	CODEBASE_INDEX_DEFAULTS,
 } from "@roo-code/types"
@@ -62,12 +68,14 @@ import {
 const DEFAULT_QDRANT_URL = "http://localhost:6333"
 const DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
+export const INDEXING_WARNING_HELP_TEXT = "Latest files that need parser, retry, or degraded-index review."
+
 /**
  * Formats milliseconds into a human-readable ETA string for display.
  * Mirrors the server-side formatEta() in state-manager.ts.
  */
 function formatEtaForDisplay(ms: number): string {
-	if (ms < 10_000) return "almost done"
+	if (ms < 10_000) return "<10s remaining"
 	if (ms < 60_000) return `~${Math.round(ms / 1000)}s remaining`
 	const minutes = Math.round(ms / 60_000)
 	if (minutes < 60) return `~${minutes}m remaining`
@@ -75,6 +83,17 @@ function formatEtaForDisplay(ms: number): string {
 	const remainingMinutes = minutes % 60
 	if (remainingMinutes === 0) return `~${hours}h remaining`
 	return `~${hours}h ${remainingMinutes}m remaining`
+}
+
+export function formatDurationForDisplay(ms: number | null | undefined): string | null {
+	if (ms == null || ms <= 0) return null
+	if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`
+	const minutes = Math.floor(ms / 60_000)
+	const remainingSeconds = Math.round((ms % 60_000) / 1000)
+	if (minutes < 60) return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`
+	const hours = Math.floor(minutes / 60)
+	const remainingMinutes = minutes % 60
+	return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`
 }
 
 function formatCountLabel(count: number, singular: string, plural: string): string {
@@ -144,6 +163,60 @@ export function getDefaultCodeIndexPopoverTab(
 
 export function shouldExpandIndexServiceCard(state: IndexingServiceState): boolean {
 	return state === "running" || state === "warning" || state === "failed"
+}
+
+type IndexingDisplayMetric = IndexingServiceSnapshot["metrics"][number]
+type IndexingMetricOwner = { metrics: IndexingDisplayMetric[] }
+
+export function shouldExpandIndexRuntimeSidecar(state: IndexingSidecarState): boolean {
+	return state === "busy" || state === "failed"
+}
+
+export function shouldExpandIndexRuntimeTask(state: IndexingRuntimeTaskState): boolean {
+	return state === "running" || state === "partial" || state === "failed"
+}
+
+export function isPrimaryIndexServiceMetric(metric: IndexingDisplayMetric): boolean {
+	return metric.visibility !== "detail"
+}
+
+export function hasExpandableIndexServiceCardContent(service: IndexingMetricOwner): boolean {
+	return service.metrics.some((metric) => metric.visibility === "detail")
+}
+
+export function getVisibleIndexServiceMetrics(
+	service: IndexingMetricOwner,
+	expanded: boolean,
+): IndexingDisplayMetric[] {
+	return expanded ? service.metrics : service.metrics.filter(isPrimaryIndexServiceMetric)
+}
+
+export function hasExpandableIndexRuntimeSidecarContent(sidecar: IndexingMetricOwner): boolean {
+	return hasExpandableIndexServiceCardContent(sidecar)
+}
+
+export function getVisibleIndexRuntimeSidecarMetrics(
+	sidecar: IndexingMetricOwner,
+	expanded: boolean,
+): IndexingDisplayMetric[] {
+	return getVisibleIndexServiceMetrics(sidecar, expanded)
+}
+
+export function hasExpandableIndexRuntimeTaskContent(task: IndexingMetricOwner): boolean {
+	return hasExpandableIndexServiceCardContent(task)
+}
+
+export function getVisibleIndexRuntimeTaskMetrics(
+	task: IndexingMetricOwner,
+	expanded: boolean,
+): IndexingDisplayMetric[] {
+	return getVisibleIndexServiceMetrics(task, expanded)
+}
+
+export function getMetadataCleanupCompactionAction(task: IndexingRuntimeTaskSnapshot) {
+	return task.id === "metadata_cleanup"
+		? task.actions?.find((action) => action.id === "compact_metadata_db")
+		: undefined
 }
 
 function getIndexingOverallStateLabel(pipeline?: IndexingPipelineSnapshot): string {
@@ -238,6 +311,71 @@ function getServiceStateToneClass(state: IndexingServiceState): string {
 	}
 }
 
+function getRuntimeSidecarStateLabel(state: IndexingSidecarState): string {
+	switch (state) {
+		case "standby":
+			return "Standby"
+		case "online":
+			return "Online"
+		case "busy":
+			return "Busy"
+		case "failed":
+			return "Failed"
+	}
+}
+
+function getRuntimeSidecarStateToneClass(state: IndexingSidecarState): string {
+	switch (state) {
+		case "online":
+			return "border-emerald-500/25 bg-emerald-500/10 text-emerald-200"
+		case "busy":
+			return "border-sky-500/25 bg-sky-500/10 text-sky-200"
+		case "failed":
+			return "border-red-500/25 bg-red-500/10 text-red-200"
+		case "standby":
+		default:
+			return "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.03)] text-vscode-descriptionForeground"
+	}
+}
+
+function getRuntimeTaskStateLabel(state: IndexingRuntimeTaskState): string {
+	switch (state) {
+		case "scheduled":
+			return "Scheduled"
+		case "running":
+			return "Running"
+		case "partial":
+			return "Partial"
+		case "complete":
+			return "Complete"
+		case "failed":
+			return "Failed"
+		case "skipped":
+			return "Skipped"
+		case "idle":
+		default:
+			return "Idle"
+	}
+}
+
+function getRuntimeTaskStateToneClass(state: IndexingRuntimeTaskState): string {
+	switch (state) {
+		case "complete":
+			return "border-emerald-500/25 bg-emerald-500/10 text-emerald-200"
+		case "scheduled":
+		case "running":
+		case "partial":
+			return "border-sky-500/25 bg-sky-500/10 text-sky-200"
+		case "failed":
+			return "border-red-500/25 bg-red-500/10 text-red-200"
+		case "skipped":
+			return "border-amber-500/25 bg-amber-500/10 text-amber-200"
+		case "idle":
+		default:
+			return "border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.03)] text-vscode-descriptionForeground"
+	}
+}
+
 function getHealthDotClass(health: IndexingHealthState | undefined): string {
 	switch (health) {
 		case "healthy":
@@ -260,6 +398,73 @@ function formatServiceProgress(service: IndexingServiceSnapshot): string | null 
 	}
 	const progressUnit = service.progressUnit ?? "items"
 	return `${service.progressCurrent.toLocaleString()} / ${service.progressTotal.toLocaleString()} ${progressUnit}`
+}
+
+function formatRuntimeTaskProgress(task: IndexingRuntimeTaskSnapshot): string | null {
+	if (task.indeterminate) {
+		return task.progressUnit ? `Working • ${task.progressUnit}` : "Working"
+	}
+	if (task.progressCurrent == null || task.progressTotal == null) {
+		return null
+	}
+	const progressUnit = task.progressUnit ?? "rows"
+	return `${task.progressCurrent.toLocaleString()} / ${task.progressTotal.toLocaleString()} ${progressUnit}`
+}
+
+export function formatCodebaseProgressRows(progress?: IndexingCodebaseProgressSnapshot): Array<{
+	key: string
+	label: string
+	value: string
+}> {
+	if (!progress) {
+		return []
+	}
+	const rows: Array<{ key: string; label: string; value: string }> = []
+	if ((progress.totalFiles ?? 0) > 0 || (progress.indexedFiles ?? 0) > 0) {
+		const indexedFiles = progress.indexedFiles ?? 0
+		const totalFiles = Math.max(progress.totalFiles ?? 0, indexedFiles, 0)
+		const fileValue =
+			progress.fileTotalKind === "available" || totalFiles <= 0
+				? `${indexedFiles.toLocaleString()} indexed`
+				: `${indexedFiles.toLocaleString()} / ${
+						progress.fileTotalKind === "estimated"
+							? `~${totalFiles.toLocaleString()}`
+							: totalFiles.toLocaleString()
+					}`
+		rows.push({
+			key: "files",
+			label: "Files indexed",
+			value: fileValue,
+		})
+	}
+	if ((progress.knownTotalChunks ?? 0) > 0 || (progress.syncedChunks ?? 0) > 0) {
+		const syncedChunks = progress.syncedChunks ?? 0
+		const knownTotalChunks = Math.max(progress.knownTotalChunks ?? 0, syncedChunks, 0)
+		const chunkValue =
+			progress.chunkTotalKind === "available" || knownTotalChunks <= 0
+				? `${syncedChunks.toLocaleString()} available`
+				: `${syncedChunks.toLocaleString()} / ${
+						progress.chunkTotalKind === "estimated"
+							? `~${knownTotalChunks.toLocaleString()}`
+							: knownTotalChunks.toLocaleString()
+					}`
+		rows.push({
+			key: "chunks",
+			label: "Chunks synced",
+			value: chunkValue,
+		})
+	}
+	return rows
+}
+
+export function getPrimaryElapsedMs(pipeline?: IndexingPipelineSnapshot): number | null {
+	if (!pipeline) {
+		return null
+	}
+	if (pipeline.runMode === "resume") {
+		return pipeline.investedElapsedMs ?? pipeline.elapsedMs ?? null
+	}
+	return pipeline.elapsedMs ?? null
 }
 
 export function getIndexingHeadline(indexingStatus: IndexingStatus, isCurrentStandby: boolean, t: any): string {
@@ -705,8 +910,19 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const [warningSort, setWarningSort] = useState<"severity" | "recent" | "path">("severity")
 	const [retryWarningsPending, setRetryWarningsPending] = useState(false)
 	const [retryingWarningPath, setRetryingWarningPath] = useState<string | null>(null)
+	const [metadataCompactionPending, setMetadataCompactionPending] = useState(false)
+	const [metadataCompactionMessage, setMetadataCompactionMessage] = useState<{
+		tone: "good" | "critical"
+		text: string
+	} | null>(null)
 	const [serviceExpansionOverrides, setServiceExpansionOverrides] = useState<
 		Partial<Record<IndexingServiceId, boolean>>
+	>({})
+	const [runtimeSidecarExpansionOverrides, setRuntimeSidecarExpansionOverrides] = useState<
+		Partial<Record<IndexingSidecarSnapshot["id"], boolean>>
+	>({})
+	const [runtimeTaskExpansionOverrides, setRuntimeTaskExpansionOverrides] = useState<
+		Partial<Record<IndexingRuntimeTaskSnapshot["id"], boolean>>
 	>({})
 	const { copyWithFeedback, showCopyFeedback } = useCopyToClipboard()
 	const saveFeedbackTimerRef = useRef<number | null>(null)
@@ -1010,11 +1226,32 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 				if (event.data.values?.success) {
 					setRetryWarningsPending(false)
 					setRetryingWarningPath(null)
+					setMetadataCompactionPending(false)
+					setMetadataCompactionMessage(null)
 					setWarningFilter("all")
 					setWarningSort("severity")
 					resetWarningDetailsState("all", "severity")
 					resetOversizedDetailsState()
 					vscode.postMessage({ type: "requestIndexingStatus" })
+				}
+			} else if (event.data.type === "indexMetadataCompactionResult") {
+				const result = event.data.values as IndexMetadataCompactionResultPayload | undefined
+				setMetadataCompactionPending(false)
+				if (result?.success) {
+					const reclaimed =
+						typeof result.reclaimedBytes === "number"
+							? ` Reclaimed ${formatBytes(result.reclaimedBytes)}.`
+							: ""
+					setMetadataCompactionMessage({
+						tone: "good",
+						text: `Metadata DB compaction complete.${reclaimed}`,
+					})
+					vscode.postMessage({ type: "requestIndexingStatus" })
+				} else {
+					setMetadataCompactionMessage({
+						tone: "critical",
+						text: result?.error ?? "Metadata DB compaction failed.",
+					})
 				}
 			} else if (event.data.type === "indexingWarningDetails") {
 				if (!event.data.values.workspacePath || event.data.values.workspacePath === cwd) {
@@ -1348,15 +1585,25 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 	const pipelineSummary = pipelineSnapshot?.summary
 	const showDebugSection = debug || currentSettings.codebaseIndexDebugLogging
 	const completedAtLabel = useMemo(() => {
-		if (!pipelineSnapshot?.lastCompletedAt) {
+		if (pipelineSnapshot?.overallState !== "completed" || !pipelineSnapshot.lastCompletedAt) {
 			return null
 		}
 		return new Date(pipelineSnapshot.lastCompletedAt).toLocaleString()
-	}, [pipelineSnapshot?.lastCompletedAt])
+	}, [pipelineSnapshot?.lastCompletedAt, pipelineSnapshot?.overallState])
 	const getIsServiceExpanded = useCallback(
 		(service: IndexingServiceSnapshot) =>
 			serviceExpansionOverrides[service.id] ?? shouldExpandIndexServiceCard(service.state),
 		[serviceExpansionOverrides],
+	)
+	const getIsRuntimeSidecarExpanded = useCallback(
+		(sidecar: IndexingSidecarSnapshot) =>
+			runtimeSidecarExpansionOverrides[sidecar.id] ?? shouldExpandIndexRuntimeSidecar(sidecar.state),
+		[runtimeSidecarExpansionOverrides],
+	)
+	const getIsRuntimeTaskExpanded = useCallback(
+		(task: IndexingRuntimeTaskSnapshot) =>
+			runtimeTaskExpansionOverrides[task.id] ?? shouldExpandIndexRuntimeTask(task.state),
+		[runtimeTaskExpansionOverrides],
 	)
 
 	const detailedStage = indexingStatus.detailedStage
@@ -1377,6 +1624,71 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 		() => getRunSummaryDisplay(indexingStatus, isCurrentStandby, t, displayedOversizedCount),
 		[indexingStatus, isCurrentStandby, t, displayedOversizedCount],
 	)
+	const codebaseProgressRows = useMemo(() => {
+		return formatCodebaseProgressRows(pipelineSnapshot?.codebaseProgress)
+	}, [pipelineSnapshot?.codebaseProgress])
+	const recoveredProgressLabel = useMemo(() => {
+		if (pipelineSummary?.recoveredProgressLabel) {
+			return pipelineSummary.recoveredProgressLabel
+		}
+		if (pipelineSnapshot?.runMode !== "resume") {
+			return null
+		}
+		const baselineFiles = pipelineSnapshot?.baselineIndexedFiles ?? 0
+		const baselineChunks = pipelineSnapshot?.baselineSyncedChunks ?? pipelineSnapshot?.baselineIndexedChunks ?? 0
+		const parts: string[] = []
+		if (baselineFiles > 0) {
+			parts.push(`${baselineFiles.toLocaleString()} indexed files`)
+		}
+		if (baselineChunks > 0) {
+			parts.push(`${baselineChunks.toLocaleString()} synced chunks`)
+		}
+		return parts.length > 0 ? `Recovered progress: ${parts.join(" • ")} already available` : null
+	}, [
+		pipelineSnapshot?.baselineIndexedChunks,
+		pipelineSnapshot?.baselineIndexedFiles,
+		pipelineSnapshot?.baselineSyncedChunks,
+		pipelineSnapshot?.runMode,
+		pipelineSummary?.recoveredProgressLabel,
+	])
+	const elapsedChipLabel = useMemo(() => {
+		if (pipelineSummary?.elapsedLabel) {
+			return pipelineSummary.elapsedLabel
+		}
+		const elapsed = formatDurationForDisplay(getPrimaryElapsedMs(pipelineSnapshot))
+		if (!elapsed) {
+			return null
+		}
+		return pipelineSnapshot?.overallState === "completed" ? `Total time ${elapsed}` : `Elapsed ${elapsed}`
+	}, [pipelineSnapshot, pipelineSummary?.elapsedLabel])
+	const etaChipLabel = useMemo(() => {
+		if (pipelineSummary?.etaLabel) {
+			return pipelineSummary.etaLabel
+		}
+		if (pipelineSnapshot?.overallState === "running" && indexingStatus.estimatedTimeRemainingMs != null) {
+			return formatEtaForDisplay(indexingStatus.estimatedTimeRemainingMs)
+		}
+		return null
+	}, [indexingStatus.estimatedTimeRemainingMs, pipelineSnapshot?.overallState, pipelineSummary?.etaLabel])
+	const phaseTimingItems = useMemo(() => {
+		const phaseTiming = pipelineSnapshot?.phaseTimingMs
+		if (!phaseTiming) {
+			return []
+		}
+		const items = [
+			{ key: "discovery", label: "Discovery", ms: phaseTiming.discoveryMs },
+			{ key: "fileChecks", label: "File checks", ms: phaseTiming.fileChecksMs },
+			{ key: "parse", label: "Parse", ms: phaseTiming.parseMs },
+			{ key: "plan", label: "Plan", ms: phaseTiming.planMs },
+			{ key: "embedSync", label: "Embed/sync", ms: phaseTiming.embedSyncMs },
+		]
+		return items
+			.map((item) => ({
+				...item,
+				value: formatDurationForDisplay(item.ms),
+			}))
+			.filter((item): item is typeof item & { value: string } => Boolean(item.value))
+	}, [pipelineSnapshot?.phaseTimingMs])
 	const progressPercentage = useMemo(() => {
 		if (pipelineSummary?.progressPercent != null) {
 			return Math.min(100, Math.max(0, Math.round(pipelineSummary.progressPercent)))
@@ -1429,6 +1741,10 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 				(detailedStage === "embedding" && !indexingStatus.hasStartedVectorSync))
 		)
 	}, [detailedStage, indexingStatus.hasStartedVectorSync, indexingStatus.systemStatus, pipelineSummary])
+	const runProgressLabel = pipelineSummary?.progressUnit
+		? `Run progress • ${pipelineSummary.progressUnit}`
+		: "Run progress"
+	const runProgressValueLabel = isIndeterminateEmbeddingProgress ? "Working" : `${progressPercentage}%`
 	const resilienceHighlights = useMemo(() => {
 		const resumedPendingJobs = indexingStatus.resumedPendingJobs ?? 0
 		const warningItems = [
@@ -1761,6 +2077,29 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 													)}
 												</div>
 
+												{codebaseProgressRows.length > 0 && (
+													<div className="grid gap-2 sm:grid-cols-2">
+														{codebaseProgressRows.map((row) => (
+															<div
+																key={row.key}
+																className="rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] px-3 py-2.5">
+																<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
+																	{row.label}
+																</div>
+																<div className="mt-2 text-[12px] leading-4 tracking-[-0.01em] text-vscode-foreground/92">
+																	{row.value}
+																</div>
+															</div>
+														))}
+													</div>
+												)}
+
+												{recoveredProgressLabel && (
+													<div className="text-[11px] leading-4 text-vscode-descriptionForeground/92">
+														{recoveredProgressLabel}
+													</div>
+												)}
+
 												<div className="flex flex-wrap gap-1.5">
 													{pipelineSnapshot && (
 														<>
@@ -1773,15 +2112,22 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 															</span>
 														</>
 													)}
-													{indexingStatus.estimatedTimeRemainingMs != null ? (
+													{elapsedChipLabel ? (
 														<span
 															className={cn(
 																stableChipClass,
 																"min-h-[30px] px-2.5 py-1 text-[10px]",
 															)}>
-															{formatEtaForDisplay(
-																indexingStatus.estimatedTimeRemainingMs,
-															)}
+															{elapsedChipLabel}
+														</span>
+													) : null}
+													{etaChipLabel ? (
+														<span
+															className={cn(
+																stableChipClass,
+																"min-h-[30px] px-2.5 py-1 text-[10px]",
+															)}>
+															{etaChipLabel}
 														</span>
 													) : completedAtLabel ? (
 														<span className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[10px] text-vscode-descriptionForeground">
@@ -1790,8 +2136,24 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 													) : null}
 												</div>
 
+												{phaseTimingItems.length > 0 && (
+													<div className="flex flex-wrap gap-1.5">
+														{phaseTimingItems.map((item) => (
+															<span
+																key={item.key}
+																className="rounded-full border border-vscode-dropdown-border/70 bg-[rgba(255,255,255,0.03)] px-2.5 py-1 text-[10px] text-vscode-descriptionForeground">
+																{item.label} {item.value}
+															</span>
+														))}
+													</div>
+												)}
+
 												{indexingStatus.systemStatus === "Indexing" && (
 													<div className="space-y-2">
+														<div className="flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.1em] text-vscode-descriptionForeground/70">
+															<span>{runProgressLabel}</span>
+															<span>{runProgressValueLabel}</span>
+														</div>
 														<div className="flex items-center gap-2">
 															<ProgressPrimitive.Root
 																className="relative h-2.5 w-full min-w-[80px] overflow-hidden rounded-full bg-[rgba(255,255,255,0.06)]"
@@ -1815,7 +2177,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 																	numericTextClass,
 																)}>
 																{isIndeterminateEmbeddingProgress
-																	? "..."
+																	? "Working"
 																	: `${progressPercentage}%`}
 															</span>
 														</div>
@@ -1828,53 +2190,464 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 									</div>
 								</div>
 
+								{pipelineSnapshot?.runtime?.sidecars?.length ||
+								pipelineSnapshot?.runtime?.tasks?.length ? (
+									<div className="space-y-2">
+										<div className={sectionLabelClass}>Index runtime</div>
+										{pipelineSnapshot.runtime.sidecars?.length ? (
+											<div className="grid gap-3 sm:grid-cols-2">
+												{pipelineSnapshot.runtime.sidecars.map((sidecar) => {
+													const hasExpandableDetails =
+														hasExpandableIndexRuntimeSidecarContent(sidecar)
+													const expanded = getIsRuntimeSidecarExpanded(sidecar)
+													const visibleMetrics = getVisibleIndexRuntimeSidecarMetrics(
+														sidecar,
+														expanded,
+													)
+													const cardHeaderClass = cn(
+														"flex w-full items-start justify-between gap-3 px-4 py-4 text-left",
+														hasExpandableDetails &&
+															"transition-colors hover:bg-[rgba(255,255,255,0.02)]",
+													)
+													const toggleRuntimeSidecarDetails = () => {
+														if (!hasExpandableDetails) {
+															return
+														}
+														setRuntimeSidecarExpansionOverrides((prev) => ({
+															...prev,
+															[sidecar.id]: !(
+																prev[sidecar.id] ??
+																shouldExpandIndexRuntimeSidecar(sidecar.state)
+															),
+														}))
+													}
+													const sidecarHeaderContent = (
+														<>
+															<div className="min-w-0 flex-1">
+																<div className="flex items-center gap-2">
+																	<span
+																		className={`inline-block h-2.5 w-2.5 rounded-full ${getHealthDotClass(sidecar.health)}`}
+																	/>
+																	<span className="text-[13px] font-semibold tracking-[-0.01em] text-vscode-foreground">
+																		{sidecar.title}
+																	</span>
+																</div>
+																<div className="mt-1 text-[12px] leading-4 text-vscode-descriptionForeground">
+																	{sidecar.summary}
+																</div>
+															</div>
+															<div className="flex shrink-0 flex-col items-end gap-1">
+																<span
+																	className={`rounded-full border px-2 py-1 text-[10px] font-medium uppercase tracking-[0.1em] ${getRuntimeSidecarStateToneClass(sidecar.state)}`}>
+																	{getRuntimeSidecarStateLabel(sidecar.state)}
+																</span>
+																{sidecar.pendingRequestCount ? (
+																	<span className="text-[10px] text-vscode-descriptionForeground">
+																		{sidecar.pendingRequestCount.toLocaleString()}{" "}
+																		pending
+																	</span>
+																) : null}
+															</div>
+														</>
+													)
+													return (
+														<div
+															key={sidecar.id}
+															className={`${surfaceCardClass} overflow-hidden`}>
+															{hasExpandableDetails ? (
+																<button
+																	type="button"
+																	onClick={toggleRuntimeSidecarDetails}
+																	className={cardHeaderClass}>
+																	{sidecarHeaderContent}
+																</button>
+															) : (
+																<div className={cardHeaderClass}>
+																	{sidecarHeaderContent}
+																</div>
+															)}
+															<div className="space-y-3 px-4 pb-4">
+																{expanded && sidecar.detail && (
+																	<div className="text-[11px] leading-4 text-vscode-descriptionForeground">
+																		{sidecar.detail}
+																	</div>
+																)}
+																<div className="grid gap-2 sm:grid-cols-2">
+																	{visibleMetrics.map((metric) => (
+																		<div
+																			key={`${sidecar.id}:${metric.key}`}
+																			className="rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] px-3 py-2.5">
+																			<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
+																				{metric.label}
+																			</div>
+																			<div
+																				className={cn(
+																					"mt-2 text-[12px] leading-4 tracking-[-0.01em]",
+																					metric.tone === "good"
+																						? "text-emerald-200"
+																						: metric.tone === "warning"
+																							? "text-amber-200"
+																							: metric.tone === "critical"
+																								? "text-red-200"
+																								: "text-vscode-foreground/92",
+																				)}>
+																				{metric.value}
+																			</div>
+																		</div>
+																	))}
+																</div>
+																{hasExpandableDetails && (
+																	<button
+																		type="button"
+																		onClick={toggleRuntimeSidecarDetails}
+																		className="text-[11px] font-medium text-vscode-descriptionForeground transition-colors hover:text-vscode-foreground">
+																		{expanded ? "Hide details" : "Show details"}
+																	</button>
+																)}
+															</div>
+														</div>
+													)
+												})}
+											</div>
+										) : null}
+										{pipelineSnapshot.runtime.tasks?.length ? (
+											<div className="grid gap-3">
+												{pipelineSnapshot.runtime.tasks.map((task) => {
+													const hasExpandableDetails =
+														hasExpandableIndexRuntimeTaskContent(task)
+													const expanded = getIsRuntimeTaskExpanded(task)
+													const visibleMetrics = getVisibleIndexRuntimeTaskMetrics(
+														task,
+														expanded,
+													)
+													const compactionAction = getMetadataCleanupCompactionAction(task)
+													const progressLabel = formatRuntimeTaskProgress(task)
+													const cardHeaderClass = cn(
+														"flex w-full items-start justify-between gap-3 px-4 py-4 text-left",
+														hasExpandableDetails &&
+															"transition-colors hover:bg-[rgba(255,255,255,0.02)]",
+													)
+													const toggleRuntimeTaskDetails = () => {
+														if (!hasExpandableDetails) {
+															return
+														}
+														setRuntimeTaskExpansionOverrides((prev) => ({
+															...prev,
+															[task.id]: !(
+																prev[task.id] ??
+																shouldExpandIndexRuntimeTask(task.state)
+															),
+														}))
+													}
+													const taskHeaderContent = (
+														<>
+															<div className="min-w-0 flex-1">
+																<div className="flex items-center gap-2">
+																	<span
+																		className={`inline-block h-2.5 w-2.5 rounded-full ${getHealthDotClass(task.health)}`}
+																	/>
+																	<span className="text-[13px] font-semibold tracking-[-0.01em] text-vscode-foreground">
+																		{task.title}
+																	</span>
+																</div>
+																<div className="mt-1 text-[12px] leading-4 text-vscode-descriptionForeground">
+																	{task.summary}
+																</div>
+															</div>
+															<div className="flex shrink-0 flex-col items-end gap-1">
+																<span
+																	className={`rounded-full border px-2 py-1 text-[10px] font-medium uppercase tracking-[0.1em] ${getRuntimeTaskStateToneClass(task.state)}`}>
+																	{getRuntimeTaskStateLabel(task.state)}
+																</span>
+															</div>
+														</>
+													)
+													return (
+														<div
+															key={task.id}
+															className={`${surfaceCardClass} overflow-hidden`}>
+															{hasExpandableDetails ? (
+																<button
+																	type="button"
+																	onClick={toggleRuntimeTaskDetails}
+																	className={cardHeaderClass}>
+																	{taskHeaderContent}
+																</button>
+															) : (
+																<div className={cardHeaderClass}>
+																	{taskHeaderContent}
+																</div>
+															)}
+															<div className="space-y-3 px-4 pb-4">
+																{(task.phaseLabel ||
+																	task.rateLabel ||
+																	task.etaLabel ||
+																	progressLabel) && (
+																	<div className="rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] px-3 py-3">
+																		<div className="flex items-center justify-between gap-3">
+																			<div>
+																				<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
+																					{task.phaseLabel
+																						? "Current step"
+																						: "Progress"}
+																				</div>
+																				<div className="mt-1 text-[12px] leading-4 text-vscode-foreground/92">
+																					{task.phaseLabel ??
+																						progressLabel ??
+																						"In progress"}
+																				</div>
+																			</div>
+																			{task.rateLabel && (
+																				<div className="shrink-0 rounded-full border border-vscode-dropdown-border/60 px-2 py-1 text-[10px] text-vscode-descriptionForeground">
+																					{task.rateLabel}
+																				</div>
+																			)}
+																		</div>
+																		{progressLabel && (
+																			<div className="mt-3 space-y-1.5">
+																				<div className="flex items-center justify-between gap-3 text-[10px] uppercase tracking-[0.1em] text-vscode-descriptionForeground/70">
+																					<span>Progress</span>
+																					<span>{progressLabel}</span>
+																				</div>
+																				<div className="h-2 overflow-hidden rounded-full bg-[rgba(255,255,255,0.08)]">
+																					<div
+																						className="h-full rounded-full bg-[rgba(147,197,253,0.78)] transition-[width] duration-300"
+																						style={{
+																							width: task.indeterminate
+																								? "35%"
+																								: `${Math.max(0, Math.min(100, task.progressPercent ?? 0))}%`,
+																						}}
+																					/>
+																				</div>
+																			</div>
+																		)}
+																		{task.etaLabel && (
+																			<div className="mt-2 text-[11px] leading-4 text-vscode-descriptionForeground">
+																				Next step: {task.etaLabel}
+																			</div>
+																		)}
+																	</div>
+																)}
+																{expanded && task.detail && (
+																	<div className="text-[11px] leading-4 text-vscode-descriptionForeground">
+																		{task.detail}
+																	</div>
+																)}
+																<div className="grid gap-2 sm:grid-cols-2">
+																	{visibleMetrics.map((metric) => (
+																		<div
+																			key={`${task.id}:${metric.key}`}
+																			className="rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] px-3 py-2.5">
+																			<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
+																				{metric.label}
+																			</div>
+																			<div
+																				className={cn(
+																					"mt-2 text-[12px] leading-4 tracking-[-0.01em]",
+																					metric.tone === "good"
+																						? "text-emerald-200"
+																						: metric.tone === "warning"
+																							? "text-amber-200"
+																							: metric.tone === "critical"
+																								? "text-red-200"
+																								: "text-vscode-foreground/92",
+																				)}>
+																				{metric.value}
+																			</div>
+																		</div>
+																	))}
+																</div>
+																{expanded && task.id === "metadata_cleanup" && (
+																	<div className="space-y-2 rounded-xl border border-vscode-dropdown-border/60 bg-[rgba(255,255,255,0.018)] px-3 py-3">
+																		<div>
+																			<div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-vscode-descriptionForeground/68">
+																				Advanced action
+																			</div>
+																			<div className="mt-1 text-[11px] leading-4 text-vscode-descriptionForeground">
+																				Compact the metadata DB file only after
+																				cleanup has completed. This can take
+																				minutes, temporarily needs free disk
+																				space, and pauses metadata search/UI
+																				reads while it runs.
+																			</div>
+																		</div>
+																		{metadataCompactionMessage && (
+																			<div
+																				className={cn(
+																					"rounded-lg border px-3 py-2 text-[11px] leading-4",
+																					metadataCompactionMessage.tone ===
+																						"good"
+																						? "border-emerald-500/25 bg-emerald-500/10 text-emerald-100"
+																						: "border-red-500/25 bg-red-500/10 text-red-100",
+																				)}>
+																				{metadataCompactionMessage.text}
+																			</div>
+																		)}
+																		{compactionAction ? (
+																			compactionAction.enabled &&
+																			!metadataCompactionPending ? (
+																				<AlertDialog>
+																					<AlertDialogTrigger asChild>
+																						<Button
+																							type="button"
+																							variant="secondary"
+																							className={
+																								footerSecondaryButtonClass
+																							}>
+																							{compactionAction.label}
+																						</Button>
+																					</AlertDialogTrigger>
+																					<AlertDialogContent>
+																						<AlertDialogHeader>
+																							<AlertDialogTitle>
+																								Compact metadata DB
+																								file?
+																							</AlertDialogTitle>
+																							<AlertDialogDescription>
+																								This rewrites the
+																								operational metadata
+																								SQLite DB to reclaim
+																								space after safe
+																								pruning. It may take
+																								several minutes, needs
+																								temporary free disk
+																								space, and pauses
+																								metadata search/UI reads
+																								until compaction
+																								finishes. Run it only
+																								while indexing is idle.
+																							</AlertDialogDescription>
+																						</AlertDialogHeader>
+																						<AlertDialogFooter>
+																							<AlertDialogCancel>
+																								Cancel
+																							</AlertDialogCancel>
+																							<AlertDialogAction
+																								onClick={() => {
+																									setMetadataCompactionPending(
+																										true,
+																									)
+																									setMetadataCompactionMessage(
+																										null,
+																									)
+																									vscode.postMessage({
+																										type: "compactCodeIndexMetadata",
+																									})
+																								}}>
+																								Compact DB file
+																							</AlertDialogAction>
+																						</AlertDialogFooter>
+																					</AlertDialogContent>
+																				</AlertDialog>
+																			) : (
+																				<div className="space-y-1">
+																					<Button
+																						type="button"
+																						variant="secondary"
+																						className={
+																							footerDisabledButtonClass
+																						}
+																						disabled>
+																						{metadataCompactionPending
+																							? "Compacting DB file..."
+																							: compactionAction.label}
+																					</Button>
+																					{compactionAction.reason && (
+																						<div className="text-[11px] leading-4 text-vscode-descriptionForeground">
+																							{compactionAction.reason}
+																						</div>
+																					)}
+																				</div>
+																			)
+																		) : (
+																			<div className="text-[11px] leading-4 text-vscode-descriptionForeground">
+																				Compact DB file becomes available after
+																				safe cleanup reaches the completed
+																				marker and reports reclaimable space.
+																			</div>
+																		)}
+																	</div>
+																)}
+																{hasExpandableDetails && (
+																	<button
+																		type="button"
+																		onClick={toggleRuntimeTaskDetails}
+																		className="text-[11px] font-medium text-vscode-descriptionForeground transition-colors hover:text-vscode-foreground">
+																		{expanded ? "Hide details" : "Show details"}
+																	</button>
+																)}
+															</div>
+														</div>
+													)
+												})}
+											</div>
+										) : null}
+									</div>
+								) : null}
+
 								<div className="space-y-2">
 									<div className={sectionLabelClass}>Services</div>
 									<div className="grid gap-3 sm:grid-cols-2">
 										{pipelineSnapshot?.services?.map((service) => {
+											const hasExpandableDetails = hasExpandableIndexServiceCardContent(service)
 											const expanded = getIsServiceExpanded(service)
-											const visibleMetrics = expanded
-												? service.metrics
-												: service.metrics.slice(0, 4)
+											const visibleMetrics = getVisibleIndexServiceMetrics(service, expanded)
+											const cardHeaderClass = cn(
+												"flex w-full items-start justify-between gap-3 px-4 py-4 text-left",
+												hasExpandableDetails &&
+													"transition-colors hover:bg-[rgba(255,255,255,0.02)]",
+											)
+											const toggleServiceDetails = () => {
+												if (!hasExpandableDetails) {
+													return
+												}
+												setServiceExpansionOverrides((prev) => ({
+													...prev,
+													[service.id]: !(
+														prev[service.id] ?? shouldExpandIndexServiceCard(service.state)
+													),
+												}))
+											}
+											const serviceHeaderContent = (
+												<>
+													<div className="min-w-0 flex-1">
+														<div className="flex items-center gap-2">
+															<span
+																className={`inline-block h-2.5 w-2.5 rounded-full ${getHealthDotClass(service.health)}`}
+															/>
+															<span className="text-[13px] font-semibold tracking-[-0.01em] text-vscode-foreground">
+																{service.title}
+															</span>
+														</div>
+														<div className="mt-1 text-[12px] leading-4 text-vscode-descriptionForeground">
+															{service.summary}
+														</div>
+													</div>
+													<div className="flex shrink-0 flex-col items-end gap-1">
+														<span
+															className={`rounded-full border px-2 py-1 text-[10px] font-medium uppercase tracking-[0.1em] ${getServiceStateToneClass(service.state)}`}>
+															{getServiceStateLabel(service.state)}
+														</span>
+														{service.issueCount ? (
+															<span className="text-[10px] text-vscode-descriptionForeground">
+																{service.issueCount.toLocaleString()} issues
+															</span>
+														) : null}
+													</div>
+												</>
+											)
 											return (
 												<div key={service.id} className={`${surfaceCardClass} overflow-hidden`}>
-													<button
-														type="button"
-														onClick={() =>
-															setServiceExpansionOverrides((prev) => ({
-																...prev,
-																[service.id]: !(
-																	prev[service.id] ??
-																	shouldExpandIndexServiceCard(service.state)
-																),
-															}))
-														}
-														className="flex w-full items-start justify-between gap-3 px-4 py-4 text-left transition-colors hover:bg-[rgba(255,255,255,0.02)]">
-														<div className="min-w-0 flex-1">
-															<div className="flex items-center gap-2">
-																<span
-																	className={`inline-block h-2.5 w-2.5 rounded-full ${getHealthDotClass(service.health)}`}
-																/>
-																<span className="text-[13px] font-semibold tracking-[-0.01em] text-vscode-foreground">
-																	{service.title}
-																</span>
-															</div>
-															<div className="mt-1 text-[12px] leading-4 text-vscode-descriptionForeground">
-																{service.summary}
-															</div>
-														</div>
-														<div className="flex shrink-0 flex-col items-end gap-1">
-															<span
-																className={`rounded-full border px-2 py-1 text-[10px] font-medium uppercase tracking-[0.1em] ${getServiceStateToneClass(service.state)}`}>
-																{getServiceStateLabel(service.state)}
-															</span>
-															{service.issueCount ? (
-																<span className="text-[10px] text-vscode-descriptionForeground">
-																	{service.issueCount.toLocaleString()} issues
-																</span>
-															) : null}
-														</div>
-													</button>
+													{hasExpandableDetails ? (
+														<button
+															type="button"
+															onClick={toggleServiceDetails}
+															className={cardHeaderClass}>
+															{serviceHeaderContent}
+														</button>
+													) : (
+														<div className={cardHeaderClass}>{serviceHeaderContent}</div>
+													)}
 													<div className="space-y-3 px-4 pb-4">
 														{formatServiceProgress(service) && (
 															<div className="space-y-2">
@@ -1940,20 +2713,14 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 																</div>
 															))}
 														</div>
-														<button
-															type="button"
-															onClick={() =>
-																setServiceExpansionOverrides((prev) => ({
-																	...prev,
-																	[service.id]: !(
-																		prev[service.id] ??
-																		shouldExpandIndexServiceCard(service.state)
-																	),
-																}))
-															}
-															className="text-[11px] font-medium text-vscode-descriptionForeground transition-colors hover:text-vscode-foreground">
-															{expanded ? "Hide details" : "Show details"}
-														</button>
+														{hasExpandableDetails && (
+															<button
+																type="button"
+																onClick={toggleServiceDetails}
+																className="text-[11px] font-medium text-vscode-descriptionForeground transition-colors hover:text-vscode-foreground">
+																{expanded ? "Hide details" : "Show details"}
+															</button>
+														)}
 													</div>
 												</div>
 											)
@@ -1979,8 +2746,7 @@ export const CodeIndexPopover: React.FC<CodeIndexPopoverProps> = ({
 															<span>Indexing warnings</span>
 														</div>
 														<div className="mt-1 text-[11px] leading-4 text-vscode-descriptionForeground">
-															Keep retries and degraded files separate from the live
-															service panels.
+															{INDEXING_WARNING_HELP_TEXT}
 														</div>
 													</div>
 													{resilienceHighlights.resumedPendingJobs > 0 && (
