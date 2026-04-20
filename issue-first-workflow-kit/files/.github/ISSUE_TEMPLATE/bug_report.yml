@@ -1,0 +1,79 @@
+# Managed by issue-first-workflow-kit. Local edits may be overwritten by install.sh.
+
+name: Bug Report
+description: Report broken behavior in plain language with a minimal reproduction
+labels: ["bug"]
+title: "[BUG] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for your report.
+        Please search existing issues in this repository before filing a new one.
+
+        Maintainers may convert this intake issue into an operational work item, or create a linked follow-on issue, if engineering investigation or implementation begins.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe what went wrong in one or two sentences.
+      placeholder: 'Example: "Expected the task to start, but nothing happened and no message appeared."'
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Who sees this and in what situation?
+      placeholder: 'Example: "Happens to new users when starting a run with default settings."'
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide clear, numbered steps so maintainers can reproduce.
+      placeholder: |
+        1. Environment/setup
+        2. Exact actions
+        3. What you observed after each step
+    validations:
+      required: true
+
+  - type: input
+    id: expected
+    attributes:
+      label: Expected result
+      placeholder: e.g., "The task starts and shows progress."
+    validations:
+      required: true
+
+  - type: input
+    id: actual
+    attributes:
+      label: Actual result
+      placeholder: e.g., "The button appears disabled and no progress is shown."
+    validations:
+      required: true
+
+  - type: textarea
+    id: variations
+    attributes:
+      label: Variations tried
+      description: Different browsers, devices, providers, settings, or environments you tried.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: What version are you using?
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or errors
+      description: Paste relevant output or errors. Use triple backticks for formatting.
+      render: shell

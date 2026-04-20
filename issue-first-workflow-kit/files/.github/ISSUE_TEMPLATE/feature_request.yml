@@ -1,0 +1,86 @@
+# Managed by issue-first-workflow-kit. Local edits may be overwritten by install.sh.
+
+name: Enhancement Request
+description: Propose an improvement in plain language focused on user benefit
+labels: ["enhancement"]
+title: "[ENHANCEMENT] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve this project.
+        Please focus on the problem and desired behavior in plain language.
+
+        Maintainers may convert this intake issue into an operational work item, or create a linked follow-on issue, if engineering investigation or implementation begins.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are users facing?
+      placeholder: e.g., "Users often trigger an action by mistake and cannot easily recover."
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Who encounters this and in what situation?
+      placeholder: e.g., "Happens when browsing a dense list of items; most visible for new users."
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired
+    attributes:
+      label: Desired behavior
+      description: Describe what should happen in simple terms.
+      placeholder: e.g., "Ask for confirmation before continuing."
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints / preferences
+      description: Any considerations like performance, accessibility, compatibility, or UX expectations.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Request checklist
+      options:
+        - label: I have searched existing Issues and Discussions for duplicates
+          required: true
+        - label: This describes a specific problem with clear context and impact
+          required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        Optional for contributors: You can stop here if you are just proposing the improvement.
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance criteria
+      description: Define what working looks like with specific, testable outcomes.
+      placeholder: |
+        Given [context]
+        When [user action]
+        Then [expected result]
+        And [additional expectations]
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed approach
+      description: If you have an idea, describe it briefly in plain language.
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Trade-offs / risks
+      description: Potential downsides or alternatives considered.
