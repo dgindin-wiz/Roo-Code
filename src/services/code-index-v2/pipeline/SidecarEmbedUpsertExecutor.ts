@@ -2,6 +2,10 @@ import { ChildProcess, fork } from "child_process"
 import { existsSync } from "fs"
 import * as path from "path"
 import { CodeIndexConfig } from "../../code-index/interfaces/config"
+import type {
+	AdaptiveEmbeddingControllerState,
+	AdaptiveProviderObservation,
+} from "../../code-index/interfaces/embedder"
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
 import { EmbedUpsertBatchItem, EmbedUpsertExecutionResult } from "./EmbedUpsertExecution"
 import {
@@ -14,6 +18,21 @@ import {
 interface PendingRequest<T> {
 	resolve: (value: T) => void
 	reject: (error: Error) => void
+	startedAtMs?: number
+	onEmbedded?: (event: EmbedUpsertEmbeddedEvent) => void
+}
+
+export interface EmbedUpsertEmbeddedEvent {
+	embeddingCount: number
+	embedLatencyMs: number
+	pointIds: string[]
+	sidecarRoundTripLatencyMs?: number
+	sidecarDeliveryDelayMs?: number
+	vectorWriteQueueDepth?: number
+	queuedVectorWriteBatches?: number
+	queuedVectorWriteEmbeddings?: number
+	vectorWriteBackpressureMs?: number
+	laneReleasedAfterEmbedMs?: number
 }
 
 interface SidecarLane {
@@ -35,6 +54,13 @@ export class SidecarEmbedUpsertExecutor {
 		private readonly vectorSize: number,
 		private readonly runtime: SidecarRuntimeMetadata,
 		laneConcurrency: number,
+		private readonly runtimeController?: {
+			profile?: AdaptiveEmbeddingControllerState
+			onRuntimeObservations?: (
+				observations: AdaptiveProviderObservation[],
+				reportedProfile?: AdaptiveEmbeddingControllerState,
+			) => Promise<AdaptiveEmbeddingControllerState | undefined> | AdaptiveEmbeddingControllerState | undefined
+		},
 	) {
 		const laneCount = Math.max(1, laneConcurrency)
 		this.lanes = Array.from({ length: laneCount }, (_, index) => ({
@@ -48,6 +74,9 @@ export class SidecarEmbedUpsertExecutor {
 		laneId: number,
 		items: EmbedUpsertBatchItem[],
 		signal?: AbortSignal,
+		options?: {
+			onEmbedded?: (event: EmbedUpsertEmbeddedEvent) => void
+		},
 	): Promise<EmbedUpsertExecutionResult> {
 		const lane = await this.ensureLane(laneId)
 		const requestId = this.nextRequestId("upsert")
@@ -61,6 +90,7 @@ export class SidecarEmbedUpsertExecutor {
 				items,
 			},
 			requestId,
+			options,
 		)
 
 		if (!signal) {
@@ -222,6 +252,7 @@ export class SidecarEmbedUpsertExecutor {
 					config: this.config,
 					vectorSize: this.vectorSize,
 					runtime: this.runtime,
+					runtimeProfile: this.runtimeController?.profile,
 				},
 			} satisfies SidecarHostToChildMessage)
 		})
@@ -231,13 +262,18 @@ export class SidecarEmbedUpsertExecutor {
 		lane.child?.send(message)
 	}
 
-	private sendRequest<T>(lane: SidecarLane, message: SidecarHostToChildMessage, requestId: string): Promise<T> {
+	private sendRequest<T>(
+		lane: SidecarLane,
+		message: SidecarHostToChildMessage,
+		requestId: string,
+		options?: { onEmbedded?: (event: EmbedUpsertEmbeddedEvent) => void },
+	): Promise<T> {
 		if (!lane.child) {
 			return Promise.reject(new Error("Code index sidecar lane is unavailable"))
 		}
 
 		return new Promise<T>((resolve, reject) => {
-			lane.pending.set(requestId, { resolve, reject })
+			lane.pending.set(requestId, { resolve, reject, startedAtMs: Date.now(), onEmbedded: options?.onEmbedded })
 			lane.child?.send(message)
 		})
 	}
@@ -291,12 +327,94 @@ export class SidecarEmbedUpsertExecutor {
 				})
 				return
 			}
+			case "upsert-embedded": {
+				const pending = lane.pending.get(message.requestId)
+				if (!pending) {
+					return
+				}
+				const receivedAtMs = Date.now()
+				const sidecarRoundTripLatencyMs =
+					typeof pending.startedAtMs === "number"
+						? Math.max(receivedAtMs - pending.startedAtMs, 0)
+						: undefined
+				const sidecarDeliveryDelayMs =
+					typeof sidecarRoundTripLatencyMs === "number"
+						? Math.max(sidecarRoundTripLatencyMs - message.embedLatencyMs, 0)
+						: undefined
+				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
+					this.getTrackedProcessKey(lane),
+					"embedSidecars",
+					`embed-lane-${lane.index + 1}`,
+					this.workspacePath,
+					lane.child?.pid,
+					message.memory,
+					message.cpu,
+				)
+				IndexDebugLoggerV2.log("basic", "CodeIndexIndexingSidecar", "sidecar-upsert-embedded", {
+					component: "CodeIndexIndexingSidecar",
+					processRole: "sidecar",
+					sidecarLane: lane.index + 1,
+					sidecarPid: lane.child?.pid,
+					requestId: message.requestId,
+					embeddingCount: message.embeddingCount,
+					embedLatencyMs: message.embedLatencyMs,
+					sidecarRoundTripLatencyMs,
+					sidecarDeliveryDelayMs,
+					vectorWriteQueueDepth: message.vectorWriteQueueDepth,
+					queuedVectorWriteBatches: message.queuedVectorWriteBatches,
+					queuedVectorWriteEmbeddings: message.queuedVectorWriteEmbeddings,
+					vectorWriteBackpressureMs: message.vectorWriteBackpressureMs,
+					laneReleasedAfterEmbedMs: message.laneReleasedAfterEmbedMs,
+					memory: message.memory,
+					cpu: message.cpu,
+					workspacePath: this.workspacePath,
+				})
+				try {
+					pending.onEmbedded?.({
+						embeddingCount: message.embeddingCount,
+						embedLatencyMs: message.embedLatencyMs,
+						pointIds: message.pointIds,
+						sidecarRoundTripLatencyMs,
+						sidecarDeliveryDelayMs,
+						vectorWriteQueueDepth: message.vectorWriteQueueDepth,
+						queuedVectorWriteBatches: message.queuedVectorWriteBatches,
+						queuedVectorWriteEmbeddings: message.queuedVectorWriteEmbeddings,
+						vectorWriteBackpressureMs: message.vectorWriteBackpressureMs,
+						laneReleasedAfterEmbedMs: message.laneReleasedAfterEmbedMs,
+					})
+				} catch (error) {
+					IndexDebugLoggerV2.log(
+						"basic",
+						"CodeIndexIndexingSidecar",
+						"sidecar-upsert-embedded-callback-failed",
+						{
+							component: "CodeIndexIndexingSidecar",
+							processRole: "host",
+							sidecarLane: lane.index + 1,
+							sidecarPid: lane.child?.pid,
+							requestId: message.requestId,
+							error: error instanceof Error ? error.message : String(error),
+							workspacePath: this.workspacePath,
+						},
+					)
+				}
+				return
+			}
 			case "upsert-result": {
 				const pending = lane.pending.get(message.requestId)
 				if (!pending) {
 					return
 				}
 				lane.pending.delete(message.requestId)
+				const receivedAtMs = Date.now()
+				const sidecarRoundTripLatencyMs =
+					typeof pending.startedAtMs === "number"
+						? Math.max(receivedAtMs - pending.startedAtMs, 0)
+						: undefined
+				const sidecarDeliveryDelayMs =
+					typeof sidecarRoundTripLatencyMs === "number"
+						? Math.max(sidecarRoundTripLatencyMs - message.embedLatencyMs - message.upsertLatencyMs, 0)
+						: undefined
 				IndexDebugLoggerV2.updateTrackedProcessSnapshot(
 					this.getTrackedProcessKey(lane),
 					"embedSidecars",
@@ -315,15 +433,31 @@ export class SidecarEmbedUpsertExecutor {
 					embeddingCount: message.embeddingCount,
 					embedLatencyMs: message.embedLatencyMs,
 					upsertLatencyMs: message.upsertLatencyMs,
+					sidecarRoundTripLatencyMs,
+					sidecarDeliveryDelayMs,
+					vectorWriteQueueDepth: message.vectorWriteQueueDepth,
+					queuedVectorWriteBatches: message.queuedVectorWriteBatches,
+					queuedVectorWriteEmbeddings: message.queuedVectorWriteEmbeddings,
+					vectorWriteBackpressureMs: message.vectorWriteBackpressureMs,
+					laneReleasedAfterEmbedMs: message.laneReleasedAfterEmbedMs,
 					memory: message.memory,
 					cpu: message.cpu,
 					workspacePath: this.workspacePath,
 				})
+				void this.handleRuntimeFeedback(message.runtimeObservations, message.runtimeProfile)
 				pending.resolve({
 					embeddingCount: message.embeddingCount,
 					embedLatencyMs: message.embedLatencyMs,
 					upsertLatencyMs: message.upsertLatencyMs,
+					sidecarRoundTripLatencyMs,
+					sidecarDeliveryDelayMs,
+					vectorWriteQueueDepth: message.vectorWriteQueueDepth,
+					queuedVectorWriteBatches: message.queuedVectorWriteBatches,
+					queuedVectorWriteEmbeddings: message.queuedVectorWriteEmbeddings,
+					vectorWriteBackpressureMs: message.vectorWriteBackpressureMs,
+					laneReleasedAfterEmbedMs: message.laneReleasedAfterEmbedMs,
 					pointIds: message.pointIds,
+					variantTelemetry: message.variantTelemetry,
 				})
 				return
 			}
@@ -374,6 +508,30 @@ export class SidecarEmbedUpsertExecutor {
 	private nextRequestId(prefix: string) {
 		this.requestCounter += 1
 		return `${prefix}:${this.requestCounter}`
+	}
+
+	private async handleRuntimeFeedback(
+		observations?: AdaptiveProviderObservation[],
+		reportedProfile?: AdaptiveEmbeddingControllerState,
+	): Promise<void> {
+		const nextProfile = await this.runtimeController?.onRuntimeObservations?.(observations ?? [], reportedProfile)
+		if (!nextProfile) {
+			return
+		}
+
+		if (this.runtimeController) {
+			this.runtimeController.profile = nextProfile
+		}
+
+		for (const lane of this.lanes) {
+			if (!lane.child) {
+				continue
+			}
+			this.sendFireAndForget(lane, {
+				type: "controller-update",
+				runtimeProfile: nextProfile,
+			})
+		}
 	}
 
 	private getTrackedProcessKey(lane: SidecarLane): string {

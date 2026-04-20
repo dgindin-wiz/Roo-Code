@@ -37,14 +37,28 @@ export interface CodeIndexStatus {
 	message?: string
 }
 
+export interface CodeIndexMetadataCompactionResult {
+	operationalDbBytesBefore: number
+	operationalDbBytesAfter: number
+	operationalWalBytesBefore: number
+	operationalWalBytesAfter: number
+	reclaimedBytes: number
+	requiredFreeBytes: number
+	availableFreeBytesBefore: number | null
+	availableFreeBytesAfter: number | null
+	elapsedMs: number
+}
+
 export interface ICodeIndexEngine {
 	readonly engine: CodeIndexEngineKind
 
 	start(): Promise<void>
+	hydrateStandbyStatus?(): Promise<boolean>
 	refreshAll(): Promise<void>
 	stop(): Promise<void>
 	clear(): Promise<void>
 	clearDatabase?(): Promise<void>
+	compactMetadataDatabase?(): Promise<CodeIndexMetadataCompactionResult>
 	search(query: string, limit: number, options?: { directoryPrefix?: string }): Promise<VectorStoreSearchResult[]>
 	searchDebug?(query: string, limit: number): Promise<CodeIndexDebugSearchTrace>
 	enqueuePathsChanged(paths: string[], reason: "watcher" | "manual" | "reconcile"): Promise<void>

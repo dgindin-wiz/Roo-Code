@@ -1,7 +1,13 @@
+import type {
+	AdaptiveEmbeddingControllerState,
+	AdaptiveProviderObservation,
+} from "../../code-index-v2/shared/adaptiveEmbeddingController"
+
 export interface EmbedderDebugContext {
 	runId?: string
 	batchId?: string
 	outerBatchSize?: number
+	workspacePath?: string
 }
 
 export interface EmbedderCreateEmbeddingsOptions {
@@ -46,6 +52,14 @@ export interface IEmbedder {
 	 */
 	recycleClient?(): Promise<void>
 
+	seedAdaptiveControllerState?(state?: AdaptiveEmbeddingControllerState): void
+
+	getAdaptiveControllerState?(): AdaptiveEmbeddingControllerState | undefined
+
+	drainAdaptiveControllerObservations?(): AdaptiveProviderObservation[]
+
+	getRecommendedDocumentBatchSize?(): number | undefined
+
 	get embedderInfo(): EmbedderInfo
 }
 
@@ -55,6 +69,8 @@ export interface EmbeddingResponse {
 		promptTokens: number
 		totalTokens: number
 	}
+	adaptiveControllerState?: AdaptiveEmbeddingControllerState
+	adaptiveControllerObservations?: AdaptiveProviderObservation[]
 }
 
 export type AvailableEmbedders =
@@ -70,3 +86,8 @@ export type AvailableEmbedders =
 export interface EmbedderInfo {
 	name: AvailableEmbedders
 }
+
+export type {
+	AdaptiveEmbeddingControllerState,
+	AdaptiveProviderObservation,
+} from "../../code-index-v2/shared/adaptiveEmbeddingController"

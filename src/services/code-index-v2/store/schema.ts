@@ -85,6 +85,15 @@ CREATE TABLE IF NOT EXISTS index_run_summaries (
   tracked_sidecar_rss_mb REAL,
   parse_sidecar_rss_mb REAL,
   embed_sidecar_rss_mb REAL,
+  metadata_sidecar_rss_mb REAL,
+  metadata_sidecar_cpu_percent REAL,
+  metadata_sidecar_heap_used_mb REAL,
+  metadata_sidecar_external_mb REAL,
+  metadata_sidecar_array_buffers_mb REAL,
+  metadata_db_bytes INTEGER,
+  metadata_wal_bytes INTEGER,
+  telemetry_db_bytes INTEGER,
+  telemetry_wal_bytes INTEGER,
   gpu_sampler TEXT,
   gpu_utilization_percent REAL,
   gpu_memory_pressure_percent REAL,
@@ -125,6 +134,7 @@ CREATE TABLE IF NOT EXISTS index_run_samples (
   pressure_reasons_json TEXT,
   lane_concurrency INTEGER,
   effective_batch_size INTEGER,
+  worker_phase TEXT,
   active_lane_count INTEGER,
   in_flight_chunk_count INTEGER,
   peak_in_flight_chunk_count INTEGER,
@@ -159,6 +169,15 @@ CREATE TABLE IF NOT EXISTS index_run_samples (
   tracked_sidecar_rss_mb REAL,
   parse_sidecar_rss_mb REAL,
   embed_sidecar_rss_mb REAL,
+  metadata_sidecar_rss_mb REAL,
+  metadata_sidecar_cpu_percent REAL,
+  metadata_sidecar_heap_used_mb REAL,
+  metadata_sidecar_external_mb REAL,
+  metadata_sidecar_array_buffers_mb REAL,
+  metadata_db_bytes INTEGER,
+  metadata_wal_bytes INTEGER,
+  telemetry_db_bytes INTEGER,
+  telemetry_wal_bytes INTEGER,
   gpu_sampler TEXT,
   gpu_utilization_percent REAL,
   gpu_memory_pressure_percent REAL,
@@ -231,6 +250,10 @@ CREATE TABLE IF NOT EXISTS chunk_variants (
   token_estimate INTEGER,
   embedding_model TEXT,
   vector_point_id TEXT,
+  vector_eligible INTEGER NOT NULL DEFAULT 1,
+  vector_priority INTEGER NOT NULL DEFAULT 0,
+  vector_eligibility_reason TEXT,
+  novelty_score REAL,
   state TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -301,14 +324,20 @@ CREATE TABLE IF NOT EXISTS reconciliation_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_workspace_path ON files(workspace_id, relative_path);
+CREATE INDEX IF NOT EXISTS idx_files_workspace_active_revision ON files(workspace_id, active_revision_id, ignore_state, tombstoned);
 CREATE INDEX IF NOT EXISTS idx_revisions_file_state ON file_revisions(file_id, state);
 CREATE INDEX IF NOT EXISTS idx_chunks_revision_state ON chunks(revision_id, state);
 CREATE INDEX IF NOT EXISTS idx_chunk_variants_chunk_state ON chunk_variants(chunk_id, state);
 CREATE INDEX IF NOT EXISTS idx_oversized_tracking_workspace_status ON oversized_file_tracking(workspace_id, status, last_evaluated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_state_next_attempt ON jobs(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_entity_state ON jobs(entity_id, state);
 CREATE INDEX IF NOT EXISTS idx_jobs_run_type_state_next_attempt ON jobs(run_id, job_type, state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_run_type_entity_state ON jobs(run_id, job_type, entity_id, state);
+CREATE INDEX IF NOT EXISTS idx_jobs_workspace_state_run_entity ON jobs(workspace_id, state, run_id, entity_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_lease_expiry ON jobs(state, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_revisions_run_state ON file_revisions(run_id, state, discovered_at);
+CREATE INDEX IF NOT EXISTS idx_revisions_file_discovered ON file_revisions(file_id, discovered_at DESC, revision_id);
+CREATE INDEX IF NOT EXISTS idx_revisions_state_revision ON file_revisions(state, revision_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_state_revision ON chunks(state, revision_id);
 CREATE INDEX IF NOT EXISTS idx_watch_events_workspace_observed ON watch_events(workspace_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_index_run_summaries_workspace_started ON index_run_summaries(workspace_id, started_at DESC);

@@ -11,9 +11,9 @@ vi.mock("vscode", () => ({
 }))
 
 describe("formatEta", () => {
-	it("should return 'almost done' for less than 10 seconds", () => {
-		expect(formatEta(5000)).toBe("almost done")
-		expect(formatEta(9999)).toBe("almost done")
+	it("should return a definitive short ETA for less than 10 seconds", () => {
+		expect(formatEta(5000)).toBe("<10 sec remaining")
+		expect(formatEta(9999)).toBe("<10 sec remaining")
 	})
 
 	it("should return seconds for less than 1 minute", () => {
@@ -150,6 +150,16 @@ describe("CodeIndexStateManager", () => {
 			stateManager.startIndexingTimer()
 			const status = stateManager.getCurrentStatus()
 			expect(status.estimatedTimeRemainingMs).toBeNull()
+		})
+
+		it("clears stale terminal pipeline snapshots before a new run starts", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineTerminalState("failed")
+			expect(stateManager.getCurrentStatus().pipeline?.overallState).toBe("failed")
+
+			stateManager.startIndexingTimer()
+
+			expect(stateManager.getCurrentStatus().pipeline).toBeUndefined()
 		})
 	})
 
@@ -312,6 +322,215 @@ describe("CodeIndexStateManager", () => {
 			expect(summary?.secondaryLabel).toBeUndefined()
 		})
 
+		it("shows hydrated standby index totals instead of unknown idle chips", () => {
+			stateManager.setStandbyPipelineSnapshot(
+				{
+					overallState: "completed",
+					overallHealth: "healthy",
+					runMode: "initial-discovery",
+					elapsedMs: 42_000,
+					investedElapsedMs: 42_000,
+					codebaseProgress: {
+						indexedFiles: 199,
+						totalFiles: 199,
+						syncedChunks: 1_204,
+						knownTotalChunks: 1_204,
+					},
+					services: [
+						{
+							id: "file_checks",
+							title: "File checks",
+							state: "completed",
+							health: "healthy",
+							summary: "Persisted file state available",
+							progressCurrent: 199,
+							progressTotal: 199,
+							progressUnit: "files",
+							progressPercent: 100,
+							metrics: [],
+						},
+						{
+							id: "vector_sync",
+							title: "Vector sync",
+							state: "completed",
+							health: "healthy",
+							summary: "Vectors available",
+							progressCurrent: 1_204,
+							progressTotal: 1_204,
+							progressUnit: "chunks",
+							progressPercent: 100,
+							metrics: [],
+						},
+					],
+				},
+				"V2 index ready across 199 files",
+			)
+
+			const status = stateManager.getCurrentStatus()
+			const pipeline = status.pipeline
+			expect(status.systemStatus).toBe("Standby")
+			expect(status.message).toBe("V2 index ready across 199 files")
+			expect(pipeline?.overallState).toBe("completed")
+			expect(pipeline?.overallHealth).toBe("healthy")
+			expect(pipeline?.runMode).toBe("initial-discovery")
+			expect(pipeline?.preservedFromPreviousRun).toBe(true)
+			expect(pipeline?.summary?.headline).toBe("Index ready")
+			expect(pipeline?.summary?.progressLabel).toBe("199 / 199 files indexed • 1,204 / 1,204 chunks synced")
+			expect(pipeline?.summary?.elapsedLabel).toBe("Total time 42 sec")
+		})
+
+		it("does not synthesize fake chunk ratios when only available chunks are known", () => {
+			stateManager.setStandbyPipelineSnapshot(
+				{
+					overallState: "completed",
+					overallHealth: "healthy",
+					runMode: "resume",
+					codebaseProgress: {
+						indexedFiles: 73_625,
+						totalFiles: 73_625,
+						fileTotalKind: "exact",
+						syncedChunks: 1_766_503,
+						chunkTotalKind: "available",
+					},
+					services: [],
+				},
+				"V2 index ready across 73,625 files",
+			)
+
+			expect(stateManager.getCurrentStatus().pipeline?.summary?.progressLabel).toBe(
+				"73,625 / 73,625 files indexed • 1,766,503 chunks available",
+			)
+		})
+
+		it("preserves resumable standby state instead of coercing it to completed", () => {
+			stateManager.setStandbyPipelineSnapshot(
+				{
+					overallState: "stopped",
+					overallHealth: "watch",
+					runMode: "resume",
+					elapsedMs: 120_000,
+					investedElapsedMs: 120_000,
+					baselineIndexedFiles: 73_686,
+					baselineSyncedChunks: 1_752_602,
+					codebaseProgress: {
+						indexedFiles: 73_686,
+						totalFiles: 73_912,
+						syncedChunks: 1_752_602,
+					},
+					summary: {
+						headline: "Resume available",
+						progressLabel: "73,686 / 73,912 files indexed • 1,752,602 chunks available",
+						secondaryLabel: "Previous indexing run did not finish. Start indexing to continue.",
+						indeterminate: true,
+					},
+					lastCompletedAt: 123_456,
+					services: [
+						{
+							id: "vector_sync",
+							title: "Vector sync",
+							state: "warning",
+							health: "watch",
+							summary: "Vector sync can resume",
+							progressCurrent: 1_752_602,
+							progressUnit: "chunks",
+							progressPercent: null,
+							indeterminate: true,
+							metrics: [],
+						},
+					],
+				},
+				"V2 index has resumable progress across 73,686 files",
+			)
+
+			const pipeline = stateManager.getCurrentStatus().pipeline
+			expect(pipeline?.overallState).toBe("stopped")
+			expect(pipeline?.runMode).toBe("resume")
+			expect(pipeline?.lastCompletedAt).toBeUndefined()
+			expect(pipeline?.summary?.headline).toBe("Resume available")
+			expect(pipeline?.summary?.progressLabel).toBe("73,686 / 73,912 files indexed • 1,752,602 chunks available")
+		})
+
+		it("preserves invested time, recovered progress, and phase timing in completed resume snapshots", () => {
+			stateManager.beginPipelineRun("resume")
+			stateManager.setPipelineSnapshot({
+				overallState: "completed",
+				elapsedMs: 60_000,
+				recoveredElapsedMs: 120_000,
+				investedElapsedMs: 180_000,
+				baselineIndexedFiles: 40,
+				baselineIndexedChunks: 400,
+				baselineSyncedChunks: 400,
+				phaseTimingMs: {
+					discoveryMs: 5_000,
+					fileChecksMs: 10_000,
+					parseMs: 20_000,
+					planMs: 15_000,
+					embedSyncMs: 70_000,
+					cleanupMs: 0,
+				},
+				codebaseProgress: {
+					indexedFiles: 41,
+					totalFiles: 100,
+					syncedChunks: 403,
+					knownTotalChunks: 403,
+				},
+				services: [
+					{
+						id: "file_checks",
+						title: "File checks",
+						state: "completed",
+						health: "healthy",
+						summary: "Checked files",
+						progressCurrent: 100,
+						progressTotal: 100,
+						progressUnit: "files",
+						progressPercent: 100,
+						metrics: [],
+					},
+					{
+						id: "vector_sync",
+						title: "Vector sync",
+						state: "completed",
+						health: "healthy",
+						summary: "Synced chunks",
+						progressCurrent: 403,
+						progressTotal: 403,
+						progressUnit: "chunks",
+						progressPercent: 100,
+						metrics: [],
+					},
+				],
+			})
+
+			stateManager.preserveCompletedPipelineSnapshot()
+
+			const pipeline = stateManager.getCurrentStatus().pipeline
+			const summary = pipeline?.summary
+			expect(pipeline?.preservedFromPreviousRun).toBe(true)
+			expect(summary?.progressLabel).toBe("41 / 100 files indexed • 403 / 403 chunks synced")
+			expect(summary?.recoveredProgressLabel).toBe(
+				"Recovered progress: 40 indexed files • 400 synced chunks already available",
+			)
+			expect(summary?.elapsedLabel).toBe("Total time 3 min")
+			expect(summary?.phaseTimingMs).toEqual(
+				expect.objectContaining({
+					discoveryMs: 5_000,
+					fileChecksMs: 10_000,
+					parseMs: 20_000,
+					planMs: 15_000,
+					embedSyncMs: 70_000,
+				}),
+			)
+			expect(summary?.codebaseProgress).toEqual(
+				expect.objectContaining({
+					indexedFiles: 41,
+					totalFiles: 100,
+					syncedChunks: 403,
+					knownTotalChunks: 403,
+				}),
+			)
+		})
+
 		it("switches the run summary to cleanup after embed is no longer active", () => {
 			stateManager.beginPipelineRun("start")
 			stateManager.setPipelineSnapshot({
@@ -369,6 +588,384 @@ describe("CodeIndexStateManager", () => {
 
 			stateManager.resetIndexingState()
 			expect(stateManager.getCurrentStatus().pipeline).toBeUndefined()
+		})
+
+		it("treats V2 service-card progress and metric changes as semantic updates", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "vector_sync",
+						title: "Vector sync",
+						state: "running",
+						health: "healthy",
+						summary: "Syncing vectors to Qdrant",
+						detail: "10 chunks synced",
+						progressCurrent: 10,
+						progressTotal: 100,
+						progressUnit: "chunks",
+						progressPercent: 10,
+						metrics: [{ key: "throughput", label: "Synced/sec", value: "10 chunks/sec" }],
+					},
+				],
+			})
+
+			const fireSpy = vi.spyOn((stateManager as any)._progressEmitter, "fire")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "vector_sync",
+						title: "Vector sync",
+						state: "running",
+						health: "healthy",
+						summary: "Syncing vectors to Qdrant",
+						detail: "11 chunks synced",
+						progressCurrent: 11,
+						progressTotal: 100,
+						progressUnit: "chunks",
+						progressPercent: 11,
+						metrics: [{ key: "throughput", label: "Synced/sec", value: "11 chunks/sec" }],
+					},
+				],
+			})
+
+			expect(fireSpy).toHaveBeenCalled()
+		})
+
+		it("treats V2 service metric visibility changes as semantic updates", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "embedding",
+						title: "Embedding",
+						state: "running",
+						health: "healthy",
+						summary: "Creating vector embeddings",
+						metrics: [
+							{
+								key: "pressure",
+								label: "Pressure",
+								value: "normal",
+								tone: "neutral",
+								visibility: "detail",
+							},
+						],
+					},
+				],
+			})
+
+			expect(
+				stateManager.getCurrentStatus().pipeline?.services.find((service) => service.id === "embedding")
+					?.metrics[0]?.visibility,
+			).toBe("detail")
+
+			const fireSpy = vi.spyOn((stateManager as any)._progressEmitter, "fire")
+			stateManager.setPipelineSnapshot({
+				services: [
+					{
+						id: "embedding",
+						title: "Embedding",
+						state: "running",
+						health: "healthy",
+						summary: "Creating vector embeddings",
+						metrics: [
+							{
+								key: "pressure",
+								label: "Pressure",
+								value: "normal",
+								tone: "neutral",
+								visibility: "primary",
+							},
+						],
+					},
+				],
+			})
+
+			expect(fireSpy).toHaveBeenCalled()
+			expect(
+				stateManager.getCurrentStatus().pipeline?.services.find((service) => service.id === "embedding")
+					?.metrics[0]?.visibility,
+			).toBe("primary")
+		})
+
+		it("treats codebase progress total trust changes as semantic updates", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				codebaseProgress: {
+					indexedFiles: 10,
+					totalFiles: 10,
+					fileTotalKind: "exact",
+					syncedChunks: 100,
+					knownTotalChunks: 100,
+					chunkTotalKind: "exact",
+				},
+				services: [],
+			})
+
+			const fireSpy = vi.spyOn((stateManager as any)._progressEmitter, "fire")
+			stateManager.setPipelineSnapshot({
+				codebaseProgress: {
+					indexedFiles: 10,
+					totalFiles: 10,
+					fileTotalKind: "exact",
+					syncedChunks: 100,
+					chunkTotalKind: "available",
+				},
+				services: [],
+			})
+
+			expect(fireSpy).toHaveBeenCalled()
+			expect(stateManager.getCurrentStatus().pipeline?.codebaseProgress).toEqual(
+				expect.objectContaining({
+					chunkTotalKind: "available",
+				}),
+			)
+		})
+
+		it("treats runtime sidecar changes as semantic updates", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				runtime: {
+					sidecars: [
+						{
+							id: "metadata_writer",
+							title: "Metadata writer",
+							state: "online",
+							health: "healthy",
+							summary: "Ready",
+							pendingRequestCount: 0,
+							lastOperation: "init",
+							lastElapsedMs: 12,
+							metrics: [
+								{
+									key: "state",
+									label: "State",
+									value: "Online",
+									tone: "good",
+								},
+							],
+						},
+					],
+				},
+				services: [],
+			})
+
+			const fireSpy = vi.spyOn((stateManager as any)._progressEmitter, "fire")
+			stateManager.setPipelineRuntimeSnapshot({
+				sidecars: [
+					{
+						id: "metadata_writer",
+						title: "Metadata writer",
+						state: "busy",
+						health: "healthy",
+						summary: "Indexing metadata writes",
+						pendingRequestCount: 1,
+						lastOperation: "claimJobsWithLease",
+						lastElapsedMs: 33,
+						metrics: [
+							{
+								key: "state",
+								label: "State",
+								value: "Busy",
+								tone: "good",
+							},
+							{
+								key: "last_operation",
+								label: "Last op",
+								value: "claimJobsWithLease",
+							},
+						],
+					},
+				],
+			})
+
+			expect(fireSpy).toHaveBeenCalled()
+			expect(stateManager.getCurrentStatus().pipeline?.runtime?.sidecars[0]).toEqual(
+				expect.objectContaining({
+					id: "metadata_writer",
+					state: "busy",
+					pendingRequestCount: 1,
+				}),
+			)
+		})
+
+		it("treats runtime task changes as semantic updates", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				runtime: {
+					sidecars: [],
+					tasks: [
+						{
+							id: "metadata_cleanup",
+							title: "Metadata cleanup",
+							state: "scheduled",
+							health: "healthy",
+							summary: "Cleanup queued",
+							metrics: [
+								{
+									key: "state",
+									label: "State",
+									value: "Scheduled",
+									tone: "good",
+								},
+							],
+						},
+					],
+				},
+				services: [],
+			})
+
+			const fireSpy = vi.spyOn((stateManager as any)._progressEmitter, "fire")
+			stateManager.setPipelineRuntimeSnapshot({
+				sidecars: [],
+				tasks: [
+					{
+						id: "metadata_cleanup",
+						title: "Metadata cleanup",
+						state: "partial",
+						health: "healthy",
+						summary: "Cleanup made progress and will continue",
+						detail: "More prunable rows remain.",
+						metrics: [
+							{
+								key: "jobs_pruned",
+								label: "Jobs pruned",
+								value: "50000",
+							},
+							{
+								key: "marker",
+								label: "Marker",
+								value: "partial",
+								visibility: "detail",
+							},
+						],
+					},
+				],
+			})
+
+			expect(fireSpy).toHaveBeenCalled()
+			expect(stateManager.getCurrentStatus().pipeline?.runtime?.tasks?.[0]).toEqual(
+				expect.objectContaining({
+					id: "metadata_cleanup",
+					state: "partial",
+					detail: "More prunable rows remain.",
+				}),
+			)
+		})
+
+		it("treats runtime task action changes as semantic updates", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				runtime: {
+					sidecars: [],
+					tasks: [
+						{
+							id: "metadata_cleanup",
+							title: "Metadata cleanup",
+							state: "complete",
+							health: "healthy",
+							summary: "Cleanup complete",
+							metrics: [],
+							actions: [
+								{
+									id: "compact_metadata_db",
+									label: "Compact DB file",
+									enabled: false,
+									reason: "Metadata writer is busy.",
+								},
+							],
+						},
+					],
+				},
+				services: [],
+			})
+
+			const fireSpy = vi.spyOn((stateManager as any)._progressEmitter, "fire")
+			stateManager.setPipelineRuntimeSnapshot({
+				sidecars: [],
+				tasks: [
+					{
+						id: "metadata_cleanup",
+						title: "Metadata cleanup",
+						state: "complete",
+						health: "healthy",
+						summary: "Cleanup complete",
+						metrics: [],
+						actions: [
+							{
+								id: "compact_metadata_db",
+								label: "Compact DB file",
+								enabled: true,
+							},
+						],
+					},
+				],
+			})
+
+			expect(fireSpy).toHaveBeenCalled()
+			expect(stateManager.getCurrentStatus().pipeline?.runtime?.tasks?.[0]?.actions?.[0]).toEqual(
+				expect.objectContaining({
+					id: "compact_metadata_db",
+					enabled: true,
+				}),
+			)
+		})
+
+		it("preserves runtime sidecar snapshots on completed runs", () => {
+			stateManager.beginPipelineRun("start")
+			stateManager.setPipelineSnapshot({
+				runtime: {
+					sidecars: [
+						{
+							id: "metadata_reader",
+							title: "Metadata reader",
+							state: "standby",
+							health: "healthy",
+							summary: "Starts lazily for search and UI reads",
+							pendingRequestCount: 0,
+							metrics: [],
+						},
+					],
+					tasks: [
+						{
+							id: "metadata_cleanup",
+							title: "Metadata cleanup",
+							state: "complete",
+							health: "healthy",
+							summary: "Cleanup complete",
+							metrics: [],
+						},
+					],
+				},
+				services: [
+					{
+						id: "discovery",
+						title: "Discovery",
+						state: "completed",
+						health: "healthy",
+						summary: "done",
+						metrics: [],
+					},
+				],
+			})
+
+			stateManager.preserveCompletedPipelineSnapshot()
+
+			expect(stateManager.getCurrentStatus().pipeline?.runtime?.sidecars[0]).toEqual(
+				expect.objectContaining({
+					id: "metadata_reader",
+					state: "standby",
+					health: "healthy",
+				}),
+			)
+			expect(stateManager.getCurrentStatus().pipeline?.runtime?.tasks?.[0]).toEqual(
+				expect.objectContaining({
+					id: "metadata_cleanup",
+					state: "complete",
+					health: "healthy",
+				}),
+			)
 		})
 	})
 

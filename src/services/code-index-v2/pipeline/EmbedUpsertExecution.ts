@@ -2,6 +2,10 @@ import { createHash } from "crypto"
 import { EmbeddingAdapter } from "../adapters/EmbeddingAdapter"
 import { VectorPoint, VectorStoreAdapter } from "../adapters/VectorStoreAdapter"
 import { buildRawCodeVariantContent } from "../shared/chunkSurfaces"
+import type {
+	AdaptiveEmbeddingControllerState,
+	AdaptiveProviderObservation,
+} from "../../code-index/interfaces/embedder"
 
 export interface EmbedUpsertChunkInput {
 	chunkId: string
@@ -30,6 +34,10 @@ export interface EmbedUpsertVariantInput {
 	chunkId: string
 	variantType: "raw_code" | "summary" | "symbol_signature"
 	content: string
+	vectorEligible?: boolean
+	vectorPriority?: number
+	vectorEligibilityReason?: string | null
+	noveltyScore?: number | null
 }
 
 export interface EmbedUpsertBatchItem {
@@ -42,6 +50,32 @@ export interface EmbedUpsertExecutionResult {
 	embedLatencyMs: number
 	upsertLatencyMs: number
 	pointIds: string[]
+	sidecarRoundTripLatencyMs?: number
+	sidecarDeliveryDelayMs?: number
+	vectorWriteQueueDepth?: number
+	queuedVectorWriteBatches?: number
+	queuedVectorWriteEmbeddings?: number
+	vectorWriteBackpressureMs?: number
+	laneReleasedAfterEmbedMs?: number
+	variantTelemetry: {
+		storedVariantCount: number
+		embeddedVariantCount: number
+		storedVariantCountsByType: Partial<Record<EmbedUpsertVariantInput["variantType"], number>>
+		embeddedVariantCountsByType: Partial<Record<EmbedUpsertVariantInput["variantType"], number>>
+		skippedVectorizationReasons: Record<string, number>
+	}
+	adaptiveControllerState?: AdaptiveEmbeddingControllerState
+	adaptiveControllerObservations?: AdaptiveProviderObservation[]
+}
+
+export interface EmbeddedUpsertBatch {
+	embeddingCount: number
+	embedLatencyMs: number
+	points: VectorPoint[]
+	pointIds: string[]
+	variantTelemetry: EmbedUpsertExecutionResult["variantTelemetry"]
+	adaptiveControllerState?: AdaptiveEmbeddingControllerState
+	adaptiveControllerObservations?: AdaptiveProviderObservation[]
 }
 
 export function getChunkVariantsForEmbedding(
@@ -49,7 +83,12 @@ export function getChunkVariantsForEmbedding(
 	variants: EmbedUpsertVariantInput[],
 ): EmbedUpsertVariantInput[] {
 	if (variants.length > 0) {
-		return variants
+		const vectorEligible = variants
+			.filter((variant) => variant.vectorEligible !== false)
+			.sort((left, right) => (right.vectorPriority ?? 0) - (left.vectorPriority ?? 0))
+		if (vectorEligible.length > 0) {
+			return vectorEligible
+		}
 	}
 
 	const rawCode = buildRawCodeVariantContent({
@@ -70,8 +109,32 @@ export function getChunkVariantsForEmbedding(
 			chunkId: chunk.chunkId,
 			variantType: "raw_code",
 			content: rawCode,
+			vectorEligible: true,
+			vectorPriority: 1000,
+			vectorEligibilityReason: "legacy_fallback_raw_code",
+			noveltyScore: 1,
 		},
 	]
+}
+
+function countVariantTypes(
+	variants: EmbedUpsertVariantInput[],
+): Partial<Record<EmbedUpsertVariantInput["variantType"], number>> {
+	return variants.reduce<Partial<Record<EmbedUpsertVariantInput["variantType"], number>>>((acc, variant) => {
+		acc[variant.variantType] = (acc[variant.variantType] ?? 0) + 1
+		return acc
+	}, {})
+}
+
+function countSkippedVectorizationReasons(variants: EmbedUpsertVariantInput[]): Record<string, number> {
+	return variants.reduce<Record<string, number>>((acc, variant) => {
+		if (variant.vectorEligible !== false) {
+			return acc
+		}
+		const reason = variant.vectorEligibilityReason ?? "lexical_only:unspecified"
+		acc[reason] = (acc[reason] ?? 0) + 1
+		return acc
+	}, {})
 }
 
 export function createPointId(
@@ -145,22 +208,71 @@ export async function executeUpsertBatch(
 			runId?: string
 			batchId?: string
 			outerBatchSize?: number
+			workspacePath?: string
 		}
 	},
 ): Promise<EmbedUpsertExecutionResult> {
+	const embedded = await createEmbeddedUpsertBatch(items, embeddingAdapter, options)
+	if (embedded.points.length === 0) {
+		return {
+			embeddingCount: embedded.embeddingCount,
+			embedLatencyMs: embedded.embedLatencyMs,
+			upsertLatencyMs: 0,
+			pointIds: [],
+			variantTelemetry: embedded.variantTelemetry,
+			adaptiveControllerState: embedded.adaptiveControllerState,
+			adaptiveControllerObservations: embedded.adaptiveControllerObservations,
+		}
+	}
+
+	const upsertLatencyMs = await writeEmbeddedUpsertBatch(embedded, vectorStore)
+	return {
+		embeddingCount: embedded.embeddingCount,
+		embedLatencyMs: embedded.embedLatencyMs,
+		upsertLatencyMs,
+		pointIds: embedded.pointIds,
+		variantTelemetry: embedded.variantTelemetry,
+		adaptiveControllerState: embedded.adaptiveControllerState,
+		adaptiveControllerObservations: embedded.adaptiveControllerObservations,
+	}
+}
+
+export async function createEmbeddedUpsertBatch(
+	items: EmbedUpsertBatchItem[],
+	embeddingAdapter: EmbeddingAdapter,
+	options?: {
+		signal?: AbortSignal
+		debugContext?: {
+			runId?: string
+			batchId?: string
+			outerBatchSize?: number
+			workspacePath?: string
+		}
+	},
+): Promise<EmbeddedUpsertBatch> {
 	const variantPairs = items.flatMap(({ chunk, variants }) =>
 		getChunkVariantsForEmbedding(chunk, variants).map((variant) => ({
 			chunk,
 			variant,
 		})),
 	)
+	const storedVariants = items.flatMap(({ variants }) => variants)
+	const embeddedVariants = variantPairs.map(({ variant }) => variant)
+	const variantTelemetry = {
+		storedVariantCount: storedVariants.length,
+		embeddedVariantCount: embeddedVariants.length,
+		storedVariantCountsByType: countVariantTypes(storedVariants),
+		embeddedVariantCountsByType: countVariantTypes(embeddedVariants),
+		skippedVectorizationReasons: countSkippedVectorizationReasons(storedVariants),
+	}
 
 	if (variantPairs.length === 0) {
 		return {
 			embeddingCount: 0,
 			embedLatencyMs: 0,
-			upsertLatencyMs: 0,
+			points: [],
 			pointIds: [],
+			variantTelemetry,
 		}
 	}
 
@@ -177,14 +289,23 @@ export async function executeUpsertBatch(
 	const points = variantPairs.map(({ chunk, variant }, index) =>
 		createPoint(chunk, variant, embeddingResponse.embeddings[index] ?? [], embeddingAdapter.modelId),
 	)
-	const upsertStartedAt = Date.now()
-	await vectorStore.upsertPoints(points)
-	const upsertLatencyMs = Date.now() - upsertStartedAt
 
 	return {
 		embeddingCount: embeddingResponse.embeddings.length,
 		embedLatencyMs,
-		upsertLatencyMs,
+		points,
 		pointIds: points.map((point) => point.id),
+		variantTelemetry,
+		adaptiveControllerState: embeddingResponse.adaptiveControllerState,
+		adaptiveControllerObservations: embeddingResponse.adaptiveControllerObservations,
 	}
+}
+
+export async function writeEmbeddedUpsertBatch(
+	embedded: Pick<EmbeddedUpsertBatch, "points">,
+	vectorStore: VectorStoreAdapter,
+): Promise<number> {
+	const upsertStartedAt = Date.now()
+	await vectorStore.upsertPoints(embedded.points)
+	return Date.now() - upsertStartedAt
 }

@@ -13,6 +13,7 @@ export type ChunkVariantType = "raw_code" | "summary" | "symbol_signature"
 export type ChunkVariantState = ChunkState
 
 export type JobState = "queued" | "running" | "done" | "abandoned" | "terminal_failed"
+export type EmbedWorkerPhase = "embedding" | "activation" | "claiming" | "delete" | "waiting_retry" | "idle"
 
 export type IndexRunState = "started" | "discovery_complete" | "complete" | "failed" | "stopped"
 export type OversizedTrackingStatus = "skipped" | "needs_reapproval" | "approved" | "eligible" | "missing"
@@ -157,6 +158,10 @@ export interface ChunkVariantRecord {
 	tokenEstimate: number | null
 	embeddingModel: string | null
 	vectorPointId: string | null
+	vectorEligible: boolean
+	vectorPriority: number
+	vectorEligibilityReason: string | null
+	noveltyScore: number | null
 	state: ChunkVariantState
 	createdAt: number
 	updatedAt: number
@@ -170,7 +175,34 @@ export interface ChunkVariantInput {
 	tokenEstimate?: number | null
 	embeddingModel?: string | null
 	vectorPointId?: string | null
+	vectorEligible?: boolean
+	vectorPriority?: number
+	vectorEligibilityReason?: string | null
+	noveltyScore?: number | null
 	state?: ChunkVariantState
+}
+
+export type PersistParsedRevisionVariantInput = Omit<ChunkVariantInput, "chunkId">
+
+export interface PersistParsedRevisionChunkInput extends Omit<ChunkInput, "revisionId"> {
+	chunkId: string
+	variants: PersistParsedRevisionVariantInput[]
+}
+
+export interface PersistParsedRevisionInput {
+	revisionId: string
+	relativePath: string
+	chunks: PersistParsedRevisionChunkInput[]
+}
+
+export interface PersistParsedRevisionResult {
+	insertedChunks: ChunkRecord[]
+	insertedVariantCount: number
+	chunkInsertLatencyMs: number
+	chunkVariantInsertLatencyMs: number
+	revisionStateUpdateLatencyMs: number
+	transactionLatencyMs: number
+	metadataWriteLatencyMs: number
 }
 
 export interface JobRecord {
@@ -347,6 +379,15 @@ export interface IndexRunSummaryInput extends IndexRunTelemetryIdentity {
 	trackedSidecarRssMB?: number | null
 	parseSidecarRssMB?: number | null
 	embedSidecarRssMB?: number | null
+	metadataSidecarRssMB?: number | null
+	metadataSidecarCpuPercent?: number | null
+	metadataSidecarHeapUsedMB?: number | null
+	metadataSidecarExternalMB?: number | null
+	metadataSidecarArrayBuffersMB?: number | null
+	metadataDbBytes?: number | null
+	metadataWalBytes?: number | null
+	telemetryDbBytes?: number | null
+	telemetryWalBytes?: number | null
 	gpuSampler?: string | null
 	gpuUtilizationPercent?: number | null
 	gpuMemoryPressurePercent?: number | null
@@ -380,6 +421,7 @@ export interface IndexRunSampleInput {
 	pressureReasons?: string[] | null
 	laneConcurrency?: number | null
 	effectiveBatchSize?: number | null
+	workerPhase?: EmbedWorkerPhase | null
 	activeLaneCount?: number | null
 	inFlightChunkCount?: number | null
 	peakInFlightChunkCount?: number | null
@@ -414,6 +456,15 @@ export interface IndexRunSampleInput {
 	trackedSidecarRssMB?: number | null
 	parseSidecarRssMB?: number | null
 	embedSidecarRssMB?: number | null
+	metadataSidecarRssMB?: number | null
+	metadataSidecarCpuPercent?: number | null
+	metadataSidecarHeapUsedMB?: number | null
+	metadataSidecarExternalMB?: number | null
+	metadataSidecarArrayBuffersMB?: number | null
+	metadataDbBytes?: number | null
+	metadataWalBytes?: number | null
+	telemetryDbBytes?: number | null
+	telemetryWalBytes?: number | null
 	gpuSampler?: string | null
 	gpuUtilizationPercent?: number | null
 	gpuMemoryPressurePercent?: number | null
@@ -427,6 +478,88 @@ export interface IndexRunSampleRecord extends IndexRunSampleInput {
 	sampleId: string
 }
 
+export interface MetadataMaintenanceSummary {
+	checkpointMode: "PASSIVE" | "RESTART" | "TRUNCATE"
+	shrinkMemory: boolean
+	pruneFootprint?: boolean
+	markFootprintCleanup?: boolean
+	maxPruneBatches?: number
+	vacuumMode?: "none" | "full"
+	operationalDbBytes: number
+	operationalWalBytes: number
+	telemetryDbBytes: number
+	telemetryWalBytes: number
+	footprintPrune?: MetadataFootprintPruneSummary
+	compaction?: MetadataCompactionSummary
+	memoryBefore: {
+		rssMB: number
+		heapUsedMB: number
+		externalMB: number
+		arrayBuffersMB: number
+	}
+	memoryAfter: {
+		rssMB: number
+		heapUsedMB: number
+		externalMB: number
+		arrayBuffersMB: number
+	}
+}
+
+export type MetadataFootprintPrunePhase =
+	| "finalized_jobs"
+	| "deleted_chunks"
+	| "superseded_chunks"
+	| "obsolete_revisions"
+	| "complete"
+
+export interface MetadataCompactionSummary {
+	operationalDbBytesBefore: number
+	operationalDbBytesAfter: number
+	operationalWalBytesBefore: number
+	operationalWalBytesAfter: number
+	reclaimedBytes: number
+	requiredFreeBytes: number
+	availableFreeBytesBefore: number | null
+	availableFreeBytesAfter: number | null
+	elapsedMs: number
+}
+
+export interface MetadataFootprintPruneSummary {
+	markerKey: string
+	markerState: "already_completed" | "completed" | "partial" | "skipped" | "failed"
+	phase?: MetadataFootprintPrunePhase
+	phaseLabel?: string
+	passElapsedMs?: number
+	totalRowsPruned?: number
+	phaseBatchLimit?: number
+	prunedJobs: number
+	prunedChunks: number
+	prunedChunkVariants: number
+	prunedFtsRows: number
+	prunedRevisions?: number
+	hasMore?: boolean
+	skippedChunkPruneDueToJobs?: boolean
+	skippedRevisionPruneDueToJobs?: boolean
+	prunedJobBatchLimit?: number
+	prunedChunkBatchLimit?: number
+	prunedRevisionBatchLimit?: number
+	jobsBefore?: number
+	jobsAfter?: number
+	chunksBefore?: number
+	chunksAfter?: number
+	chunkVariantsBefore?: number
+	chunkVariantsAfter?: number
+	ftsRowsBefore?: number
+	ftsRowsAfter?: number
+	revisionsBefore?: number
+	revisionsAfter?: number
+	freelistPagesBefore: number
+	freelistPagesAfter: number
+	pageSizeBytes: number
+	estimatedReclaimableBytesBefore: number
+	estimatedReclaimableBytesAfter: number
+}
+
 export interface PlannedRevisionResolution {
 	revisionId: string
 	fileId: string
@@ -436,6 +569,27 @@ export interface PlannedRevisionResolution {
 	runningJobs: number
 	terminalFailedJobs: number
 	totalJobs: number
+}
+
+export type ReadyRevisionDisposition = "committed" | "degraded" | "terminal_failed"
+
+export interface ReadyRevisionResolution {
+	revisionId: string
+	fileId: string
+	previousRevisionId: string | null
+	disposition: ReadyRevisionDisposition
+	failureReason: string | null
+}
+
+export interface ReadyRevisionFinalizeSummary {
+	committedRevisions: number
+	degradedRevisions: number
+	terminalFailedRevisions: number
+	supersededRevisions: number
+	activatedChunkCount: number
+	supersededChunkCount: number
+	lexicalFtsSyncLatencyMs: number
+	activationBurstLatencyMs: number
 }
 
 export interface RevisionJobResolution {

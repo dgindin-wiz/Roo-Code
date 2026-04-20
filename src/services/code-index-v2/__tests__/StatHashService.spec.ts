@@ -26,6 +26,82 @@ describe("StatHashService", () => {
 		vi.clearAllMocks()
 	})
 
+	it("emits progress updates on a time-based cadence while hashing", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue(
+			Array.from({ length: 9 }, (_, index) => ({
+				fileId: `file-${index + 1}`,
+				relativePath: `src/file-${index + 1}.ts`,
+				normalizedPath: `/workspace/src/file-${index + 1}.ts`,
+				lastSeenSize: 10 + index,
+				lastSeenMtimeMs: 20 + index,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+			})),
+		)
+		workspaceAdapter.readFile.mockImplementation(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 250))
+			return "export const value = true"
+		})
+		const onProgress = vi.fn()
+		vi.useFakeTimers()
+
+		try {
+			const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+			const runPromise = service.run("run-1", undefined, undefined, { onProgress })
+			await vi.advanceTimersByTimeAsync(500)
+			await runPromise
+		} finally {
+			vi.useRealTimers()
+		}
+
+		expect(onProgress.mock.calls.length).toBeGreaterThanOrEqual(2)
+		expect(onProgress).toHaveBeenNthCalledWith(
+			onProgress.mock.calls.length,
+			expect.objectContaining({
+				checkedFiles: 9,
+				changedFiles: 9,
+			}),
+		)
+	})
+
+	it("always emits a final progress update on completion for small workspaces", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue([
+			{
+				fileId: "file-1",
+				relativePath: "src/example.ts",
+				normalizedPath: "/workspace/src/example.ts",
+				lastSeenSize: 10,
+				lastSeenMtimeMs: 20,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+			},
+		])
+		workspaceAdapter.readFile.mockResolvedValueOnce("export const example = true")
+		const onProgress = vi.fn()
+		const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(0)
+
+		try {
+			const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+			await service.run("run-1", undefined, undefined, { onProgress })
+		} finally {
+			dateNowSpy.mockRestore()
+		}
+
+		expect(onProgress).toHaveBeenCalledTimes(2)
+		expect(onProgress).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				checkedFiles: 1,
+				changedFiles: 1,
+				unchangedFiles: 0,
+				missingFiles: 0,
+			}),
+		)
+	})
+
 	it("reuses a stale pending revision with matching fingerprint and content", async () => {
 		const { metadataStore, workspaceAdapter } = createDeps()
 		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue([
@@ -276,5 +352,43 @@ describe("StatHashService", () => {
 		expect(summary.oversizedDetails.some((detail) => detail.relativePath === "dist/generated-24.bundle.js")).toBe(
 			false,
 		)
+	})
+
+	it("processes stat/hash work with bounded concurrency while preserving revision creation", async () => {
+		const { metadataStore, workspaceAdapter } = createDeps()
+		metadataStore.getDiscoveredFilesForWorkspace.mockResolvedValue(
+			Array.from({ length: 12 }, (_, index) => ({
+				fileId: `file-${index + 1}`,
+				relativePath: `src/file-${index + 1}.ts`,
+				normalizedPath: `/workspace/src/file-${index + 1}.ts`,
+				lastSeenSize: 10,
+				lastSeenMtimeMs: 20 + index,
+				latestRevisionState: null,
+				latestRevisionFastFingerprint: null,
+				latestRevisionContentHash: null,
+				latestRevisionParserVersion: null,
+				latestRevisionChunkerVersion: null,
+			})),
+		)
+
+		let inFlightReads = 0
+		let peakInFlightReads = 0
+		workspaceAdapter.readFile.mockImplementation(async (filePath: string) => {
+			inFlightReads++
+			peakInFlightReads = Math.max(peakInFlightReads, inFlightReads)
+			await new Promise((resolve) => setTimeout(resolve, 5))
+			inFlightReads--
+			return `content for ${filePath}`
+		})
+		metadataStore.findReusableRevision.mockResolvedValue(undefined)
+
+		const service = new StatHashService(metadataStore as any, workspaceAdapter as any)
+		const summary = await service.run("run-1")
+
+		expect(summary.checkedFiles).toBe(12)
+		expect(summary.changedFiles).toBe(12)
+		expect(metadataStore.createFileRevision).toHaveBeenCalledTimes(12)
+		expect(peakInFlightReads).toBeGreaterThan(1)
+		expect(peakInFlightReads).toBeLessThanOrEqual(8)
 	})
 })

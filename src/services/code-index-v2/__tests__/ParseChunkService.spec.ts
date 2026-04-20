@@ -1,15 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { ParseChunkService } from "../pipeline/ParseChunkService"
+import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
+
+vi.mock("../logging/IndexDebugLoggerV2", () => ({
+	IndexDebugLoggerV2: {
+		log: vi.fn(),
+	},
+}))
 
 describe("ParseChunkService", () => {
 	const createDeps = () => {
 		const metadataStore = {
 			getWorkspaceId: vi.fn().mockReturnValue("workspace-1"),
 			getRevisionsByState: vi.fn(),
-			upsertChunks: vi.fn().mockImplementation(async (chunks: any[]) =>
-				chunks.map((chunk, index) => ({
-					chunkId: `chunk-${index + 1}`,
-					revisionId: chunk.revisionId,
+			persistParsedRevision: vi.fn().mockImplementation(async ({ revisionId, chunks }: any) => ({
+				insertedChunks: chunks.map((chunk: any) => ({
+					chunkId: chunk.chunkId,
+					revisionId,
 					chunkFingerprint: chunk.chunkFingerprint,
 					startLine: chunk.startLine,
 					endLine: chunk.endLine,
@@ -30,8 +37,16 @@ describe("ParseChunkService", () => {
 					createdAt: Date.now(),
 					updatedAt: Date.now(),
 				})),
-			),
-			upsertChunkVariants: vi.fn().mockResolvedValue([]),
+				insertedVariantCount: chunks.reduce(
+					(total: number, chunk: { variants?: unknown[] }) => total + (chunk.variants?.length ?? 0),
+					0,
+				),
+				chunkInsertLatencyMs: 5,
+				chunkVariantInsertLatencyMs: 2,
+				revisionStateUpdateLatencyMs: 1,
+				transactionLatencyMs: 11,
+				metadataWriteLatencyMs: 11,
+			})),
 			markRevisionState: vi.fn().mockResolvedValue(undefined),
 			markRevisionTerminalFailure: vi.fn().mockResolvedValue(undefined),
 		}
@@ -49,6 +64,7 @@ describe("ParseChunkService", () => {
 	}
 
 	beforeEach(() => {
+		vi.useRealTimers()
 		vi.clearAllMocks()
 	})
 
@@ -84,7 +100,12 @@ describe("ParseChunkService", () => {
 				relativePath: "src/a.ts",
 			}),
 		)
-		expect(metadataStore.markRevisionState).toHaveBeenCalledWith("revision-1", "parsed")
+		expect(metadataStore.persistParsedRevision).toHaveBeenCalledWith(
+			expect.objectContaining({
+				revisionId: "revision-1",
+				relativePath: "src/a.ts",
+			}),
+		)
 		expect(metadataStore.markRevisionTerminalFailure).not.toHaveBeenCalled()
 		expect(summary.parsedRevisions).toBe(1)
 		expect(summary.parsedChunks).toBe(1)
@@ -124,19 +145,25 @@ describe("ParseChunkService", () => {
 		const service = new ParseChunkService(metadataStore as any, workspaceAdapter as any, parserAdapter as any)
 		await service.run("run-1")
 
-		expect(metadataStore.upsertChunkVariants).toHaveBeenCalledWith(
-			expect.arrayContaining([
-				expect.objectContaining({
-					variantType: "raw_code",
-					content:
-						"Path: src/auth.ts\nLanguage: ts\nKind: function\nLines: 10-12\nSymbol: validateToken\nSymbol Words: validate token\nQualified Symbol: Auth.validateToken\nParent: Auth\n\nexport function validateToken(token: string) {}",
-				}),
-				expect.objectContaining({
-					variantType: "summary",
-					content: "ts function validateToken in Auth at src/auth.ts:10-12",
-				}),
-				expect.objectContaining({ variantType: "symbol_signature" }),
-			]),
+		expect(metadataStore.persistParsedRevision).toHaveBeenCalledWith(
+			expect.objectContaining({
+				chunks: expect.arrayContaining([
+					expect.objectContaining({
+						variants: expect.arrayContaining([
+							expect.objectContaining({
+								variantType: "raw_code",
+								content:
+									"Path: src/auth.ts\nLanguage: ts\nKind: function\nLines: 10-12\nSymbol: validateToken\nSymbol Words: validate token\nQualified Symbol: Auth.validateToken\nParent: Auth\n\nexport function validateToken(token: string) {}",
+							}),
+							expect.objectContaining({
+								variantType: "summary",
+								content: "ts function validateToken in Auth at src/auth.ts:10-12",
+							}),
+							expect.objectContaining({ variantType: "symbol_signature" }),
+						]),
+					}),
+				]),
+			}),
 		)
 	})
 
@@ -180,7 +207,11 @@ describe("ParseChunkService", () => {
 			"revision-bad",
 			"memory access out of bounds",
 		)
-		expect(metadataStore.markRevisionState).toHaveBeenCalledWith("revision-good", "parsed")
+		expect(metadataStore.persistParsedRevision).toHaveBeenCalledWith(
+			expect.objectContaining({
+				revisionId: "revision-good",
+			}),
+		)
 		expect(summary.parsedRevisions).toBe(1)
 		expect(summary.retryingRevisions).toBe(2)
 		expect(summary.terminalFailedRevisions).toBe(1)
@@ -203,19 +234,39 @@ describe("ParseChunkService", () => {
 			{ chunkFingerprint: "fp-1", startLine: 1, endLine: 1, content: "const value = 1" },
 			{ chunkFingerprint: "fp-2", startLine: 2, endLine: 2, content: "const next = 2" },
 		])
-		metadataStore.upsertChunks.mockResolvedValueOnce([
-			{
-				chunkId: "chunk-1",
-				revisionId: "revision-1",
-				chunkFingerprint: "fp-1",
-				startLine: 1,
-				endLine: 1,
-				content: "const value = 1",
-				searchText: null,
-				tokenEstimate: null,
-			},
-		])
-
+		metadataStore.persistParsedRevision.mockResolvedValueOnce({
+			insertedChunks: [
+				{
+					chunkId: "chunk-1",
+					revisionId: "revision-1",
+					chunkFingerprint: "fp-1",
+					startLine: 1,
+					endLine: 1,
+					language: null,
+					chunkKind: null,
+					symbolName: null,
+					symbolQualifiedName: null,
+					parentSymbolName: null,
+					parentChunkFingerprint: null,
+					summary: null,
+					searchText: "const value = 1",
+					content: "const value = 1",
+					contentHash: "hash-1",
+					tokenEstimate: null,
+					embeddingModel: null,
+					vectorPointId: null,
+					state: "parsed",
+					createdAt: Date.now(),
+					updatedAt: Date.now(),
+				},
+			],
+			insertedVariantCount: 1,
+			chunkInsertLatencyMs: 1,
+			chunkVariantInsertLatencyMs: 1,
+			revisionStateUpdateLatencyMs: 1,
+			transactionLatencyMs: 4,
+			metadataWriteLatencyMs: 4,
+		})
 		const service = new ParseChunkService(metadataStore as any, workspaceAdapter as any, parserAdapter as any)
 		const summary = await service.run("run-1")
 
@@ -247,10 +298,51 @@ describe("ParseChunkService", () => {
 		const service = new ParseChunkService(metadataStore as any, workspaceAdapter as any, parserAdapter as any)
 		const summary = await service.run("run-1")
 
-		expect(metadataStore.upsertChunks).toHaveBeenCalledTimes(1)
-		expect(metadataStore.upsertChunkVariants).toHaveBeenCalledTimes(1)
-		expect(metadataStore.markRevisionState).toHaveBeenCalledWith("revision-1", "parsed")
+		expect(metadataStore.persistParsedRevision).toHaveBeenCalledTimes(1)
 		expect(summary.parsedChunks).toBe(1)
+	})
+
+	it("logs parse metadata write timings for each stored revision batch", async () => {
+		const { metadataStore, workspaceAdapter, parserAdapter } = createDeps()
+		metadataStore.getRevisionsByState.mockResolvedValue([
+			{
+				revisionId: "revision-1",
+				fileId: "file-1",
+				runId: "run-1",
+				normalizedPath: "/workspace/src/a.ts",
+				relativePath: "src/a.ts",
+			},
+		])
+		workspaceAdapter.readFile.mockResolvedValue("export const value = 1")
+		parserAdapter.parseFile.mockResolvedValue([
+			{
+				chunkFingerprint: "fp-1",
+				startLine: 1,
+				endLine: 1,
+				content: "export const value = 1",
+				searchText: "Path: src/a.ts\n\nexport const value = 1",
+			},
+		])
+		const logSpy = vi.spyOn(IndexDebugLoggerV2, "log").mockImplementation(() => {})
+
+		const service = new ParseChunkService(metadataStore as any, workspaceAdapter as any, parserAdapter as any)
+		await service.run("run-1")
+
+		const timingCall = logSpy.mock.calls.find(([, , message]) => message === "parse-chunk-revision-stored")
+		expect(timingCall?.[3]).toEqual(
+			expect.objectContaining({
+				runId: "run-1",
+				revisionId: "revision-1",
+				relativePath: "src/a.ts",
+				insertedChunkCount: 1,
+				insertedVariantCount: expect.any(Number),
+				chunkInsertLatencyMs: expect.any(Number),
+				chunkVariantInsertLatencyMs: expect.any(Number),
+				revisionStateUpdateLatencyMs: expect.any(Number),
+				transactionLatencyMs: expect.any(Number),
+				metadataWriteLatencyMs: expect.any(Number),
+			}),
+		)
 	})
 
 	it("parses multiple revisions with bounded concurrency", async () => {
@@ -356,8 +448,7 @@ describe("ParseChunkService", () => {
 		)
 		expect(workspaceAdapter.readFile).not.toHaveBeenCalled()
 		expect(parserAdapter.parseFile).not.toHaveBeenCalled()
-		expect(metadataStore.upsertChunks).toHaveBeenCalled()
-		expect(metadataStore.upsertChunkVariants).toHaveBeenCalled()
+		expect(metadataStore.persistParsedRevision).toHaveBeenCalled()
 		expect(summary.parsedRevisions).toBe(1)
 		expect(summary.parsedChunks).toBe(1)
 	})
@@ -441,7 +532,6 @@ describe("ParseChunkService", () => {
 		abortController.abort()
 
 		await expect(runPromise).rejects.toThrow("Parse/chunk stage aborted")
-		expect(metadataStore.markRevisionState).not.toHaveBeenCalledWith("revision-1", "parsed")
-		expect(metadataStore.upsertChunks).not.toHaveBeenCalled()
+		expect(metadataStore.persistParsedRevision).not.toHaveBeenCalled()
 	})
 })

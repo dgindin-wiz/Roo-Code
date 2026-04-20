@@ -1,4 +1,8 @@
 import { CodeIndexConfig } from "../../code-index/interfaces/config"
+import type {
+	AdaptiveEmbeddingControllerState,
+	AdaptiveProviderObservation,
+} from "../../code-index/interfaces/embedder"
 import { CodeIndexV2CpuSnapshot, CodeIndexV2MemorySnapshot } from "../logging/log-types"
 import { EmbedUpsertBatchItem } from "../pipeline/EmbedUpsertExecution"
 
@@ -15,6 +19,7 @@ export interface SidecarInitPayload {
 	config: CodeIndexConfig
 	vectorSize: number
 	runtime: SidecarRuntimeMetadata
+	runtimeProfile?: AdaptiveEmbeddingControllerState
 }
 
 export type SidecarLogLevel = "basic" | "verbose" | "trace"
@@ -39,6 +44,10 @@ export type SidecarHostToChildMessage =
 	| {
 			type: "cancel"
 			requestId: string
+	  }
+	| {
+			type: "controller-update"
+			runtimeProfile?: AdaptiveEmbeddingControllerState
 	  }
 	| {
 			type: "shutdown"
@@ -66,6 +75,34 @@ export type SidecarChildToHostMessage =
 			embedLatencyMs: number
 			upsertLatencyMs: number
 			pointIds: string[]
+			vectorWriteQueueDepth?: number
+			queuedVectorWriteBatches?: number
+			queuedVectorWriteEmbeddings?: number
+			vectorWriteBackpressureMs?: number
+			laneReleasedAfterEmbedMs?: number
+			runtimeProfile?: AdaptiveEmbeddingControllerState
+			runtimeObservations?: AdaptiveProviderObservation[]
+			variantTelemetry: {
+				storedVariantCount: number
+				embeddedVariantCount: number
+				storedVariantCountsByType: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+				embeddedVariantCountsByType: Partial<Record<"raw_code" | "summary" | "symbol_signature", number>>
+				skippedVectorizationReasons: Record<string, number>
+			}
+			memory: CodeIndexV2MemorySnapshot
+			cpu: CodeIndexV2CpuSnapshot
+	  }
+	| {
+			type: "upsert-embedded"
+			requestId: string
+			embeddingCount: number
+			embedLatencyMs: number
+			pointIds: string[]
+			vectorWriteQueueDepth: number
+			queuedVectorWriteBatches: number
+			queuedVectorWriteEmbeddings: number
+			vectorWriteBackpressureMs: number
+			laneReleasedAfterEmbedMs: number
 			memory: CodeIndexV2MemorySnapshot
 			cpu: CodeIndexV2CpuSnapshot
 	  }

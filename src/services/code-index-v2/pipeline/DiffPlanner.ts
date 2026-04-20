@@ -1,5 +1,5 @@
 import { IndexDebugLoggerV2 } from "../logging/IndexDebugLoggerV2"
-import { MetadataStore } from "../store/MetadataStore"
+import { SqliteMetadataRepository } from "../store/SqliteMetadataRepository"
 
 export interface DiffPlannerSummary {
 	runId: string
@@ -9,16 +9,28 @@ export interface DiffPlannerSummary {
 	reusedFingerprintUpserts: number
 	deletedMissingFingerprintChunks: number
 	safetyFallbackRevisions: number
+	plannerSliceLatencyMs: number
 }
 
 export class DiffPlanner {
-	constructor(private readonly metadataStore: MetadataStore) {}
+	constructor(
+		private readonly metadataStore: Pick<
+			SqliteMetadataRepository,
+			| "enqueueJobs"
+			| "getChunksForRevision"
+			| "getDiffBaselineRevision"
+			| "getRevisionsByState"
+			| "getWorkspaceId"
+			| "markRevisionState"
+		>,
+	) {}
 
 	async run(
 		runId: string,
 		signal?: AbortSignal,
 		options?: { revisionIds?: string[]; limit?: number; maxJobs?: number },
 	): Promise<DiffPlannerSummary> {
+		const plannerSliceStartedAt = Date.now()
 		const workspaceId = this.metadataStore.getWorkspaceId()
 		const revisionIdSet = options?.revisionIds ? new Set(options.revisionIds) : undefined
 		const revisions = await this.metadataStore.getRevisionsByState(workspaceId, "parsed", {
@@ -121,6 +133,10 @@ export class DiffPlanner {
 		IndexDebugLoggerV2.log("basic", "DiffPlanner", "diff-plan-complete", {
 			component: "DiffPlanner",
 			runId,
+			plannerSliceLatencyMs: Date.now() - plannerSliceStartedAt,
+			plannedRevisions,
+			upsertJobs,
+			deleteJobs,
 			jobId: `${plannedRevisions}:${upsertJobs}:${deleteJobs}`,
 			reusedFingerprintUpserts,
 			deletedMissingFingerprintChunks,
@@ -139,6 +155,7 @@ export class DiffPlanner {
 			reusedFingerprintUpserts,
 			deletedMissingFingerprintChunks,
 			safetyFallbackRevisions,
+			plannerSliceLatencyMs: Date.now() - plannerSliceStartedAt,
 		}
 	}
 }

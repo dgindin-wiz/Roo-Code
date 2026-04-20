@@ -1,10 +1,12 @@
 import * as vscode from "vscode"
 import type {
+	IndexingCodebaseProgressSnapshot,
 	IndexingHealthState,
 	IndexingPipelineOverallState,
 	IndexingPipelineRunMode,
 	IndexingPipelineSnapshot,
 	IndexingRunSummarySnapshot,
+	IndexingRuntimeSnapshot,
 	IndexingServiceId,
 	IndexingServiceSnapshot,
 } from "@roo-code/types"
@@ -104,7 +106,7 @@ const PIPELINE_SERVICE_TITLES: Record<IndexingServiceId, string> = {
  * Formats milliseconds into a human-readable ETA string.
  */
 export function formatEta(ms: number): string {
-	if (ms < 10_000) return "almost done"
+	if (ms < 10_000) return "<10 sec remaining"
 	if (ms < 60_000) return `~${Math.round(ms / 1000)} sec remaining`
 	const minutes = Math.round(ms / 60_000)
 	if (minutes < 60) return `~${minutes} min remaining`
@@ -112,6 +114,23 @@ export function formatEta(ms: number): string {
 	const remainingMinutes = minutes % 60
 	if (remainingMinutes === 0) return `~${hours} hr remaining`
 	return `~${hours} hr ${remainingMinutes} min remaining`
+}
+
+function formatDurationCompact(ms: number | null | undefined): string | undefined {
+	if (ms == null || ms <= 0) {
+		return undefined
+	}
+	if (ms < 60_000) {
+		return `${Math.max(1, Math.round(ms / 1000))} sec`
+	}
+	const minutes = Math.floor(ms / 60_000)
+	const remainingSeconds = Math.round((ms % 60_000) / 1000)
+	if (minutes < 60) {
+		return remainingSeconds > 0 ? `${minutes} min ${remainingSeconds} sec` : `${minutes} min`
+	}
+	const hours = Math.floor(minutes / 60)
+	const remainingMinutes = minutes % 60
+	return remainingMinutes > 0 ? `${hours} hr ${remainingMinutes} min` : `${hours} hr`
 }
 
 export class CodeIndexStateManager {
@@ -256,6 +275,24 @@ export class CodeIndexStateManager {
 		this.emitProgressUpdate({ forceImmediate: options?.forceImmediate })
 	}
 
+	public setPipelineRuntimeSnapshot(runtime: IndexingRuntimeSnapshot): void {
+		if (this._activePipelineSnapshot) {
+			this._activePipelineSnapshot = {
+				...this._activePipelineSnapshot,
+				runtime,
+			}
+			this.emitProgressUpdate()
+			return
+		}
+		if (this._lastCompletedPipelineSnapshot) {
+			this._lastCompletedPipelineSnapshot = {
+				...this._lastCompletedPipelineSnapshot,
+				runtime,
+			}
+			this.emitProgressUpdate()
+		}
+	}
+
 	public preserveCompletedPipelineSnapshot(): void {
 		if (!this._activePipelineSnapshot) {
 			return
@@ -274,6 +311,42 @@ export class CodeIndexStateManager {
 		this._lastCompletedPipelineSnapshot = preservedSnapshot
 		this._activePipelineSnapshot = undefined
 		this.emitProgressUpdate({ forceImmediate: true })
+	}
+
+	public setStandbyPipelineSnapshot(snapshot: IndexingPipelineSnapshot, message = "Code index is ready."): void {
+		const services: IndexingServiceSnapshot[] = this.normalizePipelineServices(snapshot.services).map((service) =>
+			service.state === "pending"
+				? { ...service, state: "skipped" as const, summary: "No work required" }
+				: service,
+		)
+		const standbyOverallState: IndexingPipelineOverallState =
+			snapshot.overallState === "running" ? "idle" : snapshot.overallState
+		const preservedSnapshot = this.decoratePipelineSnapshot({
+			...snapshot,
+			overallState: standbyOverallState,
+			overallHealth: standbyOverallState === "failed" ? "critical" : this.getPipelineOverallHealth(services),
+			etaMs: null,
+			lastCompletedAt: standbyOverallState === "completed" ? snapshot.lastCompletedAt : undefined,
+			preservedFromPreviousRun: true,
+			services,
+		})
+
+		this._systemStatus = "Standby"
+		this._statusMessage = message
+		this._processedItems = 0
+		this._totalItems = 0
+		this._currentItemUnit = "blocks"
+		this._activityDetail = ""
+		this._activePipelineSnapshot = undefined
+		this._lastCompletedPipelineSnapshot = preservedSnapshot
+		this.resetDetailedProgressFields()
+		this.emitProgressUpdate({ forceImmediate: true })
+		this.logDebug("setStandbyPipelineSnapshot", {
+			phaseTransition: true,
+			message: message.substring(0, 120),
+			overallHealth: preservedSnapshot.overallHealth,
+			runMode: preservedSnapshot.runMode,
+		})
 	}
 
 	public setPipelineTerminalState(overallState: "failed" | "stopped"): void {
@@ -378,6 +451,8 @@ export class CodeIndexStateManager {
 		this._interruptionKind = "none"
 		this._resumeContext = "none"
 		this.resetResilienceStats()
+		this._activePipelineSnapshot = undefined
+		this._lastCompletedPipelineSnapshot = undefined
 	}
 
 	public setRecoveryContext(
@@ -978,15 +1053,66 @@ export class CodeIndexStateManager {
 			headline: this.getRunSummaryHeadline(primaryService.id),
 			progressLabel,
 			secondaryLabel,
+			recoveredProgressLabel: this.buildRecoveredProgressLabel(snapshot),
+			elapsedLabel: this.buildElapsedSummaryLabel(snapshot, false),
+			etaLabel: snapshot.etaMs != null ? formatEta(snapshot.etaMs) : undefined,
 			progressCurrent: primaryService.progressCurrent,
 			progressTotal: primaryService.progressTotal,
 			progressUnit: primaryService.progressUnit,
 			progressPercent: primaryService.progressPercent ?? null,
+			elapsedMs: snapshot.elapsedMs ?? null,
+			recoveredElapsedMs: snapshot.recoveredElapsedMs ?? null,
+			investedElapsedMs: snapshot.investedElapsedMs ?? snapshot.elapsedMs ?? null,
+			phaseTimingMs: snapshot.phaseTimingMs,
+			codebaseProgress: snapshot.codebaseProgress,
 			indeterminate: primaryService.indeterminate,
 		}
 	}
 
 	private buildCompletedRunSummarySnapshot(snapshot: IndexingPipelineSnapshot): IndexingRunSummarySnapshot {
+		const progressLabel = this.buildCompletedProgressLabel(snapshot)
+		const warningCount = snapshot.services.filter(
+			(service) => service.state === "warning" || service.state === "failed",
+		).length
+		const totalTimeMs = snapshot.investedElapsedMs ?? snapshot.elapsedMs ?? null
+
+		return {
+			primaryServiceId:
+				this.getPipelineServiceById(snapshot.services, "vector_sync")?.id ??
+				this.getPipelineServiceById(snapshot.services, "embedding")?.id ??
+				this.getPipelineServiceById(snapshot.services, "embed")?.id,
+			headline: snapshot.preservedFromPreviousRun ? "Index ready" : "Indexing complete",
+			progressLabel,
+			secondaryLabel:
+				warningCount > 0 ? "Completed with warnings. Review the service panels for details." : undefined,
+			recoveredProgressLabel: this.buildRecoveredProgressLabel(snapshot),
+			elapsedLabel: this.buildElapsedSummaryLabel(snapshot, true),
+			progressPercent: 100,
+			elapsedMs: snapshot.elapsedMs ?? null,
+			recoveredElapsedMs: snapshot.recoveredElapsedMs ?? null,
+			investedElapsedMs: snapshot.investedElapsedMs ?? snapshot.elapsedMs ?? null,
+			totalTimeMs,
+			phaseTimingMs: snapshot.phaseTimingMs,
+			codebaseProgress: snapshot.codebaseProgress,
+			indeterminate: false,
+		}
+	}
+
+	private buildCompletedProgressLabel(snapshot: IndexingPipelineSnapshot): string {
+		const codebaseProgress = snapshot.codebaseProgress
+		const progressParts: string[] = []
+		const fileProgressLabel = this.formatCodebaseFilesProgress(codebaseProgress)
+		if (fileProgressLabel) {
+			progressParts.push(fileProgressLabel)
+		}
+		const chunkProgressLabel = this.formatCodebaseChunksProgress(codebaseProgress)
+		if (chunkProgressLabel) {
+			progressParts.push(chunkProgressLabel)
+		}
+		if (progressParts.length > 0) {
+			return progressParts.join(" • ")
+		}
+
 		const fileCount =
 			this.getPipelineServiceById(snapshot.services, "file_checks")?.progressTotal ??
 			this.getPipelineServiceById(snapshot.services, "discovery")?.progressTotal ??
@@ -997,29 +1123,77 @@ export class CodeIndexStateManager {
 			this.getPipelineServiceById(snapshot.services, "embed")?.progressCurrent ??
 			this.getPipelineServiceById(snapshot.services, "cleanup")?.progressCurrent ??
 			0
-		const progressParts: string[] = []
+		const fallbackParts: string[] = []
 		if (fileCount > 0) {
-			progressParts.push(`${fileCount.toLocaleString()} files`)
+			fallbackParts.push(`${fileCount.toLocaleString()} files`)
 		}
 		if (syncedChunks > 0) {
-			progressParts.push(`${syncedChunks.toLocaleString()} chunks synced`)
+			fallbackParts.push(`${syncedChunks.toLocaleString()} chunks synced`)
 		}
-		const warningCount = snapshot.services.filter(
-			(service) => service.state === "warning" || service.state === "failed",
-		).length
+		return fallbackParts.join(" • ") || "Last run available"
+	}
 
-		return {
-			primaryServiceId:
-				this.getPipelineServiceById(snapshot.services, "vector_sync")?.id ??
-				this.getPipelineServiceById(snapshot.services, "embedding")?.id ??
-				this.getPipelineServiceById(snapshot.services, "embed")?.id,
-			headline: snapshot.preservedFromPreviousRun ? "Index ready" : "Indexing complete",
-			progressLabel: progressParts.join(" • ") || "Last run available",
-			secondaryLabel:
-				warningCount > 0 ? "Completed with warnings. Review the service panels for details." : undefined,
-			progressPercent: 100,
-			indeterminate: false,
+	private formatCodebaseFilesProgress(progress?: IndexingCodebaseProgressSnapshot): string | undefined {
+		const indexedFiles = progress?.indexedFiles ?? 0
+		const totalFiles = progress?.totalFiles ?? 0
+		if (indexedFiles <= 0 && totalFiles <= 0) {
+			return undefined
 		}
+		if (progress?.fileTotalKind === "available" || totalFiles <= 0) {
+			return `${indexedFiles.toLocaleString()} files indexed`
+		}
+		const totalLabel =
+			progress?.fileTotalKind === "estimated"
+				? `~${Math.max(totalFiles, indexedFiles, 0).toLocaleString()}`
+				: Math.max(totalFiles, indexedFiles, 0).toLocaleString()
+		return `${indexedFiles.toLocaleString()} / ${totalLabel} files indexed`
+	}
+
+	private formatCodebaseChunksProgress(progress?: IndexingCodebaseProgressSnapshot): string | undefined {
+		const syncedChunks = progress?.syncedChunks ?? 0
+		const knownTotalChunks = progress?.knownTotalChunks ?? 0
+		if (syncedChunks <= 0 && knownTotalChunks <= 0) {
+			return undefined
+		}
+		if (progress?.chunkTotalKind === "available" || knownTotalChunks <= 0) {
+			return `${syncedChunks.toLocaleString()} chunks available`
+		}
+		const totalLabel =
+			progress?.chunkTotalKind === "estimated"
+				? `~${Math.max(knownTotalChunks, syncedChunks, 0).toLocaleString()}`
+				: Math.max(knownTotalChunks, syncedChunks, 0).toLocaleString()
+		return `${syncedChunks.toLocaleString()} / ${totalLabel} chunks synced`
+	}
+
+	private buildRecoveredProgressLabel(snapshot: IndexingPipelineSnapshot): string | undefined {
+		if (snapshot.runMode !== "resume") {
+			return undefined
+		}
+		const baselineFiles = snapshot.baselineIndexedFiles ?? 0
+		const baselineChunks = snapshot.baselineSyncedChunks ?? snapshot.baselineIndexedChunks ?? 0
+		if (baselineFiles <= 0 && baselineChunks <= 0) {
+			return undefined
+		}
+		const parts: string[] = []
+		if (baselineFiles > 0) {
+			parts.push(`${baselineFiles.toLocaleString()} indexed files`)
+		}
+		if (baselineChunks > 0) {
+			parts.push(`${baselineChunks.toLocaleString()} synced chunks`)
+		}
+		return parts.length > 0 ? `Recovered progress: ${parts.join(" • ")} already available` : undefined
+	}
+
+	private buildElapsedSummaryLabel(snapshot: IndexingPipelineSnapshot, completed: boolean): string | undefined {
+		const primaryElapsedMs =
+			snapshot.runMode === "resume"
+				? (snapshot.investedElapsedMs ?? snapshot.elapsedMs ?? null)
+				: (snapshot.elapsedMs ?? null)
+		const formatted = formatDurationCompact(primaryElapsedMs)
+		if (!formatted) {
+			return undefined
+		}
+		return completed ? `Total time ${formatted}` : `Elapsed ${formatted}`
 	}
 
 	private selectRunSummaryPrimaryService(services: IndexingServiceSnapshot[]): IndexingServiceSnapshot | undefined {
@@ -1085,6 +1259,9 @@ export class CodeIndexStateManager {
 			case "embedding":
 			case "vector_sync":
 			case "embed":
+				if (vectorSyncService?.indeterminate || vectorSyncService?.progressTotal == null) {
+					return `${vectorSyncCurrent.toLocaleString()} chunks synced`
+				}
 				return `Synced ${vectorSyncCurrent.toLocaleString()} of ${Math.max(
 					vectorSyncTotal,
 					vectorSyncCurrent,
@@ -1223,17 +1400,127 @@ export class CodeIndexStateManager {
 				overallHealth: pipeline.overallHealth,
 				runMode: pipeline.runMode,
 				preservedFromPreviousRun: pipeline.preservedFromPreviousRun,
+				elapsedSeconds: pipeline.elapsedMs != null ? Math.floor(Math.max(pipeline.elapsedMs, 0) / 1000) : null,
+				recoveredElapsedSeconds:
+					pipeline.recoveredElapsedMs != null
+						? Math.floor(Math.max(pipeline.recoveredElapsedMs, 0) / 1000)
+						: null,
+				investedElapsedSeconds:
+					pipeline.investedElapsedMs != null
+						? Math.floor(Math.max(pipeline.investedElapsedMs, 0) / 1000)
+						: null,
+				codebaseProgress: pipeline.codebaseProgress
+					? {
+							indexedFiles: pipeline.codebaseProgress.indexedFiles ?? null,
+							totalFiles: pipeline.codebaseProgress.totalFiles ?? null,
+							fileTotalKind: pipeline.codebaseProgress.fileTotalKind ?? null,
+							syncedChunks: pipeline.codebaseProgress.syncedChunks ?? null,
+							knownTotalChunks: pipeline.codebaseProgress.knownTotalChunks ?? null,
+							chunkTotalKind: pipeline.codebaseProgress.chunkTotalKind ?? null,
+							historicalTombstonedFiles: pipeline.codebaseProgress.historicalTombstonedFiles ?? null,
+						}
+					: null,
+				phaseTimingSeconds: pipeline.phaseTimingMs
+					? {
+							discovery:
+								pipeline.phaseTimingMs.discoveryMs != null
+									? Math.floor(Math.max(pipeline.phaseTimingMs.discoveryMs, 0) / 1000)
+									: null,
+							fileChecks:
+								pipeline.phaseTimingMs.fileChecksMs != null
+									? Math.floor(Math.max(pipeline.phaseTimingMs.fileChecksMs, 0) / 1000)
+									: null,
+							parse:
+								pipeline.phaseTimingMs.parseMs != null
+									? Math.floor(Math.max(pipeline.phaseTimingMs.parseMs, 0) / 1000)
+									: null,
+							plan:
+								pipeline.phaseTimingMs.planMs != null
+									? Math.floor(Math.max(pipeline.phaseTimingMs.planMs, 0) / 1000)
+									: null,
+							embedSync:
+								pipeline.phaseTimingMs.embedSyncMs != null
+									? Math.floor(Math.max(pipeline.phaseTimingMs.embedSyncMs, 0) / 1000)
+									: null,
+							cleanup:
+								pipeline.phaseTimingMs.cleanupMs != null
+									? Math.floor(Math.max(pipeline.phaseTimingMs.cleanupMs, 0) / 1000)
+									: null,
+						}
+					: null,
 				summary: pipeline.summary && {
 					primaryServiceId: pipeline.summary.primaryServiceId,
 					headline: pipeline.summary.headline,
 					progressLabel: pipeline.summary.progressLabel,
 					secondaryLabel: pipeline.summary.secondaryLabel,
+					recoveredProgressLabel: pipeline.summary.recoveredProgressLabel,
+					elapsedLabel: pipeline.summary.elapsedLabel,
+					etaLabel: pipeline.summary.etaLabel,
 				},
+				runtime: pipeline.runtime
+					? {
+							sidecars: pipeline.runtime.sidecars.map((sidecar) => ({
+								id: sidecar.id,
+								state: sidecar.state,
+								health: sidecar.health,
+								pendingRequestCount: sidecar.pendingRequestCount ?? 0,
+								lastOperation: sidecar.lastOperation ?? null,
+								lastElapsedMs:
+									sidecar.lastElapsedMs != null
+										? Math.floor(Math.max(sidecar.lastElapsedMs, 0) / 100)
+										: null,
+								lastError: sidecar.lastError ?? null,
+								metrics: (sidecar.metrics ?? []).map((metric) => ({
+									key: metric.key,
+									value: metric.value,
+									tone: metric.tone ?? null,
+									visibility: metric.visibility ?? "primary",
+								})),
+							})),
+							tasks: (pipeline.runtime.tasks ?? []).map((task) => ({
+								id: task.id,
+								state: task.state,
+								health: task.health,
+								summary: task.summary,
+								detail: task.detail ?? null,
+								progressCurrent: task.progressCurrent ?? null,
+								progressTotal: task.progressTotal ?? null,
+								progressUnit: task.progressUnit ?? null,
+								progressPercent: task.progressPercent ?? null,
+								indeterminate: task.indeterminate ?? false,
+								rateLabel: task.rateLabel ?? null,
+								etaLabel: task.etaLabel ?? null,
+								phaseLabel: task.phaseLabel ?? null,
+								actions: (task.actions ?? []).map((action) => ({
+									id: action.id,
+									enabled: action.enabled,
+									reason: action.reason ?? null,
+									tone: action.tone ?? null,
+								})),
+								metrics: (task.metrics ?? []).map((metric) => ({
+									key: metric.key,
+									value: metric.value,
+									tone: metric.tone ?? null,
+									visibility: metric.visibility ?? "primary",
+								})),
+							})),
+						}
+					: null,
 				services: pipeline.services.map((service) => ({
 					id: service.id,
 					state: service.state,
 					health: service.health,
 					issueCount: service.issueCount ?? 0,
+					detail: service.detail ?? null,
+					progressCurrent: service.progressCurrent ?? null,
+					progressTotal: service.progressTotal ?? null,
+					progressPercent: service.progressPercent ?? null,
+					metrics: (service.metrics ?? []).map((metric) => ({
+						key: metric.key,
+						value: metric.value,
+						tone: metric.tone ?? null,
+						visibility: metric.visibility ?? "primary",
+					})),
 				})),
 			},
 		})
@@ -1301,7 +1588,7 @@ export class CodeIndexStateManager {
 	 *
 	 * During a from-scratch index, _totalBlocks only counts blocks from files
 	 * parsed so far. On a 65K-file workspace with 1% parsed, the raw total
-	 * vastly underestimates actual work — causing the ETA to say "almost done"
+	 * vastly underestimates actual work — causing the ETA to look nearly finished
 	 * when the scan is barely started.
 	 *
 	 * When parsing is incomplete (_isEstimatedTotal && _filesParsed < _totalFiles),

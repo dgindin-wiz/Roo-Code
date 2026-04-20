@@ -118,6 +118,7 @@ async function main() {
 		entryPoints: [
 			"workers/countTokens.ts",
 			"workers/codeIndexV2EmbedUpsertSidecar.ts",
+			"workers/codeIndexV2MetadataSidecar.ts",
 			"workers/codeIndexV2ParseSidecarBootstrap.ts",
 			"workers/codeIndexV2ParseSidecar.ts",
 		],

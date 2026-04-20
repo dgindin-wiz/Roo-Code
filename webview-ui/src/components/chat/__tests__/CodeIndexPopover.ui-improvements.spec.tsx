@@ -9,10 +9,23 @@
  */
 
 import {
+	formatDurationForDisplay,
+	formatCodebaseProgressRows,
 	getDefaultCodeIndexPopoverTab,
 	getIndexingHeadline,
+	INDEXING_WARNING_HELP_TEXT,
+	getPrimaryElapsedMs,
 	getRunSummaryDisplay,
+	getMetadataCleanupCompactionAction,
+	getVisibleIndexRuntimeSidecarMetrics,
+	getVisibleIndexRuntimeTaskMetrics,
+	getVisibleIndexServiceMetrics,
 	getProgressStageLabel,
+	hasExpandableIndexRuntimeSidecarContent,
+	hasExpandableIndexRuntimeTaskContent,
+	hasExpandableIndexServiceCardContent,
+	shouldExpandIndexRuntimeSidecar,
+	shouldExpandIndexRuntimeTask,
 	shouldExpandIndexServiceCard,
 } from "../CodeIndexPopover"
 
@@ -20,7 +33,7 @@ import {
 // We test the function in isolation by extracting the same logic
 
 function formatEtaForDisplay(ms: number): string {
-	if (ms < 10_000) return "almost done"
+	if (ms < 10_000) return "<10s remaining"
 	if (ms < 60_000) return `~${Math.round(ms / 1000)}s remaining`
 	const minutes = Math.round(ms / 60_000)
 	if (minutes < 60) return `~${minutes}m remaining`
@@ -31,9 +44,9 @@ function formatEtaForDisplay(ms: number): string {
 }
 
 describe("formatEtaForDisplay", () => {
-	test("returns 'almost done' for < 10 seconds", () => {
-		expect(formatEtaForDisplay(5_000)).toBe("almost done")
-		expect(formatEtaForDisplay(9_999)).toBe("almost done")
+	test("returns a definitive short ETA for < 10 seconds", () => {
+		expect(formatEtaForDisplay(5_000)).toBe("<10s remaining")
+		expect(formatEtaForDisplay(9_999)).toBe("<10s remaining")
 	})
 
 	test("returns seconds for < 1 minute", () => {
@@ -56,6 +69,44 @@ describe("formatEtaForDisplay", () => {
 	test("returns hours and minutes when minutes > 0", () => {
 		expect(formatEtaForDisplay(5_400_000)).toBe("~1h 30m remaining")
 		expect(formatEtaForDisplay(8_100_000)).toBe("~2h 15m remaining")
+	})
+})
+
+describe("formatDurationForDisplay", () => {
+	test("formats short durations in seconds", () => {
+		expect(formatDurationForDisplay(9_000)).toBe("9s")
+	})
+
+	test("formats minute and hour durations compactly", () => {
+		expect(formatDurationForDisplay(180_000)).toBe("3m")
+		expect(formatDurationForDisplay(5_400_000)).toBe("1h 30m")
+	})
+})
+
+describe("getPrimaryElapsedMs", () => {
+	test("prefers invested elapsed time for resume runs", () => {
+		expect(
+			getPrimaryElapsedMs({
+				overallState: "running",
+				overallHealth: "healthy",
+				runMode: "resume",
+				services: [],
+				elapsedMs: 60_000,
+				investedElapsedMs: 180_000,
+			}),
+		).toBe(180_000)
+	})
+
+	test("falls back to current elapsed time for initial runs", () => {
+		expect(
+			getPrimaryElapsedMs({
+				overallState: "running",
+				overallHealth: "healthy",
+				runMode: "initial-discovery",
+				services: [],
+				elapsedMs: 60_000,
+			}),
+		).toBe(60_000)
 	})
 })
 
@@ -222,6 +273,108 @@ describe("CodeIndexPopover - Run summary display", () => {
 			progressLine: "Synced 8,633 of 10,881 chunks",
 			secondaryLine: "Also parsing changed files in the background.",
 		})
+	})
+
+	test("uses hydrated standby pipeline totals before indexing starts", () => {
+		const display = getRunSummaryDisplay(
+			{
+				systemStatus: "Standby",
+				processedItems: 0,
+				totalItems: 0,
+				message: "V2 index ready across 199 files",
+				pipeline: {
+					overallState: "completed",
+					overallHealth: "healthy",
+					runMode: "initial-discovery",
+					preservedFromPreviousRun: true,
+					services: [],
+					summary: {
+						headline: "Index ready",
+						progressLabel: "199 / 199 files indexed • 1,204 / 1,204 chunks synced",
+						elapsedLabel: "Total time 42 sec",
+						codebaseProgress: {
+							indexedFiles: 199,
+							totalFiles: 199,
+							syncedChunks: 1_204,
+							knownTotalChunks: 1_204,
+						},
+					},
+				},
+			},
+			true,
+			(key: string) => key,
+		)
+
+		expect(display).toEqual({
+			headline: "Index ready",
+			progressLine: "199 / 199 files indexed • 1,204 / 1,204 chunks synced",
+			secondaryLine: undefined,
+		})
+	})
+
+	test("uses resumable standby summary instead of completed wording for incomplete runs", () => {
+		const display = getRunSummaryDisplay(
+			{
+				systemStatus: "Standby",
+				processedItems: 0,
+				totalItems: 0,
+				message: "V2 index has resumable progress across 73,686 files",
+				pipeline: {
+					overallState: "stopped",
+					overallHealth: "watch",
+					runMode: "resume",
+					preservedFromPreviousRun: true,
+					services: [],
+					summary: {
+						headline: "Resume available",
+						progressLabel: "73,686 / 73,912 files indexed • 1,752,602 chunks available",
+						secondaryLabel: "Previous indexing run did not finish. Start indexing to continue.",
+						indeterminate: true,
+					},
+				},
+			},
+			true,
+			(key: string) => key,
+		)
+
+		expect(display).toEqual({
+			headline: "Resume available",
+			progressLine: "73,686 / 73,912 files indexed • 1,752,602 chunks available",
+			secondaryLine: "Previous indexing run did not finish. Start indexing to continue.",
+		})
+	})
+})
+
+describe("CodeIndexPopover - codebase progress rows", () => {
+	test("renders exact current totals as ratios", () => {
+		expect(
+			formatCodebaseProgressRows({
+				indexedFiles: 73_625,
+				totalFiles: 73_625,
+				fileTotalKind: "exact",
+				syncedChunks: 1_766_503,
+				knownTotalChunks: 1_766_503,
+				chunkTotalKind: "exact",
+			}),
+		).toEqual([
+			{ key: "files", label: "Files indexed", value: "73,625 / 73,625" },
+			{ key: "chunks", label: "Chunks synced", value: "1,766,503 / 1,766,503" },
+		])
+	})
+
+	test("renders available-only chunk totals without fake ratios", () => {
+		expect(
+			formatCodebaseProgressRows({
+				indexedFiles: 73_686,
+				totalFiles: 73_912,
+				fileTotalKind: "exact",
+				syncedChunks: 1_752_602,
+				chunkTotalKind: "available",
+			}),
+		).toEqual([
+			{ key: "files", label: "Files indexed", value: "73,686 / 73,912" },
+			{ key: "chunks", label: "Chunks synced", value: "1,752,602 available" },
+		])
 	})
 })
 
@@ -423,6 +576,10 @@ describe("CodeIndexPopover - ETA display rendering logic", () => {
 })
 
 describe("CodeIndexPopover - warning details state sync", () => {
+	test("describes warning details as latest actionable review state", () => {
+		expect(INDEXING_WARNING_HELP_TEXT).toBe("Latest files that need parser, retry, or degraded-index review.")
+	})
+
 	test("does not clobber fetched warning items after warning details bootstrap", () => {
 		const previousState = {
 			items: [
@@ -497,5 +654,116 @@ describe("CodeIndexPopover - overview defaults", () => {
 		expect(shouldExpandIndexServiceCard("pending")).toBe(false)
 		expect(shouldExpandIndexServiceCard("completed")).toBe(false)
 		expect(shouldExpandIndexServiceCard("skipped")).toBe(false)
+	})
+
+	test("only shows service details control when detail metrics exist", () => {
+		const metric = (key: string, visibility?: "primary" | "detail") => ({ key, label: key, value: "1", visibility })
+
+		expect(
+			hasExpandableIndexServiceCardContent({
+				metrics: [metric("one"), metric("two"), metric("legacy")],
+			}),
+		).toBe(false)
+		expect(
+			hasExpandableIndexServiceCardContent({
+				metrics: [metric("one"), metric("two"), metric("diagnostic", "detail")],
+			}),
+		).toBe(true)
+	})
+
+	test("collapsed service cards show primary and legacy metrics while expanded cards include details", () => {
+		const service = {
+			metrics: [
+				{ key: "primary", label: "Primary", value: "1", visibility: "primary" as const },
+				{ key: "legacy", label: "Legacy", value: "2" },
+				{ key: "detail", label: "Detail", value: "3", visibility: "detail" as const },
+			],
+		}
+
+		expect(getVisibleIndexServiceMetrics(service, false).map((item) => item.key)).toEqual(["primary", "legacy"])
+		expect(getVisibleIndexServiceMetrics(service, true).map((item) => item.key)).toEqual([
+			"primary",
+			"legacy",
+			"detail",
+		])
+	})
+
+	test("expands busy and failed runtime sidecars by default without treating standby as expandable", () => {
+		expect(shouldExpandIndexRuntimeSidecar("busy")).toBe(true)
+		expect(shouldExpandIndexRuntimeSidecar("failed")).toBe(true)
+		expect(shouldExpandIndexRuntimeSidecar("standby")).toBe(false)
+		expect(shouldExpandIndexRuntimeSidecar("online")).toBe(false)
+	})
+
+	test("runtime sidecar metrics use primary/detail visibility like service cards", () => {
+		const sidecar = {
+			metrics: [
+				{ key: "state", label: "State", value: "Online", visibility: "primary" as const },
+				{ key: "pending", label: "Pending", value: "0" },
+				{ key: "pid", label: "PID", value: "4242", visibility: "detail" as const },
+			],
+		}
+
+		expect(hasExpandableIndexRuntimeSidecarContent(sidecar)).toBe(true)
+		expect(getVisibleIndexRuntimeSidecarMetrics(sidecar, false).map((item) => item.key)).toEqual([
+			"state",
+			"pending",
+		])
+		expect(getVisibleIndexRuntimeSidecarMetrics(sidecar, true).map((item) => item.key)).toEqual([
+			"state",
+			"pending",
+			"pid",
+		])
+	})
+
+	test("expands running partial and failed runtime tasks by default", () => {
+		expect(shouldExpandIndexRuntimeTask("running")).toBe(true)
+		expect(shouldExpandIndexRuntimeTask("partial")).toBe(true)
+		expect(shouldExpandIndexRuntimeTask("failed")).toBe(true)
+		expect(shouldExpandIndexRuntimeTask("complete")).toBe(false)
+		expect(shouldExpandIndexRuntimeTask("idle")).toBe(false)
+	})
+
+	test("runtime task metrics use primary/detail visibility like service cards", () => {
+		const task = {
+			metrics: [
+				{ key: "state", label: "State", value: "Partial", visibility: "primary" as const },
+				{ key: "jobs_pruned", label: "Jobs pruned", value: "50,000" },
+				{ key: "fts_pruned", label: "FTS rows pruned", value: "10", visibility: "detail" as const },
+			],
+		}
+
+		expect(hasExpandableIndexRuntimeTaskContent(task)).toBe(true)
+		expect(getVisibleIndexRuntimeTaskMetrics(task, false).map((item) => item.key)).toEqual(["state", "jobs_pruned"])
+		expect(getVisibleIndexRuntimeTaskMetrics(task, true).map((item) => item.key)).toEqual([
+			"state",
+			"jobs_pruned",
+			"fts_pruned",
+		])
+	})
+
+	test("metadata cleanup exposes compaction action only for the cleanup task", () => {
+		const cleanupTask = {
+			id: "metadata_cleanup" as const,
+			title: "Metadata cleanup",
+			state: "complete" as const,
+			health: "healthy" as const,
+			summary: "Cleanup complete",
+			metrics: [],
+			actions: [
+				{
+					id: "compact_metadata_db" as const,
+					label: "Compact DB file",
+					enabled: true,
+				},
+			],
+		}
+		const taskWithoutAction = {
+			...cleanupTask,
+			actions: [],
+		}
+
+		expect(getMetadataCleanupCompactionAction(cleanupTask)?.label).toBe("Compact DB file")
+		expect(getMetadataCleanupCompactionAction(taskWithoutAction)).toBeUndefined()
 	})
 })

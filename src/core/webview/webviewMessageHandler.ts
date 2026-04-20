@@ -3121,6 +3121,54 @@ export const webviewMessageHandler = async (
 			}
 			break
 		}
+		case "compactCodeIndexMetadata": {
+			try {
+				const manager = provider.getCurrentWorkspaceCodeIndexManager()
+				if (!manager) {
+					provider.log("Cannot compact metadata DB: No workspace folder open")
+					provider.postMessageToWebview({
+						type: "indexMetadataCompactionResult",
+						values: {
+							success: false,
+							error: t("embeddings:orchestrator.indexingRequiresWorkspace"),
+						},
+					})
+					return
+				}
+				if (!manager.compactIndexMetadataDatabase) {
+					throw new Error("Metadata DB compaction is not available for this workspace.")
+				}
+				const result = await manager.compactIndexMetadataDatabase()
+				provider.postMessageToWebview({
+					type: "indexMetadataCompactionResult",
+					values: {
+						success: true,
+						...result,
+					},
+				})
+				provider.postMessageToWebview({
+					type: "indexingStatusUpdate",
+					values: manager.getCurrentStatus(),
+				})
+			} catch (error) {
+				provider.log(`Error compacting metadata DB: ${error instanceof Error ? error.message : String(error)}`)
+				provider.postMessageToWebview({
+					type: "indexMetadataCompactionResult",
+					values: {
+						success: false,
+						error: error instanceof Error ? error.message : String(error),
+					},
+				})
+				const manager = provider.getCurrentWorkspaceCodeIndexManager()
+				if (manager) {
+					provider.postMessageToWebview({
+						type: "indexingStatusUpdate",
+						values: manager.getCurrentStatus(),
+					})
+				}
+			}
+			break
+		}
 		case "codeIndexDebugLog": {
 			const values = message.values ?? {}
 			IndexDebugLoggerV2.log("basic", "WebviewStateBatching", values.event ?? "webview-debug-log", {
