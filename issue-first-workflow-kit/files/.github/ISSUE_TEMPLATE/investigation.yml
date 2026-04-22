@@ -1,0 +1,127 @@
+# Managed by issue-first-workflow-kit. Local edits may be overwritten by install.sh.
+
+name: Investigation / Diagnosis
+description: Investigate a bug, performance issue, or unclear system behavior
+labels: ["investigation"]
+title: "[INVESTIGATION] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when diagnosis is the work.
+
+        This is an operational investigation form for maintainers and Codex. The resulting issue body can continue to be edited into the repository's canonical current-state structure as the investigation evolves.
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Phase
+      description: Select the current phase for this operational work item.
+      options:
+        - triage
+        - planning
+        - diagnosing
+        - diagnosis_complete
+        - implementation_planned
+        - implementing
+        - validating
+        - ready_for_review
+    validations:
+      required: true
+
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective or problem / symptom
+      description: Describe the investigation target in one or two sentences.
+      placeholder: e.g., "A workflow takes significantly longer than expected on medium-sized repos."
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Who is affected and why does this matter?
+      placeholder: e.g., "Slows down developer workflows and makes the feature feel unreliable."
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_known_context
+    attributes:
+      label: Current known context
+      description: Capture relevant system context, assumptions, or recent changes.
+      placeholder: e.g., "Occurs on repositories with more than 10k files using default settings."
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence_summary
+    attributes:
+      label: Evidence summary
+      description: Summarize observations, logs, measurements, or traces already available.
+      placeholder: |
+        - Timing results
+        - Logs
+        - Observed behavior
+        - Screenshots or traces
+
+  - type: textarea
+    id: leading_hypotheses
+    attributes:
+      label: Leading hypotheses
+      description: What are the current best explanations?
+      placeholder: |
+        - Serialization bottleneck
+        - Network latency
+        - Inefficient batching
+
+  - type: textarea
+    id: confirmed_findings
+    attributes:
+      label: Confirmed findings
+      description: Record anything already confirmed so the issue body can become the canonical current truth.
+      placeholder: |
+        - Reproduction confirmed on ...
+        - Hypothesis X ruled out by ...
+        - Root cause narrowed to ...
+
+  - type: textarea
+    id: current_plan
+    attributes:
+      label: Current plan or proposed remediation
+      description: What investigation or remediation work should happen next?
+      placeholder: |
+        - Run profiling
+        - Compare small vs large repos
+        - Measure likely bottlenecks
+
+  - type: textarea
+    id: validation_plan
+    attributes:
+      label: Validation / measurement plan
+      description: How will maintainers know the diagnosis or remediation is good enough?
+      placeholder: |
+        - Benchmark before/after
+        - Target performance threshold
+        - Reproduce and eliminate issue
+
+  - type: textarea
+    id: implementation_container
+    attributes:
+      label: Implementation container decision
+      description: Record the intended issue/branch/PR container if known.
+      placeholder: |
+        - Canonical repo from origin
+        - Same Issue or follow-on Issue
+        - Head branch
+        - Base branch / merge target
+        - PR role
+
+  - type: textarea
+    id: next_step
+    attributes:
+      label: Next step
+      description: What should happen immediately after this issue is created?
+      placeholder: e.g., "Confirm reproduction, update the canonical issue body, and decide whether implementation stays on this issue."

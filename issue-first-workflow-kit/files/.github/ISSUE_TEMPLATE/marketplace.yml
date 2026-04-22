@@ -1,0 +1,53 @@
+# Managed by issue-first-workflow-kit. Local edits may be overwritten by install.sh.
+
+name: Marketplace / Catalog Feedback
+description: Report issues or suggest improvements for marketplace, catalog, template, or integration items
+labels: ["marketplace"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for your feedback.
+        Please check existing issues first.
+
+        Maintainers may convert this intake issue into an operational work item, or create a linked follow-on issue, if engineering investigation or implementation begins.
+
+  - type: dropdown
+    id: feedback-type
+    attributes:
+      label: What kind of feedback?
+      options:
+        - Problem with an existing item
+        - Suggestion for a new item
+        - General marketplace or catalog issue
+    validations:
+      required: true
+
+  - type: input
+    id: item-name
+    attributes:
+      label: Item name
+      placeholder: e.g., "Debug Mode", "Weather API Server", "Code Formatter"
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What is the issue or what would you like to see?
+      placeholder: Clear description of the problem or suggestion
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-info
+    attributes:
+      label: Additional details
+      description: Steps to reproduce, expected behavior, screenshots, or other helpful information.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues for duplicates
+          required: true
