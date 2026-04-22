@@ -1,15 +1,32 @@
 # Issue-First Workflow Kit
 
-This kit packages a reusable Issue-first GitHub workflow for agent-assisted
-engineering work. It is shaped as a standalone repository so it can be copied
-out of this checkout later, but it can also be run directly from this folder.
+This kit packages the repo-facing artifacts for a reusable Issue-first GitHub
+workflow. It is shaped as a standalone repository so it can be copied out of
+this checkout later, but it can also be run directly from this folder.
 
-## What It Installs
+## Recommended Three-Layer Setup
+
+Use the workflow in three layers:
+
+1. **Global Codex policy**: keep a short default policy in
+   `~/.codex/AGENTS.md` so every new chat/project starts with the same working
+   agreement.
+2. **Codex skill**: use the `issue-first-workflow` skill for the detailed
+   behavior: Issue body as canonical truth, milestone comments, branch/PR
+   container selection, validation, and closeout.
+3. **Repo bootstrap kit**: run this installer only for repositories that should
+   visibly carry the workflow files, GitHub templates, and local agent block.
+
+Plugin packaging is a future sharing option for teams or multi-machine setup.
+The current package intentionally keeps that path documented rather than
+implemented.
+
+## What The Repo Bootstrap Installs
 
 - `.codex/process.md`
 - `.codex/templates/*`
 - `.github/ISSUE_TEMPLATE/*`
-- `.github/PULL_REQUEST_TEMPLATE.md`
+- `.github/pull_request_template.md`
 - a managed workflow block in `AGENTS.md`
 
 The installer preserves existing `AGENTS.md` content and only owns the block
@@ -73,3 +90,14 @@ tests/smoke.sh
 ```
 
 The smoke tests use only standard shell tools and do not require network access.
+
+## Skill Source
+
+The repo-tracked source for the local Codex skill lives at:
+
+```text
+skills/issue-first-workflow/
+```
+
+Install or copy that folder to `~/.codex/skills/issue-first-workflow/` for
+immediate local use.

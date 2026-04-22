@@ -4,6 +4,8 @@
 	"description": "Reusable Issue-first GitHub workflow assets for agent-assisted engineering work.",
 	"installer": "install.sh",
 	"managedBy": "issue-first-workflow-kit",
+	"globalPolicy": "global/AGENTS.issue-first-policy.md",
+	"skillSource": "skills/issue-first-workflow",
 	"agentsBlock": {
 		"begin": "<!-- BEGIN issue-first-github-workflow -->",
 		"end": "<!-- END issue-first-github-workflow -->",
@@ -18,7 +20,7 @@
 		".codex/templates/investigation-milestone-comment.md",
 		".codex/templates/operational-issue-body.md",
 		".codex/templates/validation-summary-comment.md",
-		".github/PULL_REQUEST_TEMPLATE.md",
+		".github/pull_request_template.md",
 		".github/ISSUE_TEMPLATE/bug_report.yml",
 		".github/ISSUE_TEMPLATE/config.yml",
 		".github/ISSUE_TEMPLATE/feature_request.yml",

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue-First Workflow"
+  short_description: "Run issue-first GitHub engineering workflows"
+  default_prompt: "Use the issue-first workflow for this GitHub engineering task."

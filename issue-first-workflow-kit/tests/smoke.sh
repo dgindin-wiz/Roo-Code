@@ -27,6 +27,13 @@ assert_not_contains() {
   fi
 }
 
+assert_no_actual_file_name() {
+  dir="$1"
+  name="$2"
+  match="$(find "$dir" -maxdepth 1 -type f -name "$name" -print -quit 2>/dev/null || true)"
+  [ -z "$match" ] || fail "unexpected actual file named $name in $dir"
+}
+
 new_target() {
   mktemp -d "${TMPDIR:-/tmp}/issue-first-workflow-kit-test.XXXXXX"
 }
@@ -66,9 +73,10 @@ test_fresh_install() {
   assert_file "$target/AGENTS.md"
   assert_file "$target/.codex/process.md"
   assert_file "$target/.codex/templates/operational-issue-body.md"
-  assert_file "$target/.github/PULL_REQUEST_TEMPLATE.md"
+  assert_file "$target/.github/pull_request_template.md"
   assert_file "$target/.github/ISSUE_TEMPLATE/bug_report.yml"
   assert_file "$target/.github/ISSUE_TEMPLATE/investigation.yml"
+  assert_no_actual_file_name "$target/.github" "PULL_REQUEST_TEMPLATE.md"
   assert_contains "$target/AGENTS.md" "BEGIN issue-first-github-workflow"
   assert_contains "$target/.codex/process.md" "Managed by issue-first-workflow-kit"
 }
@@ -143,6 +151,30 @@ test_force_backs_up_conflict() {
   [ "$backup_count" = "1" ] || fail "expected one process.md backup, got $backup_count"
 }
 
+test_managed_uppercase_pr_template_migrates() {
+  target="$(track_target "$(new_target)")"
+  mkdir -p "$target/.github"
+  printf '<!-- Managed by issue-first-workflow-kit. Local edits may be overwritten by install.sh. -->\nlegacy\n' > "$target/.github/PULL_REQUEST_TEMPLATE.md"
+
+  run_installer "$target" >/dev/null
+
+  assert_file "$target/.github/pull_request_template.md"
+  assert_no_actual_file_name "$target/.github" "PULL_REQUEST_TEMPLATE.md"
+}
+
+test_unmanaged_uppercase_pr_template_conflicts() {
+  target="$(track_target "$(new_target)")"
+  mkdir -p "$target/.github"
+  printf 'local uppercase template\n' > "$target/.github/PULL_REQUEST_TEMPLATE.md"
+
+  if run_installer "$target" > "$target/output.txt" 2>&1; then
+    fail "expected unmanaged uppercase PR template to conflict"
+  fi
+
+  assert_contains "$target/output.txt" "conflict .github/pull_request_template.md"
+  assert_contains "$target/.github/PULL_REQUEST_TEMPLATE.md" "local uppercase template"
+}
+
 test_fresh_install
 test_existing_agents_append
 test_marked_agents_replace
@@ -150,5 +182,7 @@ test_idempotent_rerun
 test_dry_run_writes_nothing
 test_conflict_without_force
 test_force_backs_up_conflict
+test_managed_uppercase_pr_template_migrates
+test_unmanaged_uppercase_pr_template_conflicts
 
 printf 'smoke tests passed\n'

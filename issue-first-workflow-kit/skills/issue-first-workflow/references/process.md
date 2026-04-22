@@ -1,5 +1,3 @@
-<!-- Managed by issue-first-workflow-kit. Local edits may be overwritten by install.sh. -->
-
 # Issue-First Process Manual for Codex
 
 ## Purpose

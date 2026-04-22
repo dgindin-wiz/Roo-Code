@@ -5,6 +5,7 @@ KIT_NAME="issue-first-workflow-kit"
 MANAGED_TEXT="Managed by issue-first-workflow-kit"
 BEGIN_MARKER="<!-- BEGIN issue-first-github-workflow -->"
 END_MARKER="<!-- END issue-first-github-workflow -->"
+LEGACY_UPPERCASE_PR_TEMPLATE=".github/PULL_REQUEST_TEMPLATE.md"
 
 usage() {
   cat <<'USAGE'
@@ -166,6 +167,38 @@ install_payload_file() {
   cp "$src" "$dest"
 }
 
+legacy_pr_template_path() {
+  legacy_dir="$target_dir/.github"
+
+  if [ ! -d "$legacy_dir" ]; then
+    return 1
+  fi
+
+  find "$legacy_dir" -maxdepth 1 -type f -name "$(basename "$LEGACY_UPPERCASE_PR_TEMPLATE")" -print -quit
+}
+
+plan_legacy_cleanup() {
+  legacy_path="$(legacy_pr_template_path || true)"
+
+  if [ -z "$legacy_path" ]; then
+    return 0
+  fi
+
+  if is_managed_file "$legacy_path"; then
+    info "remove legacy managed $LEGACY_UPPERCASE_PR_TEMPLATE"
+  else
+    info "preserve unmanaged $LEGACY_UPPERCASE_PR_TEMPLATE"
+  fi
+}
+
+install_legacy_cleanup() {
+  legacy_path="$(legacy_pr_template_path || true)"
+
+  if [ -n "$legacy_path" ] && is_managed_file "$legacy_path"; then
+    rm -f "$legacy_path"
+  fi
+}
+
 validate_agents_markers() {
   agents_file="$target_dir/AGENTS.md"
   [ -e "$agents_file" ] || return 0
@@ -252,6 +285,7 @@ $(find "$payload_dir" -type f | sort)
 EOF
 
 plan_agents
+plan_legacy_cleanup
 
 if [ "$conflicts" -gt 0 ]; then
   die "$conflicts unmanaged conflicting payload file(s); rerun with --force to back them up and overwrite"
@@ -261,6 +295,8 @@ if [ "$dry_run" -eq 1 ]; then
   info "dry-run complete; no files changed"
   exit 0
 fi
+
+install_legacy_cleanup
 
 while IFS= read -r src; do
   rel="${src#$payload_dir/}"
